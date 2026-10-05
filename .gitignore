@@ -1,0 +1,6 @@
+node_modules/
+web/dist/
+.bot/
+bin/bot
+tsconfig.json.bak
+.DS_Store

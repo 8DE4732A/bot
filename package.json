@@ -1,0 +1,35 @@
+{
+  "name": "bot",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "bot": "./bin/bot"
+  },
+  "scripts": {
+    "dev": "bun run src/cli.ts",
+    "dev:web": "bun run scripts/dev-web.ts",
+    "build:web": "cd web && bunx vite build && cd .. && bun run scripts/embed-web.ts",
+    "build:binary": "bun run build:web && bun build src/cli.ts --compile --minify --outfile bin/bot",
+    "typecheck": "tsc --noEmit && tsc -p web/tsconfig.json",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "^0.0.78",
+    "@earendil-works/chord": "^1.0.2",
+    "@earendil-works/pi-ai": "^1.0.2",
+    "@earendil-works/pi-durable": "^1.0.2",
+    "typebox": "^1.3.27"
+  },
+  "devDependencies": {
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/instrument-sans": "^5.3.0",
+    "@types/node": "^22.13.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "typescript": "^5.8.0",
+    "vite": "^8.3.2"
+  }
+}
