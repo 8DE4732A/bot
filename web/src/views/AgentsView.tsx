@@ -6,6 +6,7 @@ import {
   Empty,
   Field,
   Icon,
+  KindBadge,
   Modal,
   TagInput,
   useFormDialog,
@@ -192,7 +193,7 @@ function AgentForm({
         />
       </Field>
 
-      <Field label={`技能选配 · 已选 ${pickedSkills.length} 项`}>
+      <Field label={`技能选配 · 已选 ${pickedSkills.length} 项`} hint="TOOL = 工具扩展 · DOC = 文档型技能 (SKILL.md) · MCP = MCP 服务工具集">
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           {skills.map((s) => (
             <div
@@ -212,7 +213,7 @@ function AgentForm({
               <span className="skill-row__check">
                 {pickedSkills.includes(s.id) ? <Icon name="check" size={11} /> : null}
               </span>
-              <span>
+              <span style={{ minWidth: 0, flex: 1 }}>
                 <span className="skill-row__name">
                   {s.name}
                   <span className="mono mono--plain">{s.id}</span>
@@ -221,6 +222,7 @@ function AgentForm({
                   {s.description}
                 </span>
               </span>
+              <KindBadge kind={s.kind} />
             </div>
           ))}
         </div>

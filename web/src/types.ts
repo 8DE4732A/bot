@@ -57,12 +57,69 @@ export interface Channel {
   updatedAt: number;
 }
 
+export type SkillKind = "extension" | "skill" | "mcp";
+
 export interface Skill {
   id: string;
   name: string;
   description: string;
-  category: "coding" | "search" | "utility" | "design" | "custom";
+  category: "coding" | "search" | "utility" | "design" | "custom" | "document" | "mcp";
   builtin: boolean;
+  kind: SkillKind;
+  /** kind === "mcp" 时桥接的工具数 */
+  toolCount?: number;
+  /** kind === "skill" 时后端附加的文档技能信息 */
+  location?: string;
+  bodyPreview?: string;
+  warnings?: string[];
+  disableModelInvocation?: boolean;
+}
+
+export type McpTransport = "stdio" | "http";
+export type McpExposure = "direct" | "hidden";
+
+export interface McpServer {
+  id: string;
+  name: string;
+  transport: McpTransport;
+  command?: string;
+  args?: string[];
+  /** 脱敏掩码 (••••), 明文永不回传; 提交时掩码值表示保留已存值 */
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  description?: string;
+  exposure: McpExposure;
+  /** 工具名或通配模式 → direct/hidden (精确名优先于模式) */
+  toolExposure?: Record<string, McpExposure>;
+  enabled: boolean;
+  updatedAt: number;
+}
+
+export type ScheduleType = "once" | "every" | "cron";
+
+export interface ScheduledTask {
+  id: string;
+  agentId: string;
+  name: string;
+  prompt: string;
+  scheduleType: ScheduleType;
+  runAt?: number;
+  intervalSeconds?: number;
+  cronExpr?: string;
+  enabled: boolean;
+  deletedAt?: number;
+  nextRunAt?: number;
+  lastRunAt?: number;
+  lastStatus?: string;
+  lastResult?: string;
+  runCount: number;
+  /** 通知目标 (创建任务的会话所在渠道; 会话重置不影响投递) */
+  notifyChannelInstanceId?: string;
+  notifyPeerId?: string;
+  notifyEnabled: boolean;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface AuditLog {

@@ -3,7 +3,9 @@ import type {
   AuditLog,
   ChatChunk,
   Channel,
+  McpServer,
   ModelProvider,
+  ScheduledTask,
   Skill,
   SystemStatus,
 } from "./types";
@@ -84,6 +86,30 @@ export const api = {
 
   listSkills: () => fetch("/api/skills").then((r) => json<Skill[]>(r)),
   listAuditLogs: () => fetch("/api/audit-logs").then((r) => json<AuditLog[]>(r)),
+
+  listMcpServers: () => fetch("/api/mcp-servers").then((r) => json<McpServer[]>(r)),
+  saveMcpServer: (s: Partial<McpServer> & { id: string }) =>
+    fetch("/api/mcp-servers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(s),
+    }).then((r) => json<{ success: boolean }>(r)),
+  deleteMcpServer: (id: string) =>
+    fetch(`/api/mcp-servers?id=${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) =>
+      json<{ success: boolean }>(r),
+    ),
+  testMcpServer: (s: Partial<McpServer> & { id?: string }) =>
+    fetch("/api/mcp-servers/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(s),
+    }).then((r) => json<{ ok: boolean; toolCount?: number; tools?: string[]; error?: string }>(r)),
+
+  listScheduledTasks: () => fetch("/api/scheduled-tasks").then((r) => json<ScheduledTask[]>(r)),
+  deleteScheduledTask: (id: string) =>
+    fetch(`/api/scheduled-tasks?id=${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) =>
+      json<{ success: boolean }>(r),
+    ),
 
   resetChat: (agentId: string, sessionId: string) =>
     fetch("/api/chat/reset", {

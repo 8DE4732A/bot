@@ -37,8 +37,13 @@ export class ChannelManager {
       // 显式注册的优先 (如 CLI 的 terminal); 其余按配置经工厂实例化
       let adapter = this.adapters.get(config.id);
       if (!adapter) {
+        if (config.type === "terminal") {
+          // terminal 由 CLI 特殊管理 (daemon 模式不创建), 不是配置损坏
+          logger.debug("ChannelManager", `Channel '${config.id}' is terminal type; managed by CLI`);
+          continue;
+        }
         const created = createChannelAdapter(config);
-        if (!created) continue; // terminal 由 CLI 管理 / 未知类型已 warn
+        if (!created) continue; // 未知类型已 warn
         adapter = created;
         this.adapters.set(config.id, adapter);
         logger.info("ChannelManager", `Instantiated adapter from config: ${config.id} (${config.type})`);
@@ -81,6 +86,7 @@ export class ChannelManager {
       `Dispatching inbound message from ${message.channelInstanceId}:${message.peerId} to Agent: ${agentId}`,
     );
 
+    // AgentManager 从 sessionId 首段解析渠道身份并写映射行 (通知寻址用)
     return AgentManager.getInstance().chat(
       agentId,
       `${message.channelInstanceId}:${message.peerId}`,
@@ -92,5 +98,34 @@ export class ChannelManager {
   /** 查找已注册 (含 startAll 实例化) 的适配器, 供 webhook 分发等外部入口使用 */
   public getAdapter(id: string): ChannelAdapter | undefined {
     return this.adapters.get(id);
+  }
+
+  /**
+   * 主动推送 (定时任务通知等平台事件): 渠道层寻址 (channelInstanceId+peerId),
+   * 与会话无关——会话重置不影响通知投递。目标渠道未注册/未启用返回 false。
+   */
+  public async sendNotification(channelInstanceId: string, peerId: string, content: string): Promise<boolean> {
+    const adapter = this.adapters.get(channelInstanceId);
+    if (!adapter) return false;
+    const config = this.store.getChannel(channelInstanceId);
+    if (config && !config.enabled) return false;
+    await adapter.sendMessage(peerId, content);
+    return true;
+  }
+
+  /**
+   * 通知兜底: 找该 Agent 绑定的启用渠道实例 (按更新时间取最新)。
+   * 用于任务未记录通知目标或目标渠道已不可用的场景。
+   */
+  public findFallbackChannelForAgent(agentId: string): ChannelAdapter | undefined {
+    const bound = this.store
+      .listChannels()
+      .filter((c) => c.enabled && c.boundAgentId === agentId)
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+    for (const config of bound) {
+      const adapter = this.adapters.get(config.id);
+      if (adapter) return adapter;
+    }
+    return undefined;
   }
 }

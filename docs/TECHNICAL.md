@@ -214,7 +214,7 @@ SandboxedExecutionEnv   pi-durable env 的安全实现 (每个工具轮次由框
 
 ```bash
 bun run dev / dev:web   # 后端 / 前端 HMR
-bun test / typecheck    # 18 tests; tsc 双工程
+bun test / typecheck    # 42 tests; tsc 双工程
 bun run build:web       # 构建管理台 → src/server/ui/generated.ts (提交进 git)
 bun run build:binary    # 含 build:web 的单二进制
 ```

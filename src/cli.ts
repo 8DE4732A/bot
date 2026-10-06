@@ -8,6 +8,9 @@ import { ModelFactory } from "./core/model-factory.ts";
 import { DatabaseManager } from "./database/index.ts";
 import { AdminWebServer } from "./server/server.ts";
 import { loadCustomSkills } from "./skills/loader.ts";
+import { McpBridge } from "./skills/mcp/bridge.ts";
+import { SchedulerManager } from "./scheduler/index.ts";
+import { NotificationDispatcher } from "./notifications/dispatcher.ts";
 import { logger } from "./utils/logger.ts";
 
 async function main() {
@@ -76,11 +79,22 @@ async function main() {
 
     logger.info("CLI", `Starting Bot platform at ${cwd} (port: ${port})...`);
 
-    // 2. Load custom skills
+    // 2. Load custom skills (工具型 index.ts + 文档型 SKILL.md)
     await loadCustomSkills(cwd);
 
     // 3. Initialize Agent Harness
     await AgentManager.getInstance().init(cwd);
+
+    // 3b. Bridge configured MCP servers into the registry (连接失败不阻塞启动;
+    //     失败的 server 由低频重试循环自动恢复)
+    await McpBridge.getInstance().sync(store);
+    McpBridge.getInstance().startRetryLoop(store);
+
+    // 3c. Start the scheduler (due 任务的 catch-up 由轮询天然覆盖)
+    SchedulerManager.getInstance().start();
+
+    // 3d. Subscribe platform events → channel notifications (定时任务结果推送等)
+    NotificationDispatcher.getInstance().init();
 
     // 4 & 5. Start Web Server and configured channels in parallel (互不依赖)
     const channelManager = ChannelManager.getInstance();
@@ -109,6 +123,15 @@ async function main() {
       try {
         await Promise.race([
           AgentManager.getInstance().shutdown(),
+          new Promise((r) => setTimeout(r, 500)),
+        ]);
+      } catch {}
+      SchedulerManager.getInstance().stop();
+      NotificationDispatcher.getInstance().stop();
+      // MCP stdio 子进程回收
+      try {
+        await Promise.race([
+          McpBridge.getInstance().closeAll(),
           new Promise((r) => setTimeout(r, 500)),
         ]);
       } catch {}

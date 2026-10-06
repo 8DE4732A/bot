@@ -21,6 +21,7 @@ interface WatchTargetLike {
 }
 import type { BotSandboxConfig } from "../config/database-store.ts";
 import { DatabaseStore } from "../config/database-store.ts";
+import { buildChildProcessEnv } from "../config/sandbox-defaults.ts";
 import { getBotPaths } from "../config/env-paths.ts";
 import { logger } from "../utils/logger.ts";
 import { SandboxRuntimeManager } from "./manager.ts";
@@ -37,20 +38,15 @@ export interface SandboxedEnvOptions {
  * (含所有 provider API Key) 泄漏给沙盒内命令。这里只放行非敏感基础变量,
  * 强制 inheritEnv:false 后, 子进程永远拿不到宿主完整环境。
  */
-const SHELL_ENV_ALLOW = ["PATH", "HOME", "USER", "SHELL", "TERM", "TMPDIR", "LANG", "TZ", "LC_ALL", "SSL_CERT_FILE"];
-
 function sandboxShellEnv(): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const key of SHELL_ENV_ALLOW) {
-    const value = process.env[key];
-    if (value !== undefined) out[key] = value;
-  }
-  return out;
+  return buildChildProcessEnv();
 }
 
 /**
  * 平台级无条件禁读清单: 密钥库/会话库/日志/宿主凭据文件,
  * 以及其他 Agent 的工作区与技能源码 (多 Agent 数据横向隔离)。
+ * skills 目录只禁代码 (*.ts/*.js/node_modules)——文档型技能 SKILL.md
+ * 的正文需模型经 read 工具读取 (渐进披露), 代码与数据分别对待。
  */
 function platformDenyRead(agentWorkspace: string, store: DatabaseStore): string[] {
   const paths = getBotPaths();
@@ -60,7 +56,11 @@ function platformDenyRead(agentWorkspace: string, store: DatabaseStore): string[
     paths.logsDir,
     join(paths.root, ".env*"),
     join(paths.root, ".git-credentials"),
-    paths.skillsDir,
+    join(paths.skillsDir, "*.ts"),
+    join(paths.skillsDir, "*.js"),
+    join(paths.skillsDir, "*", "*.ts"),
+    join(paths.skillsDir, "*", "*.js"),
+    join(paths.skillsDir, "*", "node_modules"),
   ];
   // 其他 Agent 的工作区 (含已删除 Agent 的残留目录)
   const self = resolve(agentWorkspace);
@@ -104,10 +104,15 @@ export class SandboxedExecutionEnv extends NodeExecutionEnv {
     this.agentId = options.agentId;
     this.sandboxConfig = options.sandboxConfig;
     this.audit = new DatabaseStore();
+    const denyRead = platformDenyRead(options.cwd, this.audit);
+    // skills 源码 deny 模式不进 inode 指纹: glob 收集会枚举整个技能目录,
+    // 把需要放行的 SKILL.md 一并指纹化; 源码无机密, 路径 deny 已足够
+    const skillsDir = getBotPaths().skillsDir;
     this.pathGuard = new PathGuard(
       options.cwd,
       options.sandboxConfig,
-      platformDenyRead(options.cwd, this.audit),
+      denyRead,
+      denyRead.filter((p) => !p.startsWith(skillsDir)),
     );
   }
 
@@ -180,6 +185,7 @@ export class SandboxedExecutionEnv extends NodeExecutionEnv {
           this.sandboxConfig,
           this.cwd,
           platformDenyRead(this.cwd, this.audit),
+          this.agentId,
         );
       } catch (wrapErr) {
         // fail-closed: 沙盒包装失败不降级为裸执行

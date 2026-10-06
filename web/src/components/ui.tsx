@@ -24,7 +24,9 @@ type IconName =
   | "refresh"
   | "check"
   | "search"
-  | "power";
+  | "power"
+  | "plug"
+  | "clock";
 
 const ICON_PATHS: Record<IconName, ReactNode> = {
   grid: (
@@ -109,6 +111,20 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
     <>
       <path d="M12 2v10" />
       <path d="M18.4 6.6a9 9 0 1 1-12.77.04" />
+    </>
+  ),
+  plug: (
+    <>
+      <path d="M12 22v-5" />
+      <path d="M9 8V2" />
+      <path d="M15 8V2" />
+      <path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z" />
+    </>
+  ),
+  clock: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3 3" />
     </>
   ),
 };
@@ -416,6 +432,13 @@ export function TagInput({
       ) : null}
     </div>
   );
+}
+
+/* ---------------- 技能类型徽标 (tool/doc/mcp 三类统一) ---------------- */
+export function KindBadge({ kind }: { kind: string | undefined }) {
+  if (kind === "skill") return <span className="badge" style={{ marginLeft: "auto", flexShrink: 0 }}>DOC</span>;
+  if (kind === "mcp") return <span className="badge badge--live" style={{ marginLeft: "auto", flexShrink: 0 }}>MCP</span>;
+  return <span className="badge badge--ink" style={{ marginLeft: "auto", flexShrink: 0 }}>TOOL</span>;
 }
 
 /* ---------------- 工具 ---------------- */

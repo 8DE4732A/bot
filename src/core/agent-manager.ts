@@ -5,17 +5,37 @@ import {
   Harness,
   watchEvents,
 } from "@earendil-works/pi-durable";
-import type { AgentEventStream, Conversation, ConversationId, Harness as HarnessType } from "@earendil-works/pi-durable";
+import type { AgentEventStream, Conversation, ConversationId, Extension, Harness as HarnessType } from "@earendil-works/pi-durable";
 import type { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { DatabaseStore, type AgentDefinition } from "../config/database-store.ts";
 import { getBotPaths } from "../config/env-paths.ts";
 import { SandboxedExecutionEnv } from "../sandbox/execution-env.ts";
+import { SkillsCatalog } from "../skills/builtin/skills-catalog.ts";
 import { SkillRegistry } from "../skills/registry.ts";
 import { logger } from "../utils/logger.ts";
 import { ModelFactory } from "./model-factory.ts";
 
 import type { MutableModels } from "@earendil-works/pi-ai/models";
+
+/** 一轮对话的可观测统计 (对齐 pi coding-agent footer 语义) */
+export interface TurnUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  /** 最近一轮 prompt tokens ≈ 当前上下文大小 */
+  contextTokens: number;
+  /** 模型上下文窗口 (BYOK 未知时为 0, 前端显示 tokens 不显示百分比) */
+  contextWindow: number;
+  /** 缓存命中率 = cacheRead / (input + cacheRead + cacheWrite) */
+  cacheHitRate?: number;
+  costTotal: number;
+  durationMs: number;
+  /** 推理 token (provider 报告时) */
+  reasoning?: number;
+}
 
 export interface ChatChunk {
   delta?: string;
@@ -23,6 +43,7 @@ export interface ChatChunk {
     name: string;
     status: string;
   };
+  usage?: TurnUsage;
 }
 
 /** 内存中缓存的会话数上限 (LRU 淘汰, 淘汰后下次访问从存储恢复) */
@@ -55,6 +76,7 @@ export class AgentManager {
   private harness?: HarnessType;
   private models?: MutableModels;
   private storage?: SqliteStorage;
+  private registry?: ReturnType<typeof createRegistry>;
   private store: DatabaseStore;
   private conversations = new Map<string, ConvCache>();
   private conversationToAgent = new Map<string, string>();
@@ -87,6 +109,29 @@ this.models.clearProviders();
     }
   }
 
+  /**
+   * 运行期安装/卸载扩展 (MCP 桥接热更新用)。pi-durable 会话按名字解析扩展,
+   * registry 同名 install 即刻替换, 已有会话的下一条消息自动生效, 无需 reconfigure。
+   */
+  public installExtension(extension: Extension): void {
+    if (!this.registry) return;
+    this.registry.install(extension);
+  }
+
+  public uninstallExtension(name: string): void {
+    if (!this.registry) return;
+    this.registry.uninstall({ name });
+  }
+
+  /** 会话归属反查 (工具执行时确定调用方 Agent; fail-closed): 内存映射 → channel_sessions 表 */
+  public getAgentIdForConversation(conversationId: string): string | undefined {
+    const mapped = this.conversationToAgent.get(conversationId);
+    if (mapped) return mapped;
+    const agentId = this.store.getAgentIdByConversation(conversationId);
+    if (agentId) this.conversationToAgent.set(conversationId, agentId);
+    return agentId;
+  }
+
   public async init(cwd: string = process.cwd()): Promise<void> {
     if (this.harness) return;
 
@@ -99,10 +144,14 @@ this.models.clearProviders();
     this.models = ModelFactory.createConfiguredModels();
 
     const registry = createRegistry();
+    this.registry = registry;
     const allSkills = SkillRegistry.getInstance().listSkills();
     for (const skill of allSkills) {
       registry.install(skill.extension);
     }
+    // skills-catalog 不进 SkillRegistry (避免出现在选配列表), 但必须 install:
+    // 会话按名字解析扩展, 选配数组里的 SkillsCatalog 若无同名注册物会被丢弃
+    registry.install(SkillsCatalog);
 
     this.harness = await Harness.open(
       storage,
@@ -199,7 +248,8 @@ this.models.clearProviders();
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`Agent not found: ${agentId}`);
 
-    const agentSkills = SkillRegistry.getInstance().resolveExtensions(agent.skills);
+    // skills-catalog 常驻: section 渲染该 Agent 选配的文档型技能目录 (只呈现已选条目)
+    const agentSkills = [...SkillRegistry.getInstance().resolveExtensions(agent.skills), SkillsCatalog];
 
     if (!cached) {
       // Check if session mapping exists
@@ -214,7 +264,10 @@ this.models.clearProviders();
           BACKGROUND_CONTEXT,
         );
         if (existing) {
-          cached = { conv: existing, configFp: configFingerprint(agent) };
+          // configFp 置空: 恢复的旧会话无法得知其冻结的扩展名单是否落后于当前
+          // agent 配置 (如新增技能/MCP), 必须强制一次 configure 同步——否则名单
+          // 永远冻结在会话创建时刻 (实测: 重启后旧终端会话看不到新挂的 MCP 工具)
+          cached = { conv: existing, configFp: "" };
         } else {
           logger.warn("AgentManager", `Conversation ${sessionRecord.conversationId} no longer exists; recreating session ${cacheKey}`);
           cached = { conv: await this.createNewConversation(agent, agentSkills), configFp: configFingerprint(agent) };
@@ -297,6 +350,7 @@ this.models.clearProviders();
     );
   }
 
+
   private async chatLocked(
     agentId: string,
     sessionId: string,
@@ -305,11 +359,32 @@ this.models.clearProviders();
   ): Promise<string> {
     const conv = await this.getOrCreateConversation(agentId, sessionId);
     const context = BACKGROUND_CONTEXT;
+    const turnStartedAt = Date.now();
+
+    // 真实渠道映射行 (通知寻址用): sessionId 首段即渠道实例 id, 渠道真实存在
+    // 才写映射——terminal/web-playground/scheduler 的差异由存在性决定, 调用方
+    // 无需 (也不可能传错) 重复编码渠道身份
+    const channelInstanceId = sessionId.split(":")[0];
+    if (channelInstanceId !== MAPPING_CHANNEL && this.store.getChannel(channelInstanceId)) {
+      this.store.saveSession({
+        channelInstanceId,
+        peerId: sessionId.slice(channelInstanceId.length + 1),
+        agentId,
+        conversationId: String(conv.id),
+        createdAt: Date.now(),
+        lastActiveAt: Date.now(),
+      });
+    }
 
     // Attach the framework's typed event stream (watchEvents) for streaming output;
     // 不再读取 pi.live 内部文档结构, 框架升级时由编译期类型兜底
     let watch: AgentEventStream | undefined;
     let lastRenderedText = "";
+    // 本轮消耗 = 轮内各 assistant 消息 usage 相加; 当前上下文 = 最后一条
+    // assistant 消息的 prompt 侧 (工具调用轮的累计差值会把多条消息 prompt
+    // 相加, 虚高于真实上下文——实测踩坑, 勿改回差值口径)
+    const turnAgg = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, reasoning: 0, cost: 0 };
+    let lastMsgUsage: { input: number; cacheRead: number; cacheWrite: number } | undefined;
 
     if (onChunk) {
       try {
@@ -317,7 +392,27 @@ this.models.clearProviders();
         let lastToolEvent = "";
         watch.start(async (events) => {
           for (const e of events) {
-            if (e.type === "message_update") {
+            if (e.type === "message_end") {
+              // EntryRecord.model = 该条目贡献给模型上下文的消息数组;
+              // assistant 消息的 usage 是本次请求的计量 (input=未命中, cacheRead=命中);
+              // toolResult 消息可能带独立 usage (工具内部模型调用), 一并计入本轮消耗
+              const msgs = (e.entry as any)?.model as any[] | undefined;
+              for (const m of msgs ?? []) {
+                const usage = m?.usage;
+                if (!usage) continue;
+                turnAgg.input += usage.input ?? 0;
+                turnAgg.output += usage.output ?? 0;
+                turnAgg.cacheRead += usage.cacheRead ?? 0;
+                turnAgg.cacheWrite += usage.cacheWrite ?? 0;
+                turnAgg.totalTokens += usage.totalTokens ?? 0;
+                turnAgg.cost += usage.cost?.total ?? 0;
+                if (typeof usage.reasoning === "number") turnAgg.reasoning += usage.reasoning;
+                // 当前上下文取最后一条 assistant 消息的 prompt 侧 (含全部历史)
+                if (m.role === "assistant") {
+                  lastMsgUsage = { input: usage.input ?? 0, cacheRead: usage.cacheRead ?? 0, cacheWrite: usage.cacheWrite ?? 0 };
+                }
+              }
+            } else if (e.type === "message_update") {
               for (const change of e.changes) {
                 if (change.type === "text_delta") {
                   lastRenderedText += change.delta;
@@ -377,6 +472,38 @@ this.models.clearProviders();
           } else if (fullText) {
             onChunk({ delta: `\n${fullText}` });
           }
+        }
+
+        // 轮统计: 本轮消耗 = 轮内各 assistant 消息 usage 相加;
+        // 当前上下文 = 最后一条 assistant 消息的 prompt 侧 (input+cacheRead+cacheWrite)
+        // ——工具调用轮的"累计差值"会把多条消息 prompt 相加, 虚高于真实上下文 (实测踩坑)
+        if (onChunk && lastMsgUsage) {
+          const contextTokens = lastMsgUsage.input + lastMsgUsage.cacheRead + lastMsgUsage.cacheWrite;
+          const cacheHitRate = contextTokens > 0 ? (lastMsgUsage.cacheRead / contextTokens) * 100 : undefined;
+          let contextWindow = 0;
+          try {
+            const agent = this.store.getAgent(agentId);
+            if (agent) {
+              // 目录未命中的自定义模型 → 0 (终端只显示 tokens, 不显示假百分比);
+              // 目录命中优先 (如 deepseek-v4 = 1M, 厂商注册表不含这些 BYOK id)
+              contextWindow = this.models?.getModel(agent.model.provider, agent.model.modelId)?.contextWindow ?? 0;
+            }
+          } catch { /* 未知模型不显示百分比 */ }
+          onChunk({
+            usage: {
+              input: turnAgg.input,
+              output: turnAgg.output,
+              cacheRead: turnAgg.cacheRead,
+              cacheWrite: turnAgg.cacheWrite,
+              totalTokens: turnAgg.totalTokens,
+              reasoning: turnAgg.reasoning || undefined,
+              contextTokens,
+              contextWindow,
+              cacheHitRate,
+              costTotal: turnAgg.cost,
+              durationMs: Date.now() - turnStartedAt,
+            },
+          });
         }
 
         return fullText || "(无返回内容)";

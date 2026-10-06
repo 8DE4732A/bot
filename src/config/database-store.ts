@@ -75,6 +75,64 @@ export interface AuditLogEntry {
   createdAt: number;
 }
 
+export interface McpServerDefinition {
+  id: string;
+  name: string;
+  transport: "stdio" | "http";
+  command?: string;
+  args?: string[];
+  /** MCP server 进程需要的环境变量——bash 最小环境白名单不含它们, 必须显式配置 */
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  description?: string;
+  /** direct = 工具声明给模型; hidden = 注册但不暴露 (留作观察/手动启用) */
+  exposure: "direct" | "hidden";
+  /** per-tool 覆盖: 工具名或通配模式 → direct/hidden (精确名优先于模式) */
+  toolExposure?: Record<string, "direct" | "hidden">;
+  enabled: boolean;
+  updatedAt: number;
+}
+
+export type ScheduleType = "once" | "every" | "cron";
+
+export interface ScheduledTaskDefinition {
+  id: string;
+  /** 创建任务的 Agent——触发会话以此 Agent 的配置执行; 工具归属校验的依据 */
+  agentId: string;
+  name: string;
+  /** 触发时发送给 Agent 的消息 */
+  prompt: string;
+  scheduleType: ScheduleType;
+  /** once: 触发时间戳 (ms) */
+  runAt?: number;
+  /** every: 重复间隔秒 (最小 60) */
+  intervalSeconds?: number;
+  /** cron: 标准 5 字段表达式 (本地时区) */
+  cronExpr?: string;
+  enabled: boolean;
+  /** 逻辑删除时间戳 (ms); 非 null 即不可见/不触发 */
+  deletedAt?: number;
+  nextRunAt?: number;
+  lastRunAt?: number;
+  /** ok | error | done (once 任务完成) */
+  lastStatus?: string;
+  /** 最近一次执行的回答摘要 (截断) */
+  lastResult?: string;
+  runCount: number;
+  /**
+   * 通知目标 (创建任务的会话所在渠道, 渠道层寻址与会话无关——会话重置不影响):
+   * 触发完成后由 NotificationDispatcher 经 ChannelManager 推送到该渠道该 peer;
+   * 未记录 (如在 Web Playground 创建) 时 fallback 到 Agent 绑定的终端类渠道
+   */
+  notifyChannelInstanceId?: string;
+  notifyPeerId?: string;
+  /** false = 触发结果不推送渠道 (仍记录在任务上) */
+  notifyEnabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export class DatabaseStore {
   private db: DatabaseManager;
 
@@ -237,8 +295,27 @@ export class DatabaseStore {
     if (bound && bound.count > 0) {
       throw new Error(`Agent '${id}' is still bound to ${bound.count} channel(s); rebind them first`);
     }
-    this.db.run("DELETE FROM agents WHERE id = ?", id);
-    this.db.run("DELETE FROM channel_sessions WHERE agent_id = ?", id);
+    // 级联停掉该 Agent 的定时任务: 否则任务按周期触发 → chat 找不到 agent →
+    // 每周期 error 审计 + 失败通知循环骚扰 (孤儿任务)。级联在单事务内原子完成
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.run(
+        "UPDATE scheduled_tasks SET deleted_at = ?, enabled = 0, updated_at = ? WHERE agent_id = ? AND deleted_at IS NULL",
+        Date.now(),
+        Date.now(),
+        id,
+      );
+      this.db.run("DELETE FROM agents WHERE id = ?", id);
+      this.db.run("DELETE FROM channel_sessions WHERE agent_id = ?", id);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* ignore */
+      }
+      throw err;
+    }
     return true;
   }
 
@@ -348,6 +425,28 @@ export class DatabaseStore {
     return row?.agent_id;
   }
 
+  /**
+   * 按会话库 conversationId 反查完整渠道映射 (定时任务通知寻址用)。
+   * 同一 conversation 可能有两行 (真实渠道行 + AgentManager 内部哨兵行),
+   * 真实渠道行优先——通知要送达真实渠道。
+   */
+  public getSessionByConversation(conversationId: string): ChannelSession | undefined {
+    const r = this.db.queryOne<any>(
+      `SELECT * FROM channel_sessions WHERE conversation_id = ?
+       ORDER BY (channel_instance_id = 'channel_session') ASC, last_active_at DESC LIMIT 1`,
+      conversationId,
+    );
+    if (!r) return undefined;
+    return {
+      channelInstanceId: r.channel_instance_id,
+      peerId: r.peer_id,
+      agentId: r.agent_id,
+      conversationId: r.conversation_id,
+      createdAt: r.created_at,
+      lastActiveAt: r.last_active_at,
+    };
+  }
+
   public saveSession(session: ChannelSession): void {
     const now = Date.now();
     this.db.run(
@@ -365,6 +464,213 @@ export class DatabaseStore {
       session.createdAt || now,
       now,
     );
+  }
+
+  // --- MCP Servers ---
+  private mapMcpServerRow(row: any): McpServerDefinition {
+    return {
+      id: row.id,
+      name: row.name,
+      transport: row.transport,
+      command: row.command ?? undefined,
+      args: JSON.parse(row.args || "null") ?? undefined,
+      env: JSON.parse(row.env || "null") ?? undefined,
+      url: row.url ?? undefined,
+      headers: JSON.parse(row.headers || "null") ?? undefined,
+      description: row.description ?? undefined,
+      exposure: row.exposure === "hidden" ? "hidden" : "direct",
+      toolExposure: JSON.parse(row.tool_exposure || "null") ?? undefined,
+      enabled: Boolean(row.enabled),
+      updatedAt: row.updated_at,
+    };
+  }
+
+  public listMcpServers(): McpServerDefinition[] {
+    const rows = this.db.query<any>("SELECT * FROM mcp_servers ORDER BY updated_at DESC");
+    return rows.map((r) => this.mapMcpServerRow(r));
+  }
+
+  public getMcpServer(id: string): McpServerDefinition | undefined {
+    const row = this.db.queryOne<any>("SELECT * FROM mcp_servers WHERE id = ?", id);
+    return row ? this.mapMcpServerRow(row) : undefined;
+  }
+
+  public saveMcpServer(server: McpServerDefinition): void {
+    const now = Date.now();
+    this.db.run(
+      `INSERT INTO mcp_servers (
+        id, name, transport, command, args, env, url, headers,
+        description, exposure, tool_exposure, enabled, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        transport = excluded.transport,
+        command = excluded.command,
+        args = excluded.args,
+        env = excluded.env,
+        url = excluded.url,
+        headers = excluded.headers,
+        description = excluded.description,
+        exposure = excluded.exposure,
+        tool_exposure = excluded.tool_exposure,
+        enabled = excluded.enabled,
+        updated_at = excluded.updated_at`,
+      server.id,
+      server.name,
+      server.transport,
+      server.command ?? null,
+      JSON.stringify(server.args ?? null),
+      JSON.stringify(server.env ?? null),
+      server.url ?? null,
+      JSON.stringify(server.headers ?? null),
+      server.description ?? null,
+      server.exposure === "hidden" ? "hidden" : "direct",
+      JSON.stringify(server.toolExposure ?? null),
+      server.enabled ? 1 : 0,
+      now,
+    );
+  }
+
+  public deleteMcpServer(id: string): boolean {
+    const selected = this.listAgents().filter((a) => a.skills.includes(`mcp__${id}`));
+    if (selected.length > 0) {
+      throw new Error(
+        `MCP server '${id}' is still selected by agent(s): ${selected.map((a) => a.id).join(", ")}; remove it from their skills first`,
+      );
+    }
+    this.db.run("DELETE FROM mcp_servers WHERE id = ?", id);
+    return true;
+  }
+
+  // --- Scheduled Tasks (逻辑删除) ---
+  private mapScheduledTaskRow(row: any): ScheduledTaskDefinition {
+    return {
+      id: row.id,
+      agentId: row.agent_id,
+      name: row.name,
+      prompt: row.prompt,
+      scheduleType: row.schedule_type,
+      runAt: row.run_at ?? undefined,
+      intervalSeconds: row.interval_seconds ?? undefined,
+      cronExpr: row.cron_expr ?? undefined,
+      enabled: Boolean(row.enabled),
+      deletedAt: row.deleted_at ?? undefined,
+      nextRunAt: row.next_run_at ?? undefined,
+      lastRunAt: row.last_run_at ?? undefined,
+      lastStatus: row.last_status ?? undefined,
+      lastResult: row.last_result ?? undefined,
+      runCount: row.run_count,
+      notifyChannelInstanceId: row.notify_channel_instance_id ?? undefined,
+      notifyPeerId: row.notify_peer_id ?? undefined,
+      notifyEnabled: row.notify_enabled === undefined ? true : Boolean(row.notify_enabled),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  public saveScheduledTask(task: ScheduledTaskDefinition): void {
+    const now = Date.now();
+    this.db.run(
+      `INSERT INTO scheduled_tasks (
+        id, agent_id, name, prompt, schedule_type, run_at, interval_seconds, cron_expr,
+        enabled, deleted_at, next_run_at, last_run_at, last_status, last_result,
+        run_count, notify_channel_instance_id, notify_peer_id, notify_enabled,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        prompt = excluded.prompt,
+        schedule_type = excluded.schedule_type,
+        run_at = excluded.run_at,
+        interval_seconds = excluded.interval_seconds,
+        cron_expr = excluded.cron_expr,
+        enabled = excluded.enabled,
+        deleted_at = excluded.deleted_at,
+        next_run_at = excluded.next_run_at,
+        last_run_at = excluded.last_run_at,
+        last_status = excluded.last_status,
+        last_result = excluded.last_result,
+        run_count = excluded.run_count,
+        notify_channel_instance_id = excluded.notify_channel_instance_id,
+        notify_peer_id = excluded.notify_peer_id,
+        notify_enabled = excluded.notify_enabled,
+        updated_at = excluded.updated_at`,
+      task.id,
+      task.agentId,
+      task.name,
+      task.prompt,
+      task.scheduleType,
+      task.runAt ?? null,
+      task.intervalSeconds ?? null,
+      task.cronExpr ?? null,
+      task.enabled ? 1 : 0,
+      task.deletedAt ?? null,
+      task.nextRunAt ?? null,
+      task.lastRunAt ?? null,
+      task.lastStatus ?? null,
+      task.lastResult ?? null,
+      task.runCount,
+      task.notifyChannelInstanceId ?? null,
+      task.notifyPeerId ?? null,
+      task.notifyEnabled ? 1 : 0,
+      task.createdAt || now,
+      now,
+    );
+  }
+
+  /** 不含逻辑删除的 (工具可见; 调度循环也用此查询) */
+  public getScheduledTask(id: string): ScheduledTaskDefinition | undefined {
+    const row = this.db.queryOne<any>(
+      "SELECT * FROM scheduled_tasks WHERE id = ? AND deleted_at IS NULL",
+      id,
+    );
+    return row ? this.mapScheduledTaskRow(row) : undefined;
+  }
+
+  public listScheduledTasks(agentId?: string): ScheduledTaskDefinition[] {
+    const rows = agentId
+      ? this.db.query<any>(
+          "SELECT * FROM scheduled_tasks WHERE deleted_at IS NULL AND agent_id = ? ORDER BY created_at ASC",
+          agentId,
+        )
+      : this.db.query<any>(
+          "SELECT * FROM scheduled_tasks WHERE deleted_at IS NULL ORDER BY created_at ASC",
+        );
+    return rows.map((r) => this.mapScheduledTaskRow(r));
+  }
+
+  /** 调度循环的轻量探针: 覆盖索引一查, 未到期时免去全行 SELECT + 行映射 */
+  public hasDueScheduledTasks(now: number): boolean {
+    const row = this.db.queryOne<{ n: number }>(
+      "SELECT EXISTS(SELECT 1 FROM scheduled_tasks WHERE deleted_at IS NULL AND enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?) as n",
+      now,
+    );
+    return Boolean(row?.n);
+  }
+
+  /** 调度循环: 到期任务 (含上次进程未跑完的 catch-up) */
+  public listDueScheduledTasks(now: number): ScheduledTaskDefinition[] {
+    const rows = this.db.query<any>(
+      "SELECT * FROM scheduled_tasks WHERE deleted_at IS NULL AND enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at ASC",
+      now,
+    );
+    return rows.map((r) => this.mapScheduledTaskRow(r));
+  }
+
+  /** 逻辑删除: deleted_at 置位, 记录保留 (禁用触发, 工具/调度循环均不可见) */
+  public softDeleteScheduledTask(id: string, agentId?: string): boolean {
+    const task = this.getScheduledTask(id);
+    if (!task) return false;
+    if (agentId && task.agentId !== agentId) {
+      throw new Error(`Task '${id}' belongs to another agent`);
+    }
+    this.db.run(
+      "UPDATE scheduled_tasks SET deleted_at = ?, enabled = 0, updated_at = ? WHERE id = ?",
+      Date.now(),
+      Date.now(),
+      id,
+    );
+    return true;
   }
 
   // --- Audit Logs ---

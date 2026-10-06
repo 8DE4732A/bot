@@ -5,7 +5,10 @@ import { getAgentWorkspaceDir } from "../config/env-paths.ts";
 import { AgentManager } from "../core/agent-manager.ts";
 import { ModelFactory } from "../core/model-factory.ts";
 import { ChannelManager } from "../channels/manager.ts";
+import { McpBridge } from "../skills/mcp/bridge.ts";
+import type { McpServerDefinition } from "../config/database-store.ts";
 import { SkillRegistry } from "../skills/registry.ts";
+import { loadCustomSkills } from "../skills/loader.ts";
 import { logger } from "../utils/logger.ts";
 import { EMBEDDED_UI } from "./ui/generated.ts";
 
@@ -68,6 +71,29 @@ function unmaskCredentials(next: Record<string, unknown>, previous: Record<strin
     out[k] = v === CREDENTIAL_MASK && typeof previous[k] === "string" ? previous[k] : v;
   }
   return out;
+}
+
+
+/** MCP 表单载荷 → server 定义 (保存与连接测试共用同一套归一化与凭据还原) */
+function normalizeMcpServerInput(
+  body: any,
+  previous: ReturnType<DatabaseStore["getMcpServer"]>,
+): McpServerDefinition {
+  return {
+    id: typeof body.id === "string" ? body.id : String(body.id ?? ""),
+    name: body.name || "test",
+    transport: body.transport === "http" ? "http" : "stdio",
+    command: body.command || undefined,
+    args: Array.isArray(body.args) ? body.args : undefined,
+    env: unmaskCredentials(body.env ?? {}, previous?.env ?? {}) as Record<string, string>,
+    url: body.url || undefined,
+    headers: unmaskCredentials(body.headers ?? {}, previous?.headers ?? {}) as Record<string, string>,
+    description: body.description || undefined,
+    exposure: body.exposure === "hidden" ? "hidden" : "direct",
+    toolExposure: body.toolExposure && typeof body.toolExposure === "object" ? body.toolExposure : undefined,
+    enabled: body.enabled !== false,
+    updatedAt: Date.now(),
+  };
 }
 
 function binaryFor(pathname: string, bodyB64: string): Buffer {
@@ -399,7 +425,7 @@ export class AdminWebServer {
         }
       }
 
-      // 9. Skills API
+      // 9. Skills API (三类统一: extension / skill / mcp; 文档型附正文预览)
       if (pathname === "/api/skills" && method === "GET") {
         const skills = SkillRegistry.getInstance().listSkills().map((s) => ({
           id: s.id,
@@ -407,12 +433,130 @@ export class AdminWebServer {
           description: s.description,
           category: s.category,
           builtin: s.builtin,
+          kind: s.kind,
+          toolCount: s.extension.tools?.length ?? 0,
+          ...(s.document
+            ? {
+                location: s.document.location,
+                bodyPreview: s.document.body.slice(0, 400),
+                warnings: s.document.warnings,
+                disableModelInvocation: s.document.disableModelInvocation,
+              }
+            : {}),
         }));
         this.sendJson(res, skills);
         return;
       }
 
-      // 10. Audit Logs API
+      // 9b-2. 技能热刷新: 重扫 .bot/skills 并 reconcile durable registry——
+      // 只改 SkillRegistry 是"假成功" (模型可用性由 AgentManager 的 registry 决定)
+      if (pathname === "/api/skills/reload" && method === "POST") {
+        const diff = await loadCustomSkills();
+        const agentManager = AgentManager.getInstance();
+        for (const ext of diff.upserted) agentManager.installExtension(ext);
+        for (const name of diff.removed) agentManager.uninstallExtension(name);
+        await McpBridge.getInstance().sync(this.store);
+        this.store.recordAudit("skills.reloaded", {
+          upserted: diff.upserted.map((e) => e.name),
+          removed: diff.removed,
+        });
+        this.sendJson(res, {
+          success: true,
+          upserted: diff.upserted.map((e) => e.name),
+          removed: diff.removed,
+          ...(diff.codeReloadLimited
+            ? { note: "tool skill code changed but requires a restart (ESM module cache)" }
+            : {}),
+        });
+        return;
+      }
+
+      // 9b. MCP Servers API (凭据语义同渠道: headers/env 响应掩码, 掩码值提交还原)
+      if (pathname === "/api/mcp-servers") {
+        if (method === "GET") {
+          this.sendJson(
+            res,
+            this.store.listMcpServers().map((s) => ({
+              ...s,
+              env: maskCredentials(s.env ?? {}),
+              headers: maskCredentials(s.headers ?? {}),
+            })),
+          );
+          return;
+        }
+        if (method === "POST") {
+          const body = await this.readJsonBody(req);
+          if (!body.id || !body.name || !body.transport) {
+            this.sendError(res, 400, "id, name, and transport are required");
+            return;
+          }
+          // id 进入工具名 mcp__<id>__ 与连接缓存 key——必须是字符串且只允许安全字符
+          // (NUL 曾造成 closeServerClients 前缀碰撞; JSON number 会被 String() 掩盖)
+          if (typeof body.id !== "string" || !/^[a-zA-Z0-9_-]+$/.test(body.id)) {
+            this.sendError(res, 400, "id must be a string containing only letters, digits, '_' and '-'");
+            return;
+          }
+          if (body.transport === "stdio" && !body.command) {
+            this.sendError(res, 400, "stdio transport requires command");
+            return;
+          }
+          if (body.transport === "http" && !body.url) {
+            this.sendError(res, 400, "http transport requires url");
+            return;
+          }
+          this.store.saveMcpServer(normalizeMcpServerInput(body, this.store.getMcpServer(body.id)));
+          this.store.recordAudit("mcp.server_saved", { serverId: body.id, transport: body.transport });
+          // registry 重装即刻生效 (会话按名字解析扩展); 返回连接状态供前端展示
+          const syncResults = await McpBridge.getInstance().sync(this.store);
+          const mine = syncResults.find((r) => r.serverId === body.id);
+          this.sendJson(res, {
+            success: true,
+            ok: mine?.ok ?? true,
+            toolCount: mine?.toolCount ?? 0,
+            warnings: mine?.warnings ?? [],
+          });
+          return;
+        }
+        if (
+          method === "DELETE" &&
+          this.handleDelete(url, res, (id) => {
+            this.store.deleteMcpServer(id);
+            this.store.recordAudit("mcp.server_deleted", { serverId: id });
+          })
+        ) {
+          await McpBridge.getInstance().sync(this.store);
+          return;
+        }
+      }
+
+      // 9c. MCP 连接测试 (不落库不装扩展)
+      if (pathname === "/api/mcp-servers/test" && method === "POST") {
+        const body = await this.readJsonBody(req);
+        // 已存 server 的 headers/env 掩码值在此还原后再试连
+        const server = normalizeMcpServerInput(
+          { ...body, id: body.id || "test" },
+          body.id ? this.store.getMcpServer(body.id) : undefined,
+        );
+        this.store.recordAudit("mcp.server_test", { serverId: server.id, transport: server.transport });
+        this.sendJson(res, await McpBridge.getInstance().testServer(server));
+        return;
+      }
+
+      // 10. Scheduled Tasks API (管理台视角: 全部 Agent 的任务; 删除为逻辑删除)
+      if (pathname === "/api/scheduled-tasks") {
+        if (method === "GET") {
+          this.sendJson(res, this.store.listScheduledTasks());
+          return;
+        }
+        if (method === "DELETE" && this.handleDelete(url, res, (id) => {
+          this.store.softDeleteScheduledTask(id);
+          this.store.recordAudit("scheduler.task_deleted", { taskId: id, via: "admin" });
+        })) {
+          return;
+        }
+      }
+
+      // 11. Audit Logs API
       if (pathname === "/api/audit-logs" && method === "GET") {
         const logs = this.store.listAuditLogs(100);
         this.sendJson(res, logs);

@@ -4,6 +4,7 @@ import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completio
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { createModels, createProvider } from "@earendil-works/pi-ai/models";
 import { DatabaseStore, type ModelProtocol, type ModelProviderDefinition } from "../config/database-store.ts";
+import { lookupContextWindow } from "../config/context-windows.ts";
 import { logger } from "../utils/logger.ts";
 
 export class ModelFactory {
@@ -74,7 +75,8 @@ export class ModelFactory {
       baseUrl: p.apiBase,
       reasoning: false,
       input: ["text" as const],
-      contextWindow: 128000,
+      // 目录未命中 → 0: 终端只显示 tokens 不显示假百分比 (pi-ai 内部不依赖此值做决策)
+      contextWindow: lookupContextWindow(modelId) ?? 0,
       maxTokens: 8192,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       compat: {

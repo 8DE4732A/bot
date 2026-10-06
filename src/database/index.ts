@@ -8,6 +8,8 @@ import { runMigrations } from "./migrations.ts";
 export class DatabaseManager {
   private db: DatabaseSync;
   private static instance?: DatabaseManager;
+  /** 预编译语句缓存 (sql → StatementSync): 高频路径 (调度器秒级轮询/审计写入) 免重复 prepare */
+  private stmtCache = new Map<string, import("node:sqlite").StatementSync>();
 
   constructor(dbPath?: string) {
     const path = dbPath || getBotPaths().dbFile;
@@ -41,12 +43,17 @@ export class DatabaseManager {
   }
 
   public prepare(sql: string) {
-    return this.db.prepare(sql);
+    let stmt = this.stmtCache.get(sql);
+    if (!stmt) {
+      stmt = this.db.prepare(sql);
+      this.stmtCache.set(sql, stmt);
+      // 语句种类由代码决定 (几十条), 缓存无界但有界
+    }
+    return stmt;
   }
 
   public query<T = any>(sql: string, ...params: any[]): T[] {
-    const stmt = this.db.prepare(sql);
-    return stmt.all(...params) as T[];
+    return this.prepare(sql).all(...params) as T[];
   }
 
   public queryOne<T = any>(sql: string, ...params: any[]): T | undefined {
@@ -60,6 +67,7 @@ export class DatabaseManager {
   }
 
   public close() {
+    this.stmtCache.clear();
     this.db.close();
   }
 }

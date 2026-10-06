@@ -1,6 +1,7 @@
 # 二期设计：技能 / 插件 / 扩展的工具化支持
 
-> 状态：设计稿（2026-10）。一期代码现状见 `TECHNICAL.md`；本文的 pi 参考实现均指 `../pi/packages/coding-agent`（源码路径随文标注）。
+> 状态：**已交付**（2026-10）。M1（文档型技能）、M2（MCP 桥接）、M3（toolExposure/描述截断/连接测试）均已实现并经真实对话链路验证；M4（codemode/OAuth/热重载）仍为三期候选。
+> 一期代码现状见 `TECHNICAL.md`；本文的 pi 参考实现均指 `../pi/packages/coding-agent`（源码路径随文标注）。
 > 目标：把"技能"从当前的工具型 Extension 扩展为三类统一的能力体系，**至少交付 SKILL（文档型技能）与 MCP 接入**。
 
 ---
@@ -175,4 +176,18 @@ mcp_servers(id TEXT PK, name TEXT, transport TEXT('stdio'|'http'), command TEXT,
 
 1. **MCP server 的 Agent 级 vs 平台级**：本设计为"平台级注册 + Agent 选配"（与技能一致）。若出现"同一 server 不同 Agent 需不同凭据"，需升级为 per-agent 覆盖（类似 channel 凭据）——M2 暂不做
 2. **内核网络白名单对 MCP http 无关**（宿主转发），但 stdio 子进程继承 bash 最小环境——MCP server 需要的 env 必须显式配在 `env` 字段（安全默认）
-3. **文档型技能的沙盒可读性**：`platformDenyRead` 目前禁 `skillsDir`（工具源码不可读）。SKILL.md 正文需模型可读——调整为禁 `skills/*/index.ts`（代码）而放开 `SKILL.md`，横向隔离语义不变（skills 是平台共享资产）
+3. **文档型技能的沙盒可读性**：`platformDenyRead` 目前禁 `skillsDir`（工具源码不可读）。SKILL.md 正文需模型可读——调整为禁 `skills/*/index.ts`（代码）而放开 `SKILL.md`，横向隔离语义不变（skills 是平台共享资产）【已落地，含内核层同步；skills 代码 deny 模式不进 inode 指纹收集（glob 枚举会波及 SKILL.md）】
+
+---
+
+## 8. 实现备注（与设计的偏差与实测结论）
+
+- **read_skill 工具（§4.2 的修正）**：设计假设"无需新增工具，read 已存在"——实测发现 `read` 属于 `coding-tools` 扩展，未选配它的 Agent（非编码类）读不了 SKILL.md，渐进披露断链。skills-catalog 因此自带 `read_skill(id)` 工具：只接受注册表内的技能 id，沙盒开启时优先经 `env.readTextFile` 走 PathGuard，**执行环境拒绝或调用方 Agent 解析失败一律 fail-closed 返回错误**；`disable-model-invocation: true` 的技能 read_skill 同样拒绝（仅供宿主触发）。目录提示词同步指向 read_skill。
+- **热更新机制（实测确认）**：pi-durable 会话按**名字**解析扩展（`resolveAgent` 每次请求从 registry snapshot 取），故 MCP server 保存/停用后 `registry.install/uninstall` 即刻生效——既有会话的下一条消息自动使用新工具面，无需 reconfigure。SkillsCatalog 同理，但注意它必须显式 `registry.install`（不在 SkillRegistry 中）。**技能 reload 必须同时 reconcile AgentManager 的 durable registry**（`loadCustomSkills` 返回 added/updated/removed diff，server 层逐个 install/uninstall）——只改 SkillRegistry 是"假成功"。
+- **技能语义边界（两轮评审后明确）**：技能是**平台共享知识资产**，选配控制的是"渐进披露目录中的可发现性 + read_skill 的工具层访问"，不是硬性安全隔离——沙盒对 SKILL.md 恒放行，拥有 read 工具的 Agent 可以直接读任何 SKILL.md。需要按 Agent 硬隔离技能正文时需另做 per-agent denyRead（当前无此需求）。
+- **MCP 连接生命周期**：连接缓存 key = serverId + 配置指纹（配置变化必然 miss，旧连接关闭淘汰）；listTools 失败重连一次，**callTool 绝不重试**（外部 server 可能已执行副作用）；testServer 一次性连接不进缓存；停用/删除关闭连接回收 stdio 子进程；连接失败保留 last-known-good 工具面（不替换为 0）+ 60s 重试循环自动恢复；工具结果 20KB 中段截断 + outputLimits 双保险；工具名全局唯一（64 字符上限，净化冲突加 hash）。
+- **定时任务语义：at-most-once**。先占坑（reserve 推进 next_run_at 后才执行）防重复触发；代价是进程在 reserve 后、执行完成前崩溃会**丢失该次触发**（不补发）。这是有意的取舍：重复触发（重复发消息/重复外部动作）比偶尔丢一次更不可接受。once 任务执行失败即终止（不重试）；创建/恢复过去时间的 once 被拒绝。
+- **已知统计口径限制**：终端可观测性统计不含 compaction/summary 的 usage（durable 事件流不暴露其 usage 条目；pi footer 是扫全部 entries 实现的，我们走事件流增量）。/status 的会话累计为本进程生命周期内。
+- **审计**：`mcp.call_tool`（server/tool/参数摘要 300 字符/时长/错误）、`mcp.server_saved/deleted/test`、`scheduler.*` 均入 audit_logs；`mcp_servers.headers/env` 响应脱敏（掩码提交=保留），复用渠道凭据语义。**url 不脱敏**——凭据不要放 url 查询参数，用 headers。
+- **M3 提前并入 M2**：toolExposure（精确名 > 通配模式）、描述截断 500 字符（tool poisoning 缓解）、管理台连接测试 + exposure UI 已随 M2 交付。
+- **测试**：`test/phase2.test.ts` 覆盖 frontmatter 解析/渐进披露/加载器（共存、upsert、builtin 保护、removed diff）/MCP 命名与 exposure/InMemoryTransport 全链路桥接（真实 callTool 转发与审计、不重试、配置重建、连续 sync 名字稳定）/SKILL.md 沙盒放行语义；`test/scheduler.test.ts`、`test/notifications.test.ts` 覆盖调度与通知。两轮对抗评审（herdr Claude+Codex）后新增 10 条回归。

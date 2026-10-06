@@ -1,5 +1,5 @@
 import { api } from "../api";
-import { Empty, Icon, fmtTime, fmtUptime, initials, useAsync } from "../components/ui";
+import { Empty, Icon, KindBadge, fmtTime, fmtUptime, initials, useAsync } from "../components/ui";
 
 export function OverviewView({ onNavigate }: { onNavigate: (v: string) => void }) {
   const statusQ = useAsync(() => api.status(), []);
@@ -177,11 +177,14 @@ export function OverviewView({ onNavigate }: { onNavigate: (v: string) => void }
                   </div>
                   <div className="card__sub">{s.builtin ? "内置技能" : "本地扩展"}</div>
                 </div>
-                <span className="badge" style={{ marginLeft: "auto" }}>
-                  {s.category}
-                </span>
+                <KindBadge kind={s.kind} />
               </div>
               <div className="card__body">{s.description}</div>
+              {s.warnings && s.warnings.length > 0 ? (
+                <div className="card__body" style={{ color: "var(--warn, #b45309)", fontSize: "0.78rem" }}>
+                  ⚠ {s.warnings.join("；")}
+                </div>
+              ) : null}
               <div className="meta-row">
                 <span className="meta-label">已启用</span>
                 <span className="meta-val">

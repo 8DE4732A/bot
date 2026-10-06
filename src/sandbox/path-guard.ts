@@ -89,7 +89,15 @@ export class PathGuard {
   /** 平台保护文件的 inode 指纹 ("dev:ino"): 硬链接是同一文件的第二个名字, 路径 deny 拦不住 */
   private protectedInodes: Set<string>;
 
-  constructor(workspaceDir: string, config: BotSandboxConfig, platformDenyRead: string[] = []) {
+  constructor(
+    workspaceDir: string,
+    config: BotSandboxConfig,
+    platformDenyRead: string[] = [],
+    /** 参与 inode 指纹收集的子集 (缺省同 platformDenyRead)。
+     *  glob 条目会对目录整体枚举, 同目录的"放行"文件也会被收指纹——
+     *  skills 源码 deny 模式必须排除 (否则 SKILL.md 无法读取), 见 execution-env */
+    inodeProtect?: string[],
+  ) {
     this.workspaceDir = resolve(workspaceDir);
     this.config = config.filesystem;
     this.enabled = config.enabled;
@@ -97,7 +105,9 @@ export class PathGuard {
     // 对清单中的实际文件收集 inode 指纹 (目录不收: macOS 普通用户无法硬链接目录)。
     // 清单条目多为 glob (bot.sqlite*) 或目录 (logs/), 直接 stat 字符串收不到——
     // 先展开 glob (父目录 readdir + 前缀/正则匹配) 再逐文件指纹
-    this.protectedInodes = collectInodesCached(this.platformDenyRead);
+    this.protectedInodes = collectInodesCached(
+      (inodeProtect ?? platformDenyRead).map((p) => this.resolveReal(this.normalizePath(p))),
+    );
   }
 
 

@@ -74,6 +74,60 @@ const MIGRATIONS: ((db: DatabaseSync) => void)[] = [
       );
     `);
   },
+  // v2: MCP server 配置 (二期 M2)
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS mcp_servers (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        transport TEXT NOT NULL,
+        command TEXT,
+        args TEXT,
+        env TEXT,
+        url TEXT,
+        headers TEXT,
+        description TEXT,
+        exposure TEXT NOT NULL DEFAULT 'direct',
+        tool_exposure TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+  },
+  // v3: 定时任务 (系统级 scheduler 工具组)
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS scheduled_tasks (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        schedule_type TEXT NOT NULL,
+        run_at INTEGER,
+        interval_seconds INTEGER,
+        cron_expr TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        deleted_at INTEGER,
+        next_run_at INTEGER,
+        last_run_at INTEGER,
+        last_status TEXT,
+        last_result TEXT,
+        run_count INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_next_run
+        ON scheduled_tasks (enabled, deleted_at, next_run_at);
+    `);
+  },
+  // v4: 定时任务通知 (事件机制 → 渠道寻址)
+  (db) => {
+    db.exec(`
+      ALTER TABLE scheduled_tasks ADD COLUMN notify_channel_instance_id TEXT;
+      ALTER TABLE scheduled_tasks ADD COLUMN notify_peer_id TEXT;
+      ALTER TABLE scheduled_tasks ADD COLUMN notify_enabled INTEGER NOT NULL DEFAULT 1;
+    `);
+  },
 ];
 
 export function runMigrations(db: DatabaseSync) {

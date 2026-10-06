@@ -5,6 +5,13 @@ import { AgentManager } from "../../core/agent-manager.ts";
 import { logger } from "../../utils/logger.ts";
 import type { ChannelAdapter } from "../base.ts";
 import { ChannelManager } from "../manager.ts";
+import {
+  addTurn,
+  buildPrompt,
+  createTotals,
+  renderStatusPanel,
+  renderTurnStats,
+} from "./stats.ts";
 
 export class TerminalChannel implements ChannelAdapter {
   readonly id = "terminal-main";
@@ -15,6 +22,10 @@ export class TerminalChannel implements ChannelAdapter {
   private rl?: readline.Interface;
   private activeAgentId = "agent-default";
   private store = new DatabaseStore();
+  /** 会话可观测累计 (进程生命周期内, 随 /agent 切换重置) */
+  private totals = createTotals();
+  /** 当前 Agent 的 modelId 缓存 (prompt 每次渲染都用, 避免逐次查库; /agent 切换时刷新) */
+  private cachedModelId = "?";
 
   public async start(): Promise<void> {
     if (this.running) return;
@@ -38,8 +49,17 @@ export class TerminalChannel implements ChannelAdapter {
     }
   }
 
+  /**
+   * 主动推送 (平台通知: 定时任务结果等): REPL 等待输入时也能送达。
+   * 输出后重绘 prompt, 避免通知文本与输入行交叠。
+   */
   public async sendMessage(peerId: string, content: string): Promise<void> {
-    console.log(`\n\x1b[32mAgent:\x1b[0m ${content}\n`);
+    const lines = content.split("\n").join("\n  ");
+    process.stdout.write(`\n\x1b[36m┌─\x1b[0m \x1b[1m📢 平台通知\x1b[0m\x1b[90m (${peerId})\x1b[0m\n  ${lines}\n\x1b[36m└─\x1b[0m\n`);
+    if (this.rl) {
+      // 通知插在 prompt 之上; 重绘后用户输入行不受影响
+      this.rl.prompt(true);
+    }
   }
 
   private printBanner(): void {
@@ -72,7 +92,7 @@ export class TerminalChannel implements ChannelAdapter {
 
     while (this.running) {
       try {
-        const prompt = `\x1b[1;34m[${this.activeAgentId}] > \x1b[0m`;
+        const prompt = buildPrompt(this.activeAgentId, this.currentModelId(), this.totals);
         const line = await this.rl.question(prompt);
         if (line === null || line === undefined) {
           this.running = false;
@@ -90,6 +110,7 @@ export class TerminalChannel implements ChannelAdapter {
         // Process message through ChannelManager
         process.stdout.write("\x1b[32mAgent: \x1b[0m");
         let hasStreamed = false;
+        let turnUsageLine: string | undefined;
 
         const answer = await ChannelManager.getInstance().dispatchInbound(
           {
@@ -105,6 +126,10 @@ export class TerminalChannel implements ChannelAdapter {
               process.stdout.write(chunk.delta);
               hasStreamed = true;
             }
+            if (chunk.usage) {
+              addTurn(this.totals, chunk.usage);
+              turnUsageLine = renderTurnStats(chunk.usage);
+            }
           },
         );
 
@@ -112,6 +137,10 @@ export class TerminalChannel implements ChannelAdapter {
           process.stdout.write(answer);
         }
         console.log("\n");
+        if (turnUsageLine) {
+          console.log(turnUsageLine);
+          console.log("");
+        }
       } catch (err: any) {
         const msg = String(err?.message || err);
         if (
@@ -126,6 +155,13 @@ export class TerminalChannel implements ChannelAdapter {
         console.error(`\n\x1b[31mError: ${msg}\x1b[0m\n`);
       }
     }
+  }
+
+  private currentModelId(): string {
+    if (this.cachedModelId === "?") {
+      this.cachedModelId = this.store.getAgent(this.activeAgentId)?.model.modelId ?? "?";
+    }
+    return this.cachedModelId;
   }
 
   private async handleCommand(cmd: string): Promise<void> {
@@ -149,6 +185,8 @@ export class TerminalChannel implements ChannelAdapter {
             console.log(`\x1b[31mAgent not found: ${targetId}\x1b[0m`);
           } else {
             this.activeAgentId = targetId;
+            this.totals = createTotals(); // 统计随 agent 切换重置
+            this.cachedModelId = "?";
             const chan = this.store.getChannel(this.id);
             if (chan) {
               chan.boundAgentId = targetId;
@@ -187,6 +225,15 @@ export class TerminalChannel implements ChannelAdapter {
         console.log(`  Sandbox:       ${agent?.sandbox.enabled ? "\x1b[32mEnabled\x1b[0m" : "\x1b[31mDisabled\x1b[0m"}`);
         console.log(`  Skills:        ${agent?.skills.join(", ")}`);
         console.log("");
+        console.log(`\x1b[1mSession Usage (本进程内 · ${this.activeAgentId}):\x1b[0m`);
+        console.log(renderStatusPanel(
+          agent?.name ?? "?",
+          this.activeAgentId,
+          agent?.model.provider ?? "?",
+          agent?.model.modelId ?? "?",
+          this.totals,
+        ));
+        console.log("");
         break;
       }
       case "/admin": {
@@ -202,9 +249,11 @@ export class TerminalChannel implements ChannelAdapter {
         console.log("  /agent <id>      - 切换当前终端绑定的 Agent");
         console.log("  /reset           - 重置当前 Agent 的对话上下文");
         console.log("  /compact         - 压缩当前对话历史 (释放 Token)");
-        console.log("  /status          - 查看当前 Agent 运行状态与工作空间");
+        console.log("  /status          - 查看运行状态与可观测统计 (token/缓存/上下文)");
         console.log("  /admin           - 查看管理后台 Web 访问地址");
         console.log("  /exit            - 退出终端\n");
+        console.log("  提示: prompt 中实时显示上下文占用 (ctx %), 每轮回复后显示");
+        console.log("  ↑输入 ↓输出 R缓存读 W缓存写 CH命中率 $花费 与耗时。\n");
         break;
       }
     }

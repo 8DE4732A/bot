@@ -7,8 +7,10 @@ import { AgentsView } from "./views/AgentsView";
 import { AuditView } from "./views/AuditView";
 import { ChannelsView } from "./views/ChannelsView";
 import { ChatView } from "./views/ChatView";
+import { McpView } from "./views/McpView";
 import { OverviewView } from "./views/OverviewView";
 import { ProvidersView } from "./views/ProvidersView";
+import { ScheduledTasksView } from "./views/ScheduledTasksView";
 
 /* ---------------- 视图注册表: 新增视图只需在此加一行 ---------------- */
 
@@ -26,6 +28,8 @@ const VIEWS: ViewDef[] = [
   { view: "agents", label: "Agent", icon: "users", render: () => <AgentsView /> },
   { view: "providers", label: "模型服务商", icon: "zap", render: () => <ProvidersView /> },
   { view: "channels", label: "对话渠道", icon: "swap", render: () => <ChannelsView /> },
+  { view: "mcp", label: "MCP 服务", icon: "plug", render: () => <McpView /> },
+  { view: "tasks", label: "定时任务", icon: "clock", render: () => <ScheduledTasksView /> },
   { view: "chat", label: "对话调试", icon: "message", render: ({ agentId }) => <ChatView initialAgentId={agentId} /> },
   { view: "audit", label: "沙盒审计", icon: "shield", render: () => <AuditView /> },
 ];

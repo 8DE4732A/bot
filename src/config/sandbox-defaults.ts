@@ -1,6 +1,27 @@
 import type { BotSandboxConfig } from "./database-store.ts";
 
 /**
+ * 子进程最小环境白名单——单一真相源, 两条路线共用:
+ * - 沙盒 bash (execution-env 的 inheritEnv:false)
+ * - MCP stdio server 子进程 (bridge)
+ * 漂移有实际后果: 抄漏 SSL_CERT_FILE 会让企业根证书环境的 TLS 握手静默失败。
+ */
+export const CHILD_PROCESS_ENV_ALLOW = [
+  "PATH", "HOME", "USER", "SHELL", "TERM", "TMPDIR", "LANG", "TZ", "LC_ALL", "SSL_CERT_FILE",
+];
+
+/** 从白名单构造子进程 env (宿主 process.env 中存在的才带) */
+export function buildChildProcessEnv(extra?: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of CHILD_PROCESS_ENV_ALLOW) {
+    const value = process.env[key];
+    if (value !== undefined) out[key] = value;
+  }
+  if (extra) Object.assign(out, extra);
+  return out;
+}
+
+/**
  * 新建 Agent 的沙盒默认规则 (单一数据源):
  * migrations.ts 的种子数据与 Web 表单的新建初值共用此函数, 防止两处漂移。
  */
