@@ -1,6 +1,6 @@
 # Bot Agent — 基于 pi-durable 的轻量级多 Agent 平台
 
-> 架构详解、pi-durable 框架理解见 **docs/TECHNICAL.md**；二期设计（SKILL/MCP/统一技能模型，已交付）见 **docs/PHASE2-DESIGN.md**。
+> 架构详解、pi-durable 框架理解见 **docs/TECHNICAL.md**；二期设计（SKILL/MCP/统一技能模型，已交付）见 **docs/PHASE2-DESIGN.md**；三期设计（多渠道：飞书/QQ/微信/企微，未开工）见 **docs/PHASE3-DESIGN.md**。
 
 基于 `@earendil-works/pi-durable` 的多 Agent 对话网关：零配置文件（一切存 SQLite）、双层安全沙盒、多渠道接入（终端 + 企微/微信/QQ 预留）、免密 Web 管理后台。原始需求见 `INTEND.md`（一期目标：完整 agent 能力、沙盒、终端渠道）。
 
@@ -34,7 +34,7 @@ bun run build:binary # build:web + 编译单二进制到 bin/bot（bun build --c
    - **fail-closed 纪律**：argv 数组命令、不支持平台、wrap 失败一律拒绝执行并审计，绝不降级裸跑；
    - **宿主进程 env 不进子进程**：provider 密钥只经 `auth.resolve` 闭包，bash 强制最小环境白名单 `inheritEnv:false`；宿主进程内 fetch（fetch_url）走 `safeFetch`（拒绝内网/回环/元数据，重定向逐跳校验）。
 8. **内核网络白名单非实时（评审实证）**：ASRT 的域名过滤判定（`filterNetworkRequest`）读取的是**进程级全局 config**（`initialize`/`updateConfig` 时刻的清单），`wrapWithSandbox` 的 `customConfig.network` 只决定"是否启用网络限制"，**不更新代理的域名规则**；本项目从不调 `updateConfig`，故内核层白名单冻结在首个执行 bash 的 Agent 的配置上。应用层（read/write 的 PathGuard）是实时的（env 回调每轮从库重读）。多 Agent 各自域名配置下内核层会用错清单——根治需要 per-agent 代理（ASRT 架构限制），短期可在 `wrapCommand` 前检测配置变化并调 `updateConfig`（有微小竞态窗口，方向是最近一次 wrap 的配置）。
-9. **已知 backlog**（评审确认非阻碍性但记录在案）：temperature 是死配置（pi-durable AgentState 无该字段）；`env.cleanup()` 未接入（优雅退出由 harness.close join 任务覆盖，SIGKILL 场景接受）；safeFetch 的 DNS TOCTOU 需 runtime 层 dispatcher；删除 Agent 后 conversations.sqlite 的孤儿会话无框架删除 API（重置=删库文件）；INODE_ENTRY_LIMIT 截断后超出部分依赖内核层路径 deny；**ASRT 内置网络代理与宿主 TUN 代理（Fake-IP 198.18/15）环境不兼容**——白名单外域名正常拦截，但白名单内域名的 CONNECT 经代理挂起（实测 2026-10，宿主 Clash 类 TUN 环境），内核出网功能性失效（方向 fail-closed 不出数据）；网络层白名单在该环境下不可依赖，需 ASRT proxy 支持上游宿主代理或改用 TUN 层白名单。**内核违规监控（violation monitor）已开启**（`initialize(…, enableLogMonitor=true)`，事件经 subscribe 落 `sandbox.violation` 审计并归因 agent），但 macOS 上 file-read/file-write 类 deny 事件只记 debug 级内核日志且不带规则 logTag（实测 deny 行无 message 后缀，monitor 的 ENDSWITH 谓词匹配不到）——file 类内核拦截当前仍无审计，文件边界审计依赖应用层 PathGuard；sysctl/代理拒绝等带 logTag 的事件可正常捕获归因。**二期四轮对抗评审（herdr Claude+Codex）收敛记录**：终态双方 NO BLOCKING ISSUES；遗留 MINOR backlog——同 server 内工具名净化碰撞的 base 归属已按 name 排序确定化（listTools 顺序无关）；MCP 工具名全局唯一靠"重建时排除 MCP 自身 + id 排序 + 64 字符截断"，跨进程重启后的 transcript 旧工具名兼容未做；mcp_servers 表无 CHECK 约束（id 格式靠 API 层校验）；`.bot/skills/mcp__<id>/` 目录撞 MCP id 时 SKILL.md 被 shadowed（有诊断）；混合技能删除 index.ts 后 registry 保留旧工具条目（目录名 id 存活，文档面 stale）。
+9. **已知 backlog**（评审确认非阻碍性但记录在案）：temperature 是死配置（pi-durable AgentState 无该字段）；`env.cleanup()` 未接入（优雅退出由 harness.close join 任务覆盖，SIGKILL 场景接受）；safeFetch 的 DNS TOCTOU 需 runtime 层 dispatcher；删除 Agent 后 conversations.sqlite 的孤儿会话无框架删除 API（重置=删库文件）；INODE_ENTRY_LIMIT 截断后超出部分依赖内核层路径 deny；**ASRT 内置网络代理与宿主 TUN 代理（Fake-IP 198.18/15）环境不兼容**——白名单外域名正常拦截，但白名单内域名的 CONNECT 经代理挂起（实测 2026-10，宿主 Clash 类 TUN 环境），内核出网功能性失效（方向 fail-closed 不出数据）；网络层白名单在该环境下不可依赖，需 ASRT proxy 支持上游宿主代理或改用 TUN 层白名单。**内核违规监控（violation monitor）已开启**（`initialize(…, enableLogMonitor=true)`，事件经 subscribe 落 `sandbox.violation` 审计并归因 agent），但 macOS 上 file-read/file-write 类 deny 事件只记 debug 级内核日志且不带规则 logTag（实测 deny 行无 message 后缀，monitor 的 ENDSWITH 谓词匹配不到）——file 类内核拦截当前仍无审计，文件边界审计依赖应用层 PathGuard；sysctl/代理拒绝等带 logTag 的事件可正常捕获归因。**二期四轮对抗评审（herdr Claude+Codex）收敛记录**：终态双方 NO BLOCKING ISSUES；遗留 MINOR backlog——同 server 内工具名净化碰撞的 base 归属已按 name 排序确定化（listTools 顺序无关）；MCP 工具名全局唯一靠"重建时排除 MCP 自身 + id 排序 + 64 字符截断"，跨进程重启后的 transcript 旧工具名兼容未做；mcp_servers 表无 CHECK 约束（id 格式靠 API 层校验）；`.bot/skills/mcp__<id>/` 目录撞 MCP id 时 SKILL.md 被 shadowed（有诊断）；混合技能删除 index.ts 后 registry 保留旧工具条目（目录名 id 存活，文档面 stale）。**三期渠道 backlog（均未实测真机凭据，连上后验证）**：四渠道 adapter 未经全量真机联调（协议语义对照 hermes 生产实现移植，QQ/微信接口字段可能演进）；飞书 text 消息不渲染 markdown（出站降级 plain，interactive 卡片形态未做）；QQ 主动消息月 4 条配额未做配额记账；微信 iLink 无 SLA（-14 会话过期需重新扫码）；群聊 @ 过滤依赖平台事件订阅层（allowFrom 白名单已实现，未配置时群消息放行——成本防护由 loop-guard 兜底）；微信 QR 扫码 UI 呈现为 liteapp 链接而非内嵌二维码图；投递账本（delivery ledger）未实现；Telegram 未确认 updates 游标不持久化的重启重投语义（官方以确认前保留为准）。**三轮对抗评审（herdr Claude+Codex 空上下文）修复记录（2026-10）**：R1 8 BLOCKING（unhandled rejection 杀进程/QQ 致命码/飞书媒体 API/企微分段/Telegram 去重键与预算/微信指纹去重/stop 挂死）→ R2 2 BLOCKING（QR redirect_host SSRF 白名单/terminal 热替换保护）+ 生命周期统一（POST/QR/DELETE 全走 restartChannel 单飞+代际收敛，start 失败注销，DELETE 前置保留项保护并同步等待）→ R3 1 BLOCKING（分段器围栏预算 off-by-one）+ 收尾（三渠道媒体 storeMediaStream 真流式含管道内 AES 解密与建连超时、DB WAL/SHM chmod、QQ token/gateway 超时、pre-coalesce per-peer 限流 30/min、防抖附件并集上限、Telegram 群消息 @ 判定不依赖 privacy mode、截断末段围栏补全、allowFrom 只匹配不可变 peerId、.bot/channels 进双层沙盒 deny、QR 端点限 weixin 类型/禁用渠道、已存渠道禁改 type、前端二维码图、管理台 allowFrom 字段）。regression tests：分段器 off-by-one/小预算死循环/围栏闭合/emoji 边界/附件并集（phase3 套件 19 用例）。R6 修复：信号量可重入化（AsyncLocalStorage 上下文——adapter 外层建连占位 + 内层 storeMediaStream 复用同一 slot，消除 4 并发确定性自锁死锁）；QR confirmed 锁内重读配置再写库（旧快照不得复活已删除渠道/覆盖并发修改）；飞书超时路径 slot 占用至底层 axios settle（有界 60s，防 fd 泄漏）；企微 SDK Buffer 路径纳入全局信号量与强制水位。R5 修复：restartChannel 循环简化为锁内单次重启（锁内才重读最新配置，循环在旧代际遇新代际时活锁——B-R5-1 教训：epoch set 丢失导致无限重启风暴，已由渠道生命周期端到端测试守护：无凭据 weixin POST 必须超时前返回 500）；媒体信号量前移到建连/SDK 请求阶段（withDownloadSlot 全程作用域）；磁盘水位强制触发（进程累计落盘 128MB 无视 sweep 节流）；截断围栏补全改用段首开围栏标记（嵌套时内部标记不是边界）。**R7-R9 收敛**：信号量可重入（AsyncLocalStorage——嵌套占位死锁根治）、QR 锁内重读配置（旧快照不复活已删渠道）、飞书 httpInstance 注入自定义 axios（60s 原生超时 + 精确复刻 SDK 的 UA/resp.data 解包 interceptor——裸实例会导致 token/消息 API 全部失败，已对真实 API 冒烟）、企微纳入信号量与强制水位。**终态：六轮评审双方 NO BLOCKING ISSUES。** 已记录取舍 backlog：wecom SDK downloadFile 返回 Buffer、分段器病态小预算契约、DNS TOCTOU（既有）、媒体缓存 per-channel 配额未分账。**R4 修复：per-channel 互斥锁统一 restart/delete 临界区（防交叉产生僵尸渠道）、QR confirmed 自增代际（新凭据不被同 epoch 在途重启吞掉）、terminal 既有实例可经管理台编辑（仅禁新建）、start 失败本代如实 500（旧代静默交新代处理）、限流 Map 逐插容量守护+过期清扫（防唯一 peer 洪水 OOM）、微信 item_list 附件上限 4、媒体全局并发信号量（4）+ 总磁盘水位 1GB（sweep 从最旧删除）、飞书 SDK 请求阶段 60s race（axios 默认无超时）、截断末段围栏补全升级（识别 ~~~/四反引号+补全计入预算）、DB chmod 挪到 pragmas 后（覆盖首启新建的 WAL）+ 失败告警、QQ stop 等待 close+lastInboundMsgId LRU、telegram 命令过滤 @otherbot、API 空字符串不清空 secret、QR status 前置 enabled 检查、weixin typing 30s。**第一轮修复明细**：B1 级——coalesce 定时器链 unhandled rejection 杀进程（flush 内置 catch）、QQ 致命 close 码对齐 hermes（4004 刷 token/4006/4007/4009 清 session 重连）、飞书媒体改 messageResource.get（image.get/file.get 对用户资源平台直接拒绝且返回非 Buffer）、企微流式路径超限分段兜底、Telegram 去重键拼 chatId 前缀（message_id 是 per-chat 计数）+ 4096 字节预算、微信内容指纹去重删除（合法重复文本被误杀）、微信 stop 可中断（stopAwareSleep + AbortController，QR 热重启不再挂 10 分钟）、渠道 CRUD 与 adapter 生命周期对齐（保存热替换/停用停止/删除回收+清媒体缓存）、loop-guard 改为按派发计数（防抖后）+ 审计节流、allowFrom 访问策略、DB 文件 0600、QQ typing 用 input_notify 协议体且限单聊、QQ 端点选择以入站记录的 chatType 为准（弃 G 前缀启发式）、safeFetch 跨源重定向摘 Authorization、凭据清空保旧（后端合并）、wecom/qq/weixin/telegram 网络调用全部带超时。
 
 ## 架构
 
@@ -92,12 +92,21 @@ src/
 │   └── loader.ts           扫描 <cwd>/.bot/skills/：SKILL.md → 文档型条目（id=目录名），
 │                           index.ts → 工具型 Extension（现状不变；同 id 冲突 extension 优先）
 ├── channels/
-│   ├── base.ts             ChannelAdapter 接口（id/type/start/stop/sendMessage）
+│   ├── base.ts             ChannelAdapter 契约（id/type/start/stop/sendMessage +
+│   │                       sendReply?/maxMessageBytes?/markdownMode?/sendTyping?/
+│   │                       healthCheck?）+ InboundMessage（媒体附件/replyContext/
+│   │                       messageId 去重键/conversationType）
 │   ├── factory.ts          渠道工厂：CHANNEL_TYPES 注册表 (type → 构造器) 实例化
 │   │                       adapter；新渠道只需实现 ChannelAdapter 并登记一行；
 │   │                       terminal 不经工厂（由 CLI 特殊管理）
 │   ├── manager.ts          ChannelManager 单例：startAll 从数据库配置实例化并启动全部
-│   │                       已启用渠道；按 boundAgentId 路由分发消息
+│   │                       已启用渠道；按 boundAgentId 路由分发；
+│   │                       dispatchAndReply/deliverOutbound（降级→分段→sendReply
+│   │                       优先、超窗回退 sendMessage）
+│   ├── runtime/            渠道运行时（全部渠道共用, 三期 M0）：dedupe（去重）、
+│   │                       coalesce（防抖合并）、segmenter（块级贪心分段, 围栏块
+│   │                       不可切）、markdown（降级）、typing（心跳）、media-cache
+│   │                       （媒体缓存）、loop-guard（防自循环）、dispatch（管道组装）
 │   ├── terminal/index.ts   本地 REPL 渠道（terminal-main）+ 斜杠命令；
 │   │                       动态 prompt（agent·model·ctx%）+ 每轮统计行
 │   │                       （↑↓ R/W 缓存 · CH 命中率 · ctx 上下文占比 · $ 耗时）
@@ -105,7 +114,9 @@ src/
 │   ├── terminal/stats.ts   统计渲染纯函数（可测试）：数据源 = watchEvents 的
 │                           usage_changed 事件（会话累计）+ 轮前 snapshot 差值；
 │                           当前上下文 = 本轮 prompt 侧（累计值会虚高，勿改）
-│   └── adapters/           wecom/weixin/qq 适配器（二期实现真实连接，现为占位）
+│   └── adapters/           feishu/wecom/qq/weixin/telegram（三期真实实现：飞书/
+│                           企微/QQ 官方 SDK 或官方 API + 微信 iLink 协议自实现 +
+│                           Telegram 基准渠道；全部 WS 长连接/长轮询免公网）
 └── server/
     ├── server.ts           AdminWebServer：原生 node:http + REST API（providers/agents/
     │                       channels/skills/audit-logs/chat SSE 流式），默认监听
@@ -131,17 +142,37 @@ scripts/
 - **工作流**：改 UI 一律改 `web/src/`，`bun run dev:web` 热更新；改完 `bun run build:web` 重新生成内嵌资源（generated.ts 需随改动提交）。后端 API 不变时前端可独立开发。
 - **对齐约束**：表单保存的默认值（temperature 0.7、thinkingLevel medium、denyWrite `['.git','*.pem','*.key']` 等）需与后端 migrations.ts 种子保持语义一致。
 
-### 消息流转
+### 消息流转（三期：统一入站管道 + 出站投递）
 
 ```
-渠道(Terminal/Web/API) → ChannelManager.dispatchInbound
-  → 按渠道配置解析 boundAgentId（缺省 agent-default）
-  → AgentManager.chat(agentId, `${channelInstanceId}:${peerId}`, text, onChunk)
-      → getOrCreateConversation：channel_sessions 表恢复或新建 pi-durable Conversation
-        （每次都会 conv.configure 同步最新模型/instructions/cwd/skills）
-      → conv.submit + watch 流式回调（delta / toolCall）→ commit
-  → 回调输出到终端 / SSE / JSON
+IM 渠道 adapter → InboundPipeline.submit（渠道运行时, src/channels/runtime/）
+  ① dedupe（messageId TTL 去重, 防平台重推）→ ② loop-guard（群聊防自循环熔断, 8 次/60s）
+  → ③ 媒体入站即下载（media-cache: safeFetch 强制/CDN 白名单, 落 .bot/media/, 128MB 上限 24h TTL）
+  → ④ coalesce（同 peer 防抖合并 5s/30s, 连发只派发一次）
+  → ⑤ ChannelManager.dispatchAndReply
+      → dispatchInbound：AgentManager.chat(`${channelInstanceId}:${peerId}`, …)
+      → deliverOutbound：markdownMode 降级（full/limited/plain）→ maxMessageBytes 分段
+        （segmenter: 块级贪心打包, 围栏块不可切）→ sendReply(replyContext) 优先,
+        超窗/失败回退 sendMessage（主动）→ 多段间隔 300ms
 ```
+
+被动回复窗口语义留在 adapter 内（`sendReply` 返回 false 即超窗）；飞书=引用回复、
+QQ=msg_id+msg_seq（群 5min/单聊 60min）、微信=context_token、企微=原帧 req_id 流式。
+终端/Web 渠道不经此管道（直连 chat）。
+
+### 三期渠道（全部官方 SDK / 官方 API，WS 长连接免公网）
+
+| 渠道 | type | 凭据 | 实现 |
+|---|---|---|---|
+| 飞书 | `feishu` | appId+appSecret | `@larksuiteoapi/node-sdk` WSClient；媒体经 `im.v1.image/file.get` → storeMediaBytes |
+| 企微智能机器人 | `wecom` | botId+secret | `@wecom/aibot-node-sdk` WS 长连接；**全渠道唯一流式回复**（onChunk → replyStream 800ms 节流全量刷新，断流降级主动推送）；加密媒体 `ws.downloadFile(url, aeskey)` |
+| QQ | `qq` | appId+clientSecret（`sandbox` 可选） | 自实现薄 WS 客户端（token 单飞刷新 → gateway → Hello/Identify/Resume/心跳，语义移植自 hermes qqbot adapter）；REST `/v2/users|groups/{id}/messages` |
+| 微信个人号 | `weixin` | 无字段（**扫码登录**） | iLink Bot API 长轮询（协议移植自 hermes weixin.py）；context_token 落盘、-14 降级 tokenless 重发、AES-128-ECB 媒体；扫码端点 `POST /api/channels/:id/qr-login` |
+| Telegram | `telegram` | botToken | Bot API 长轮询（零依赖基准渠道，验收运行时设施） |
+
+渠道共性：adapter 声明 `maxMessageBytes`/`markdownMode`/`sendReply?`/`sendTyping?`/`healthCheck?`；
+管理台表单按 `CHANNEL_FORM_SCHEMAS`（ChannelsView）声明式渲染凭据字段；微信凭据文件落
+`.bot/channels/weixin/<accountId>/`（0600）。**通知兜底只投终端类渠道**（IM peerId 不可跨渠道移植）。
 
 ### 双层沙盒
 
@@ -158,7 +189,7 @@ scripts/
 
 ### 管理后台 API（server.ts）
 
-`/api/status`、`/api/config`（GET/POST）、`/api/providers`（GET/POST/DELETE）、`/api/providers/fetch-models`、`/api/providers/test`、`/api/agents`（GET/POST/DELETE）、`/api/channels`（GET/POST/DELETE）、`/api/skills`、`/api/mcp-servers`（GET/POST/DELETE；headers/env 脱敏语义同渠道凭据）、`/api/mcp-servers/test`（连接试测，不落库）、`/api/scheduled-tasks`（GET 全部 Agent 的任务 / DELETE 逻辑删除）、`/api/audit-logs`、`/api/chat`（POST，Accept: text/event-stream 时走 SSE 流式）、`/api/chat/reset`。
+`/api/status`、`/api/config`（GET/POST）、`/api/providers`（GET/POST/DELETE）、`/api/providers/fetch-models`、`/api/providers/test`、`/api/agents`（GET/POST/DELETE）、`/api/channels`（GET/POST/DELETE）、`/api/channels/:id/health`（adapter 健康检查）、`/api/channels/:id/qr-login` + `/qr-status`（微信 iLink 扫码, confirmed 自动并入凭据并热重启 adapter）、`/api/skills`、`/api/mcp-servers`（GET/POST/DELETE；headers/env 脱敏语义同渠道凭据）、`/api/mcp-servers/test`（连接试测，不落库）、`/api/scheduled-tasks`（GET 全部 Agent 的任务 / DELETE 逻辑删除）、`/api/audit-logs`、`/api/chat`（POST，Accept: text/event-stream 时走 SSE 流式）、`/api/chat/reset`。
 
 保存 provider/agent 后需调用 `AgentManager.reloadModels()` 热刷新 pi-ai 模型注册（server.ts 中已这样处理）。
 
@@ -172,6 +203,6 @@ scripts/
   - **MCP** (`kind: "mcp"`，id=`mcp__<serverId>`)：管理台「MCP 服务」页配置（stdio/HTTP），`McpBridge.sync()` 桥接为动态 Extension；pi-durable 会话按名字解析扩展，registry 同名 install 即刻生效（含既有会话）。
   - **定时任务**（内置技能 `scheduler`）：`schedule_create/list/update/delete` 四工具；任务归属创建它的 Agent（经 `api.conversationId` → `AgentManager.getAgentIdForConversation` 反查，fail-closed）；触发由 `SchedulerManager`（cli 启动）执行，会话 key `scheduler:<taskId>` 天然复用同一 conversation；interval 最小 60s（防高频烧 token）；删除为逻辑删除。**触发结果经事件机制推送渠道**：SchedulerManager publish `scheduler.completed` → NotificationDispatcher 按"任务记录的通知目标（来源渠道+peer）→ Agent 绑定渠道兜底"投递——渠道层寻址与会话无关，会话重置不影响；通知目标依赖真实渠道映射行（`chat` 的 `origin` 参数写入，`getSessionByConversation` 优先非哨兵行）。
   - skills-catalog 本身**不注册进 SkillRegistry**（避免出现在选配列表），但必须在 `AgentManager.init` 显式 `registry.install`——会话按名字解析，缺注册物会被静默丢弃。
-- **新渠道**：实现 `ChannelAdapter` 接口，在 `ChannelManager` 注册；渠道实例与 Agent 的绑定关系存 `channel_instances.bound_agent_id`。
+- **新渠道**：实现 `ChannelAdapter` 接口（出站可选声明 `sendReply`/`maxMessageBytes`/`markdownMode`/`sendTyping`/`healthCheck`），在 `factory.ts` 的 `CHANNEL_TYPES` 注册一行；入站走 `InboundPipeline`（渠道运行时自动获得去重/防抖/媒体/防自循环），终点为 `ChannelManager.dispatchAndReply`；渠道实例与 Agent 的绑定关系存 `channel_instances.bound_agent_id`；管理台凭据表单在 `ChannelsView` 的 `CHANNEL_FORM_SCHEMAS` 加声明（secret 字段沿用掩码还原语义）。
 - **测试**：`test/` 下 9 个套件（paths/database/sandbox/skills/server/phase2/scheduler/notifications 等），基于 `bun:test`，多为真实文件系统 + 真实 HTTP 端口的集成测试；server 测试已隔离到临时目录（测试顶部显式 `DatabaseManager.getInstance(临时路径)` + `logger.init(临时目录)`，新增测试套件须沿用此模式，勿写真实 cwd 的 `.bot/`）；**单例被全部套件共享（首个 getInstance 绑定生效），任何套件不得 rmSync 单例库文件所在目录**，否则并行套件会 disk I/O error。
 - 代码中的中文注释/命名（如技能名称、终端 banner）是刻意为之，保持一致。

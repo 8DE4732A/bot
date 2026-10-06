@@ -49,7 +49,7 @@ export interface AgentDefinition {
 
 export interface ChannelInstanceConfig {
   id: string;
-  type: "terminal" | "wecom" | "weixin" | "qq";
+  type: "terminal" | "wecom" | "weixin" | "qq" | "feishu" | "telegram";
   name: string;
   enabled: boolean;
   boundAgentId: string;

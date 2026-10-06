@@ -67,11 +67,12 @@ export class NotificationDispatcher {
       if (delivered) deliveredChannel = task.notifyChannelInstanceId;
     }
 
-    // 兜底: 该 Agent 绑定的启用渠道 (如 terminal)
+    // 兜底: 该 Agent 绑定的启用渠道。仅终端类可用——IM 渠道的 peerId 不可跨
+    // 渠道移植, 没有真实 peer (任务记录的目标) 时跳过, 绝不发往渠道级假地址
+    // (三期设计 §8.4)。
     if (!delivered) {
-      const fallback = channelManager.findFallbackChannelForAgent(e.agentId);
+      const fallback = channelManager.findFallbackChannelForAgent(e.agentId, (a) => a.type === "terminal");
       if (fallback) {
-        // peer 对通知型渠道无寻址意义 (终端单用户); IM 渠道的通知需要真实 peer, 由任务的目标列承担
         delivered = await channelManager.sendNotification(fallback.id, "platform-notify", content).catch(() => false);
         if (delivered) deliveredChannel = fallback.id;
       }

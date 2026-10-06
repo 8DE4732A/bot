@@ -49,12 +49,23 @@ export interface Agent {
 
 export interface Channel {
   id: string;
-  type: "terminal" | "wecom" | "weixin" | "qq";
+  type: "terminal" | "wecom" | "weixin" | "qq" | "feishu" | "telegram";
   name: string;
   enabled: boolean;
   boundAgentId: string;
   credentials: Record<string, unknown>;
   updatedAt: number;
+}
+
+export interface ChannelHealth {
+  ok: boolean;
+  detail?: string;
+}
+
+export interface WeixinQrLogin {
+  qrcode: string;
+  qrcodeImgContent: string;
+  dataUrl?: string;
 }
 
 export type SkillKind = "extension" | "skill" | "mcp";

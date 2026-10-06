@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { getBotPaths } from "../config/env-paths.ts";
 import { logger } from "../utils/logger.ts";
@@ -18,7 +18,23 @@ export class DatabaseManager {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.initPragmas();
+    // 库内含全部凭据 (provider key/渠道 secret/微信 token)——收紧到 0600
+    // (SQLite 新建文件默认 0644)。必须在 initPragmas 之后: WAL/SHM 由
+    // journal_mode=pragma 创建, 先 chmod 会漏掉首次启动新建的 WAL。
+    // WAL 里就是最近写入的凭据页, 只锁主库等于没锁
+    this.tightenFilePermissions(path);
     runMigrations(this.db);
+  }
+
+  /** 凭据库三文件收紧 0600 (失败必须告警——静默降级等于 0644 裸奔) */
+  private tightenFilePermissions(path: string): void {
+    for (const file of [path, `${path}-wal`, `${path}-shm`]) {
+      try {
+        chmodSync(file, 0o600);
+      } catch (err) {
+        logger.warn("Database", `Failed to tighten permissions on ${file}: ${err}`);
+      }
+    }
   }
 
   public static getInstance(dbPath?: string): DatabaseManager {

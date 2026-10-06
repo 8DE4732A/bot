@@ -53,6 +53,9 @@ function platformDenyRead(agentWorkspace: string, store: DatabaseStore): string[
   const deny = [
     join(paths.dotBot, "bot.sqlite*"),
     join(paths.dotBot, "conversations.sqlite*"),
+    // 渠道持久化凭据 (微信 bot_token/context_token 等)——0600 只防其他 OS 用户,
+    // 沙盒 Agent 同一 OS 用户, 必须靠路径 deny (与 kernelDenyRead 同步演进)
+    join(paths.dotBot, "channels"),
     paths.logsDir,
     join(paths.root, ".env*"),
     join(paths.root, ".git-credentials"),

@@ -4,6 +4,8 @@ import type { ChannelAdapter } from "./base.ts";
 import { QQChannelAdapter } from "./adapters/qq.ts";
 import { WeComChannelAdapter } from "./adapters/wecom.ts";
 import { WeixinChannelAdapter } from "./adapters/weixin.ts";
+import { FeishuChannelAdapter } from "./adapters/feishu.ts";
+import { TelegramChannelAdapter } from "./adapters/telegram.ts";
 
 /**
  * 渠道类型注册表: 新增渠道只需实现 ChannelAdapter 并在此登记一行。
@@ -13,6 +15,8 @@ const CHANNEL_TYPES: Record<string, new (id: string, name: string, credentials: 
   wecom: WeComChannelAdapter,
   weixin: WeixinChannelAdapter,
   qq: QQChannelAdapter,
+  feishu: FeishuChannelAdapter,
+  telegram: TelegramChannelAdapter,
 };
 
 export function createChannelAdapter(config: ChannelInstanceConfig): ChannelAdapter | null {

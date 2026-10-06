@@ -143,11 +143,13 @@ describe("notifications: 事件 → 渠道分发", () => {
       runNumber: 1,
       result: "fallback 结果",
     });
-    // fallback = 该 Agent 绑定的启用渠道 (updatedAt 最新优先 → im-test)
-    const before = recorded.length;
-    const hit = await waitFor(() => recorded.length > before);
+    // fallback 仅限终端类渠道 (peerless)——IM 渠道的 peerId 不可跨渠道移植
+    const before = recordedTerminal.length;
+    const hit = await waitFor(() => recordedTerminal.length > before);
     expect(hit).toBe(true);
-    expect(recorded.at(-1)?.content).toContain("fallback 任务");
+    expect(recordedTerminal.at(-1)?.content).toContain("fallback 任务");
+    // 不允许发往 IM 渠道的渠道级假地址 (三期设计 §8.4)
+    expect(recorded.some((r) => r.content.includes("fallback 任务"))).toBe(false);
   });
 
   test("notify_enabled=false 的任务不推送", async () => {

@@ -3,11 +3,13 @@ import type {
   AuditLog,
   ChatChunk,
   Channel,
+  ChannelHealth,
   McpServer,
   ModelProvider,
   ScheduledTask,
   Skill,
   SystemStatus,
+  WeixinQrLogin,
 } from "./types";
 
 /** 从非 2xx 响应中提取错误消息 (统一给 json() 与 chatStream 使用) */
@@ -83,6 +85,17 @@ export const api = {
     fetch(`/api/channels?id=${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) =>
       json<{ success: boolean }>(r),
     ),
+  channelHealth: (id: string) =>
+    fetch(`/api/channels/${encodeURIComponent(id)}/health`).then((r) => json<ChannelHealth>(r)),
+  weixinQrLogin: (id: string) =>
+    fetch(`/api/channels/${encodeURIComponent(id)}/qr-login`, { method: "POST" }).then((r) =>
+      json<WeixinQrLogin>(r),
+    ),
+  weixinQrStatus: (id: string, qrcode: string, redirectHost?: string) =>
+    fetch(
+      `/api/channels/${encodeURIComponent(id)}/qr-status?qrcode=${encodeURIComponent(qrcode)}${redirectHost ? `&redirect_host=${encodeURIComponent(redirectHost)}` : ""}`,
+    ).then((r) => json<{ status: string; redirectHost?: string }>(r)),
+
 
   listSkills: () => fetch("/api/skills").then((r) => json<Skill[]>(r)),
   listAuditLogs: () => fetch("/api/audit-logs").then((r) => json<AuditLog[]>(r)),

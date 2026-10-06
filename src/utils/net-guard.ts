@@ -38,7 +38,8 @@ export async function assertSafeRemoteUrl(rawUrl: string): Promise<URL> {
   try {
     url = new URL(rawUrl);
   } catch {
-    throw new Error(`Invalid URL: ${rawUrl}`);
+    // 不带原始 URL——平台下载 URL 可能内嵌凭据 (Telegram bot token)
+    throw new Error("Invalid URL (unable to parse)");
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error(`Blocked non-HTTP URL scheme: ${url.protocol}`);
@@ -68,15 +69,30 @@ export async function assertSafeRemoteUrl(rawUrl: string): Promise<URL> {
 
 const MAX_REDIRECTS = 3;
 
-/** 带 SSRF 校验的受限 fetch: 每一跳重定向都重新校验目标 */
+/** 带 SSRF 校验的受限 fetch: 每一跳重定向都重新校验目标;
+ * 跨源重定向时剥离 Authorization (认证头绝不跟随到跳转目标) */
 export async function safeFetch(rawUrl: string, init?: RequestInit): Promise<Response> {
   let url = await assertSafeRemoteUrl(rawUrl);
+  let headers: Record<string, string> | undefined;
+  if (init?.headers) {
+    // 兼容普通对象与 Headers 实例 (统一成对象便于跨源摘头)
+    headers = init.headers instanceof Headers
+      ? Object.fromEntries(init.headers.entries())
+      : { ...(init.headers as Record<string, string>) };
+  }
   for (let hop = 0; ; hop++) {
-    const res = await fetch(url, { ...init, redirect: "manual" });
+    const res = await fetch(url, { ...init, headers, redirect: "manual" });
     const location = res.headers.get("location");
     if (res.status >= 300 && res.status < 400 && location) {
-      if (hop >= MAX_REDIRECTS) throw new Error(`Too many redirects fetching ${rawUrl}`);
-      url = await assertSafeRemoteUrl(new URL(location, url).toString());
+      // 错误信息不带原始 URL——平台下载 URL 可能内嵌凭据 (Telegram bot token)
+      if (hop >= MAX_REDIRECTS) throw new Error(`Too many redirects (>= ${MAX_REDIRECTS + 1}) following media/platform URL`);
+      const next = await assertSafeRemoteUrl(new URL(location, url).toString());
+      // 跳转目标 origin 变化 → 摘除 Authorization (最小暴露)
+      if (headers && new URL(next).origin !== new URL(url).origin) {
+        const { Authorization, authorization, ...rest } = headers;
+        headers = rest;
+      }
+      url = next;
       continue;
     }
     return res;

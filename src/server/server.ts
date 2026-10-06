@@ -1,10 +1,14 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { networkInterfaces } from "node:os";
+import QRCode from "qrcode";
 import { DatabaseStore } from "../config/database-store.ts";
 import { getAgentWorkspaceDir } from "../config/env-paths.ts";
 import { AgentManager } from "../core/agent-manager.ts";
 import { ModelFactory } from "../core/model-factory.ts";
 import { ChannelManager } from "../channels/manager.ts";
+import { createChannelAdapter } from "../channels/factory.ts";
+import { startQrLogin, pollQrStatus, extractQrCredentials, clearWeixinPersistedState } from "../channels/adapters/weixin.ts";
+import { clearMediaCache } from "../channels/runtime/media-cache.ts";
 import { McpBridge } from "../skills/mcp/bridge.ts";
 import type { McpServerDefinition } from "../config/database-store.ts";
 import { SkillRegistry } from "../skills/registry.ts";
@@ -57,6 +61,17 @@ function maskProviderKey(p: ReturnType<DatabaseStore["listModelProviders"]>[numb
 const CREDENTIAL_MASK = "••••";
 
 /** 渠道凭据脱敏: 字符串值统一掩码; 提交时值为掩码的字段由后端还原旧值 */
+/** 渠道类型枚举 (与 factory CHANNEL_TYPES 对齐; terminal 由 CLI 管理) */
+const CHANNEL_TYPE_KEYS = new Set(["wecom", "weixin", "qq", "feishu", "telegram"]);
+/** 各渠道类型的 secret 凭据字段 (保存时清空/掩码 → 保留旧值; 非 secret 字段可显式清空) */
+const SECRET_CREDENTIAL_KEYS: Record<string, string[]> = {
+  feishu: ["appSecret"],
+  qq: ["clientSecret"],
+  wecom: ["secret"],
+  weixin: ["token"],
+  telegram: ["botToken"],
+};
+
 function maskCredentials(credentials: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(credentials ?? {})) {
@@ -411,18 +426,162 @@ export class AdminWebServer {
             this.sendError(res, 400, "id, name, type, and boundAgentId are required");
             return;
           }
-          // 值为掩码的字段由后端还原为已存凭据 (前端不持有明文)
-          body.credentials = unmaskCredentials(
-            body.credentials ?? {},
-            this.store.getChannel(body.id)?.credentials ?? {},
-          );
+          // type 必须是已注册的渠道类型 (terminal 只允许编辑既有实例——
+          // 它由 CLI 管理, 新建无意义, 但绑定 Agent 的修改必须可达)
+          const existingForType = this.store.getChannel(body.id);
+          if (!CHANNEL_TYPE_KEYS.has(body.type) && body.type !== "terminal") {
+            this.sendError(res, 400, `unknown channel type: ${body.type}`);
+            return;
+          }
+          if (body.type === "terminal" && !existingForType) {
+            this.sendError(res, 400, "terminal channels are managed by the CLI and cannot be created here");
+            return;
+          }
+          body.enabled = body.enabled !== false;
+          if (!this.store.getAgent(body.boundAgentId)) {
+            this.sendError(res, 400, `bound agent '${body.boundAgentId}' does not exist`);
+            return;
+          }
+          const previous = this.store.getChannel(body.id);
+          // 已有渠道禁止改 type (跨类型凭据合并会互相污染)
+          if (previous && previous.type !== body.type) {
+            this.sendError(res, 400, `channel '${body.id}' type cannot be changed (${previous.type} → ${body.type})`);
+            return;
+          }
+          // secret 字段: 值为掩码或被清空都保留旧值 (凭据是连接的关键机密,
+          // 清空即删会静默断连——删除渠道重建才是显式路径);
+          // 非 secret 字段按提交值覆盖 (显式可清空)
+          const prevCreds = previous?.credentials ?? {};
+          const merged: Record<string, unknown> = { ...prevCreds };
+          const nextCreds = unmaskCredentials(body.credentials ?? {}, prevCreds);
+          for (const k of Object.keys(merged)) {
+            if (SECRET_CREDENTIAL_KEYS[body.type]?.includes(k)) continue;
+            if (!(k in nextCreds)) delete merged[k];
+          }
+          for (const [k, v] of Object.entries(nextCreds)) {
+            // secret 字段空字符串提交 = 保旧 (与前端清空删 key 的语义一致)
+            if (SECRET_CREDENTIAL_KEYS[body.type]?.includes(k) && v === "") continue;
+            merged[k] = v;
+          }
+          body.credentials = merged;
           this.store.saveChannel(body);
+
+          // 生命周期统一入口: 热替换/停用走带单飞锁的 restartChannel
+          // (terminal 由 CLI 特殊管理, restartChannel 内部跳过)
+          const epoch = (this.channelConfigEpoch.get(body.id) ?? 0) + 1;
+          try {
+            await this.restartChannel(body.id, epoch);
+          } catch (err) {
+            this.sendError(res, 500, `channel saved but adapter start failed: ${err instanceof Error ? err.message : err}`);
+            return;
+          }
+          this.store.recordAudit("channel.saved", { channelId: body.id, type: body.type, enabled: body.enabled });
           this.sendJson(res, { success: true });
           return;
         }
-        if (method === "DELETE" && this.handleDelete(url, res, (id) => this.store.deleteChannel(id))) {
+        if (method === "DELETE") {
+          const handled = await this.handleDeleteAsync(url, res, (id) => this.deleteChannelFully(id));
+          if (handled) return;
+        }
+      }
+
+      // 8b. 渠道健康检查 (adapter.healthCheck, 管理台渠道卡片)
+      if (/^\/api\/channels\/[^/]+\/health$/.test(pathname) && method === "GET") {
+        const channelId = decodeURIComponent(pathname.split("/")[3]);
+        const adapter = ChannelManager.getInstance().getAdapter(channelId);
+        if (!adapter) {
+          this.sendError(res, 404, `Channel '${channelId}' is not running`);
           return;
         }
+        // 未实现 healthCheck 的 adapter 不能默认健康 (可能已断线/过期);
+        // 终端是本地常驻例外
+        const health = adapter.healthCheck
+          ? await adapter.healthCheck().catch((err) => ({ ok: false, detail: String(err) }))
+          : adapter.type === "terminal"
+            ? { ok: true, detail: "local terminal" }
+            : { ok: false, detail: "unknown (no health check implemented)" };
+        this.sendJson(res, health);
+        return;
+      }
+
+      // 8c. 微信 iLink 扫码登录 (POST 发起 → 前端展示二维码链接 → GET 轮询状态;
+      // confirmed 时凭据自动并入渠道 credentials 并热重启 adapter)
+      // 仅对 weixin 类型渠道开放 (防止把 iLink 凭据写进其他渠道)
+      if (/^\/api\/channels\/[^/]+\/qr-login$/.test(pathname) && method === "POST") {
+        const channelId = decodeURIComponent(pathname.split("/")[3]);
+        const channel = this.store.getChannel(channelId);
+        if (!channel || channel.type !== "weixin") {
+          this.sendError(res, 400, "QR login is only available for weixin channels");
+          return;
+        }
+        if (!channel.enabled) {
+          this.sendError(res, 400, "channel is disabled; enable it before QR login");
+          return;
+        }
+        try {
+          const qr = await startQrLogin();
+          // liteapp URL 编码为二维码图 (桌面管理台可直接扫码)
+          const dataUrl = await QRCode.toDataURL(qr.qrcodeImgContent || qr.qrcode, { margin: 1 });
+          this.sendJson(res, { ...qr, dataUrl });
+        } catch (err) {
+          this.sendError(res, 502, `iLink QR request failed: ${err instanceof Error ? err.message : err}`);
+        }
+        return;
+      }
+      if (/^\/api\/channels\/[^/]+\/qr-status$/.test(pathname) && method === "GET") {
+        const channelId = decodeURIComponent(pathname.split("/")[3]);
+        const qrcode = url.searchParams.get("qrcode");
+        const redirectHost = url.searchParams.get("redirect_host");
+        if (!qrcode) {
+          this.sendError(res, 400, "qrcode is required");
+          return;
+        }
+        const channel = this.store.getChannel(channelId);
+        if (!channel || channel.type !== "weixin") {
+          this.sendError(res, 400, "QR login is only available for weixin channels");
+          return;
+        }
+        if (!channel.enabled) {
+          this.sendError(res, 400, "channel is disabled");
+          return;
+        }
+        try {
+          // scaned_but_redirect 携带 redirect_host: 后续轮询必须切到新 host
+          // (平台迁移轮询端点, 忽略它登录永远无法确认)
+          const statusResp = await pollQrStatus(qrcode, undefined, redirectHost || undefined);
+          if (statusResp.status === "confirmed") {
+            const creds = extractQrCredentials(statusResp);
+            // 锁内重读→写库→重启 (QR 轮询等待期间的旧快照不得覆盖并发修改,
+            // 更不能复活已删除的渠道)
+            const qrEpoch = (this.channelConfigEpoch.get(channelId) ?? 0) + 1;
+            await this.withChannelLock(channelId, async () => {
+              const fresh = this.store.getChannel(channelId);
+              if (!fresh || fresh.type !== "weixin" || !fresh.enabled) return;
+              this.store.saveChannel({
+                ...fresh,
+                credentials: {
+                  ...fresh.credentials,
+                  token: creds.token,
+                  accountId: creds.accountId,
+                  baseUrl: creds.baseUrl,
+                },
+                updatedAt: Date.now(),
+              });
+              this.channelConfigEpoch.set(channelId, qrEpoch);
+              await this.doRestartChannel(channelId);
+            });
+            logger.info("WebServer", `Weixin channel '${channelId}' authenticated via QR scan (account=${creds.accountId})`);
+            this.store.recordAudit("channel.weixin_qr_login", { channelId, accountId: creds.accountId });
+          }
+          this.sendJson(res, {
+            status: statusResp.status,
+            // scaned_but_redirect: 前端后续轮询必须带回来这个 host
+            redirectHost: typeof statusResp.redirect_host === "string" ? statusResp.redirect_host : undefined,
+          });
+        } catch (err) {
+          this.sendError(res, 502, `iLink QR status failed: ${err instanceof Error ? err.message : err}`);
+        }
+        return;
       }
 
       // 9. Skills API (三类统一: extension / skill / mcp; 文档型附正文预览)
@@ -640,6 +799,20 @@ export class AdminWebServer {
     }
   }
 
+  /** 统一处理 DELETE ?id=... 的样板 (异步删除: 响应等待回收完成, 防幽灵行) */
+  private handleDeleteAsync(url: URL, res: ServerResponse, del: (id: string) => Promise<void>): Promise<boolean> {
+    return (async () => {
+      const id = url.searchParams.get("id");
+      if (!id) {
+        this.sendError(res, 400, "id is required");
+        return true;
+      }
+      await del(id);
+      this.sendJson(res, { success: true });
+      return true;
+    })();
+  }
+
   /** 统一处理 DELETE ?id=... 的样板; 返回是否已响应 */
   private handleDelete(url: URL, res: ServerResponse, del: (id: string) => void): boolean {
     const id = url.searchParams.get("id");
@@ -650,6 +823,92 @@ export class AdminWebServer {
     del(id);
     this.sendJson(res, { success: true });
     return true;
+  }
+
+  /** 配置代际计数: 每次保存/扫码确认自增, 重启后比对防并发保存被单飞吞掉 */
+  private channelConfigEpoch = new Map<string, number>();
+  /** per-channel 互斥锁: restart 与 delete 共享同一临界区 (防交叉产生僵尸渠道) */
+  private channelLocks = new Map<string, Promise<void>>();
+
+  private async withChannelLock<T>(channelId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.channelLocks.get(channelId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    this.channelLocks.set(channelId, prev.then(() => gate));
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  private async restartChannel(channelId: string, epoch: number): Promise<void> {
+    await this.withChannelLock(channelId, async () => {
+      if (!this.store.getChannel(channelId)) return; // 渠道已删除
+      this.channelConfigEpoch.set(channelId, epoch); // 登记代际 (审计/诊断用)
+      // 单次重启即可: 拿到锁后才重读配置, 任何并发保存都在等锁之前完成了
+      // 落库——本次 doRestart 读到的就是最新配置, 无需循环收敛
+      // (循环写法在旧代际调用方遇到新代际时会活锁, 已废弃)
+      await this.doRestartChannel(channelId);
+    });
+  }
+
+  private async doRestartChannel(channelId: string): Promise<void> {
+    const manager = ChannelManager.getInstance();
+    const config = this.store.getChannel(channelId);
+    // terminal 由 CLI 特殊管理 (工厂无法重建), 热替换跳过——
+    // 与 startAll 的特判保持同一不变量, 否则管理台保存一次就杀死 REPL
+    if (config?.type === "terminal") return;
+    const old = manager.getAdapter(channelId);
+    if (old) {
+      await old.stop().catch(() => {});
+      manager.unregister(channelId);
+    }
+    if (config?.enabled) {
+      const adapter = createChannelAdapter(config);
+      if (adapter) {
+        manager.register(adapter);
+        try {
+          await adapter.start();
+        } catch (err) {
+          // start 失败不留僵尸注册 (管理台健康检查/通知寻址都依赖 adapters 表)
+          manager.unregister(channelId);
+          logger.error("WebServer", `Channel '${channelId}' start failed:`, err);
+          this.store.recordAudit("channel.start_failed", { channelId, error: String(err) });
+          throw err;
+        }
+      }
+    }
+  }
+
+  /** 渠道完整删除: 与热替换共用同一 per-channel 临界区 (防交叉产生僵尸渠道) */
+  private async deleteChannelFully(id: string): Promise<void> {
+    await this.withChannelLock(id, async () => {
+      const manager = ChannelManager.getInstance();
+      const config = this.store.getChannel(id);
+      // 保留项保护必须前置: store.deleteChannel 对 terminal-main 会抛错,
+      // 但那是在 stop/unregister 之后——终端 REPL 会先被杀死 (与 startAll
+      // 的 terminal 特判同一条不变量)
+      if (id === "terminal-main" || config?.type === "terminal") {
+        throw new Error("terminal channel cannot be deleted via API");
+      }
+      const adapter = manager.getAdapter(id);
+      if (adapter) {
+        await adapter.stop().catch(() => {});
+        manager.unregister(id);
+      }
+      await clearMediaCache(id);
+      // 微信持久化凭据/游标删除 (防同 accountId 重建渠道时旧 token 复活)
+      if (config?.type === "weixin") {
+        clearWeixinPersistedState(
+          typeof config.credentials?.accountId === "string" ? config.credentials.accountId : undefined,
+        );
+      }
+      this.store.deleteChannel(id);
+      this.channelConfigEpoch.delete(id); // 待重启循环感知删除态 (restart 首行 getChannel 兜底)
+      this.store.recordAudit("channel.deleted", { channelId: id });
+    });
   }
 
   private sendJson(res: ServerResponse, data: unknown): void {

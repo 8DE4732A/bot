@@ -20,6 +20,9 @@ function kernelDenyRead(extraDenyRead: string[] = []): string[] {
     join(paths.dotBot, "conversations.sqlite"),
     join(paths.dotBot, "conversations.sqlite-wal"),
     join(paths.dotBot, "conversations.sqlite-shm"),
+    // 渠道持久化凭据 (微信 bot_token/context_token 等)——0600 只防其他 OS 用户,
+    // 沙盒 Agent 同一 OS 用户, 必须靠路径 deny (与 platformDenyRead 同步演进)
+    join(paths.dotBot, "channels"),
     join(paths.dotBot, "logs"),
     join(paths.root, ".env"),
     join(paths.root, ".env.*"),

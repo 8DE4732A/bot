@@ -102,7 +102,11 @@ async function main() {
     const terminalChannel = noTerminal ? undefined : new TerminalChannel();
     if (terminalChannel) channelManager.register(terminalChannel);
     const webServer = new AdminWebServer(port, host);
-    await Promise.all([webServer.start(), channelManager.startAll()]);
+    // 渠道先全部启动、Web 后开: Web API 的渠道热替换与 startAll 共享
+    // 生命周期状态, 并发启动窗口内 POST 保存会产生双连接泄漏
+    // (adapter 均有网络超时, 此处串行的延迟有界)
+    await channelManager.startAll();
+    await webServer.start();
 
     // Handle graceful shutdown
     let isShuttingDown = false;
