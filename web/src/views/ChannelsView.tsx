@@ -291,9 +291,28 @@ export function ChannelsView() {
   const toast = useToast();
   const form = useFormDialog<Channel>();
   const [qrChannel, setQrChannel] = useState<Channel | null>(null);
+  // 周期健康探测结果 (SSE channel.health 推送; §6.2 #3: enabled ≠ connected)
+  const [healthMap, setHealthMap] = useState<Record<string, { ok: boolean; detail?: string; checkedAt: number }>>({});
 
   const channels = q.data ?? [];
   const agents = agentsQ.data ?? [];
+
+  useEffect(() => {
+    const onEvent = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail?.type === "channel.health") {
+        setHealthMap((m) => ({
+          ...m,
+          [detail.channelId]: { ok: Boolean(detail.ok), detail: detail.detail, checkedAt: detail.checkedAt },
+        }));
+      } else if (detail?.type === "channel.status") {
+        q.reload();
+      }
+    };
+    window.addEventListener("bot:event", onEvent);
+    return () => window.removeEventListener("bot:event", onEvent);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const checkHealth = async (c: Channel) => {
     try {
@@ -370,13 +389,30 @@ export function ChannelsView() {
                       <span className="mono">{c.type}</span>
                     </td>
                     <td>
-                      {c.enabled ? (
-                        <span className="badge badge--live">
-                          <span className="dot" /> 在线
-                        </span>
-                      ) : (
-                        <span className="badge">已停用</span>
-                      )}
+                      {/* 状态语义修正 (§6.2 #3): 启用只是配置态; 连接态来自
+                          周期 healthCheck 的 channel.health 事件流 */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "flex-start" }}>
+                        {c.enabled ? (
+                          <span className="badge badge--ink">
+                            <span className="dot" /> 已启用
+                          </span>
+                        ) : (
+                          <span className="badge">已停用</span>
+                        )}
+                        {c.enabled ? (
+                          (() => {
+                            const h = healthMap[c.id];
+                            if (!h) return <span className="field__hint">连接态探测中…</span>;
+                            return h.ok ? (
+                              <span className="badge badge--live">
+                                <span className="dot" /> 已连接
+                              </span>
+                            ) : (
+                              <span className="badge badge--warn" title={h.detail}>连接异常</span>
+                            );
+                          })()
+                        ) : null}
+                      </div>
                     </td>
                     <td>
                       {agent ? (

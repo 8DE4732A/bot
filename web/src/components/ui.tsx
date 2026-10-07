@@ -26,7 +26,8 @@ type IconName =
   | "search"
   | "power"
   | "plug"
-  | "clock";
+  | "clock"
+  | "layers";
 
 const ICON_PATHS: Record<IconName, ReactNode> = {
   grid: (
@@ -125,6 +126,13 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
     <>
       <circle cx="12" cy="12" r="9" />
       <path d="M12 7v5l3 3" />
+    </>
+  ),
+  layers: (
+    <>
+      <path d="m12 2 9 5-9 5-9-5 9-5Z" />
+      <path d="m3 12 9 5 9-5" />
+      <path d="m3 17 9 5 9-5" />
     </>
   ),
 };

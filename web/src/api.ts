@@ -1,12 +1,17 @@
 import type {
   Agent,
   AuditLog,
+  AuditPage,
   ChatChunk,
   Channel,
   ChannelHealth,
   McpServer,
   ModelProvider,
   ScheduledTask,
+  ScheduleType,
+  SessionHistory,
+  SessionRow,
+  SessionSearchHit,
   Skill,
   SystemStatus,
   WeixinQrLogin,
@@ -24,43 +29,89 @@ async function resErrorMessage(res: Response): Promise<string> {
   return msg;
 }
 
+/**
+ * 注入式 session token (四期 §6.1): 优先读服务端注入 HTML 的
+ * window.__BOT_TOKEN__; vite dev 模式 (HTML 无注入) 回退 /api/bootstrap。
+ * 惰性解析一次, 之后全部请求统一附 header。
+ */
+let cachedToken: string | null | undefined;
+async function authToken(): Promise<string> {
+  if (cachedToken !== undefined) return cachedToken ?? "";
+  const injected = (window as any).__BOT_TOKEN__;
+  if (typeof injected === "string" && injected) {
+    cachedToken = injected;
+    return injected;
+  }
+  try {
+    const res = await fetch("/api/bootstrap");
+    const body = await res.json();
+    cachedToken = typeof body?.token === "string" ? body.token : "";
+  } catch {
+    cachedToken = "";
+  }
+  return cachedToken ?? "";
+}
+
+/** 全部 /api 请求的统一头 (token 鉴权 + JSON 体) */
+async function apiHeaders(extra?: Record<string, string>): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { "x-bot-token": await authToken(), ...extra };
+  return headers;
+}
+
+/** 401 = gateway 重启后 token 轮换: 自动 reload 重新拿注入的新 token (§6.1)。
+ *  计数上限 2 次 (R1 评审 M11: token 持续失效时避免无限 reload 循环) */
+function handle401(res: Response): void {
+  if (res.status !== 401) return;
+  const key = "bot:401-reloads";
+  const count = Number(sessionStorage.getItem(key) ?? "0");
+  if (count >= 2) return;
+  sessionStorage.setItem(key, String(count + 1));
+  window.location.reload();
+}
+
 async function json<T>(res: Response): Promise<T> {
-  if (!res.ok) throw new Error(await resErrorMessage(res));
+  if (!res.ok) {
+    handle401(res);
+    throw new Error(await resErrorMessage(res));
+  }
   return res.json() as Promise<T>;
 }
 
-export const api = {
-  status: () => fetch("/api/status").then((r) => json<SystemStatus>(r)),
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  return fetch(path, {
+    ...init,
+    headers: await apiHeaders(init?.headers as Record<string, string> | undefined),
+  }).then((r) => json<T>(r));
+}
 
-  listAgents: () => fetch("/api/agents").then((r) => json<Agent[]>(r)),
+export const api = {
+  status: () => request<SystemStatus>("/api/status"),
+
+  listAgents: () => request<Agent[]>("/api/agents"),
   saveAgent: (a: Partial<Agent> & { id: string }) =>
-    fetch("/api/agents", {
+    request<{ success: boolean }>("/api/agents", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(a),
-    }).then((r) => json<{ success: boolean }>(r)),
+    }),
   deleteAgent: (id: string) =>
-    fetch(`/api/agents?id=${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) =>
-      json<{ success: boolean }>(r),
-    ),
+    request<{ success: boolean }>(`/api/agents?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
 
-  listProviders: () => fetch("/api/providers").then((r) => json<ModelProvider[]>(r)),
+  listProviders: () => request<ModelProvider[]>("/api/providers"),
   saveProvider: (p: Partial<ModelProvider> & { id: string }) =>
-    fetch("/api/providers", {
+    request<{ success: boolean }>("/api/providers", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(p),
-    }).then((r) => json<{ success: boolean }>(r)),
+    }),
   deleteProvider: (id: string) =>
-    fetch(`/api/providers?id=${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) =>
-      json<{ success: boolean }>(r),
-    ),
+    request<{ success: boolean }>(`/api/providers?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
   fetchRemoteModels: (apiBase: string, apiKey: string, providerId?: string) =>
-    fetch("/api/providers/fetch-models", {
+    request<{ success: boolean; models: string[]; error?: string }>("/api/providers/fetch-models", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ apiBase, apiKey, providerId }),
-    }).then((r) => json<{ success: boolean; models: string[]; error?: string }>(r)),
+    }),
   testProvider: (req: {
     providerId: string;
     modelId: string;
@@ -68,69 +119,167 @@ export const api = {
     apiKey?: string;
     protocol?: string;
   }) =>
-    fetch("/api/providers/test", {
+    request<{ success: boolean; latencyMs?: number; error?: string }>("/api/providers/test", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req),
-    }).then((r) => json<{ success: boolean; latencyMs?: number; error?: string }>(r)),
+    }),
 
-  listChannels: () => fetch("/api/channels").then((r) => json<Channel[]>(r)),
+  listChannels: () => request<Channel[]>("/api/channels"),
   saveChannel: (c: Partial<Channel> & { id: string }) =>
-    fetch("/api/channels", {
+    request<{ success: boolean }>("/api/channels", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(c),
-    }).then((r) => json<{ success: boolean }>(r)),
+    }),
   deleteChannel: (id: string) =>
-    fetch(`/api/channels?id=${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) =>
-      json<{ success: boolean }>(r),
-    ),
+    request<{ success: boolean }>(`/api/channels?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
   channelHealth: (id: string) =>
-    fetch(`/api/channels/${encodeURIComponent(id)}/health`).then((r) => json<ChannelHealth>(r)),
+    request<ChannelHealth>(`/api/channels/${encodeURIComponent(id)}/health`),
   weixinQrLogin: (id: string) =>
-    fetch(`/api/channels/${encodeURIComponent(id)}/qr-login`, { method: "POST" }).then((r) =>
-      json<WeixinQrLogin>(r),
-    ),
+    request<WeixinQrLogin>(`/api/channels/${encodeURIComponent(id)}/qr-login`, { method: "POST" }),
   weixinQrStatus: (id: string, qrcode: string, redirectHost?: string) =>
-    fetch(
+    request<{ status: string; redirectHost?: string }>(
       `/api/channels/${encodeURIComponent(id)}/qr-status?qrcode=${encodeURIComponent(qrcode)}${redirectHost ? `&redirect_host=${encodeURIComponent(redirectHost)}` : ""}`,
-    ).then((r) => json<{ status: string; redirectHost?: string }>(r)),
+    ),
 
+  listSkills: () => request<Skill[]>("/api/skills"),
+  listAuditLogs: () => request<AuditLog[]>("/api/audit-logs"),
 
-  listSkills: () => fetch("/api/skills").then((r) => json<Skill[]>(r)),
-  listAuditLogs: () => fetch("/api/audit-logs").then((r) => json<AuditLog[]>(r)),
-
-  listMcpServers: () => fetch("/api/mcp-servers").then((r) => json<McpServer[]>(r)),
+  listMcpServers: () => request<McpServer[]>("/api/mcp-servers"),
   saveMcpServer: (s: Partial<McpServer> & { id: string }) =>
-    fetch("/api/mcp-servers", {
+    request<{ success: boolean }>("/api/mcp-servers", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(s),
-    }).then((r) => json<{ success: boolean }>(r)),
+    }),
   deleteMcpServer: (id: string) =>
-    fetch(`/api/mcp-servers?id=${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) =>
-      json<{ success: boolean }>(r),
-    ),
+    request<{ success: boolean }>(`/api/mcp-servers?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
   testMcpServer: (s: Partial<McpServer> & { id?: string }) =>
-    fetch("/api/mcp-servers/test", {
+    request<{ ok: boolean; toolCount?: number; tools?: string[]; error?: string }>("/api/mcp-servers/test", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(s),
-    }).then((r) => json<{ ok: boolean; toolCount?: number; tools?: string[]; error?: string }>(r)),
+    }),
 
-  listScheduledTasks: () => fetch("/api/scheduled-tasks").then((r) => json<ScheduledTask[]>(r)),
+  listScheduledTasks: () => request<ScheduledTask[]>("/api/scheduled-tasks"),
   deleteScheduledTask: (id: string) =>
-    fetch(`/api/scheduled-tasks?id=${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) =>
-      json<{ success: boolean }>(r),
-    ),
+    request<{ success: boolean }>(`/api/scheduled-tasks?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   resetChat: (agentId: string, sessionId: string) =>
-    fetch("/api/chat/reset", {
+    request<{ success: boolean }>("/api/chat/reset", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ agentId, sessionId }),
-    }).then((r) => json<{ success: boolean }>(r)),
+    }),
+  cancelChat: (agentId: string, sessionId: string) =>
+    request<{ success: boolean; aborted: boolean }>("/api/chat/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId, sessionId }),
+    }),
+
+  /* ---------------- 四期 M3 ---------------- */
+
+  listSessions: () => request<SessionRow[]>("/api/sessions"),
+  findSession: (agentId: string, sessionId: string) =>
+    request<SessionRow | null>(`/api/sessions/find?agentId=${encodeURIComponent(agentId)}&sessionId=${encodeURIComponent(sessionId)}`),
+  sessionHistory: (conversationId: string) =>
+    request<SessionHistory>(`/api/sessions/${encodeURIComponent(conversationId)}/history`),
+  searchSessions: (q: string) =>
+    request<SessionSearchHit[]>(`/api/sessions/search?q=${encodeURIComponent(q)}`),
+  auditLogsFiltered: (params: {
+    event?: string;
+    agentId?: string;
+    since?: number;
+    until?: number;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const usp = new URLSearchParams();
+    if (params.event) usp.set("event", params.event);
+    if (params.agentId) usp.set("agentId", params.agentId);
+    if (params.since !== undefined) usp.set("since", String(params.since));
+    if (params.until !== undefined) usp.set("until", String(params.until));
+    usp.set("limit", String(params.limit ?? 100));
+    usp.set("offset", String(params.offset ?? 0));
+    return request<AuditPage>(`/api/audit-logs?${usp.toString()}`);
+  },
+  saveScheduledTask: (t: Partial<ScheduledTask> & { agentId: string; name: string; prompt: string; scheduleType: ScheduleType }) =>
+    request<{ success: boolean; id: string; nextRunAt?: number }>("/api/scheduled-tasks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(t),
+    }),
+  triggerScheduledTask: (id: string) =>
+    request<{ success: boolean; runNumber: number }>("/api/scheduled-tasks/trigger", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    }),
 };
+
+/* ---------------- Gateway 事件流 (四期 §6.1): SSE → 窗口事件分发 ---------------- */
+
+export type GatewayEvent = { type: string; [k: string]: unknown };
+
+/**
+ * 订阅 /api/gateway/events。断线自动重连 (指数退避); 每个事件同时以
+ * window CustomEvent("bot:event", {detail}) 分发——视图无需各自持连接,
+ * 监听窗口事件做静默刷新即可 (hermes 用轮询模拟的效果)。
+ */
+export function subscribeGatewayEvents(): () => void {
+  let es: EventSource | null = null;
+  let stopped = false;
+  let retry = 0;
+
+  const open = async () => {
+    while (!stopped) {
+      try {
+        const token = await authToken();
+        // EventSource 无法带 header: token 走查询参数 (127.0.0.1 本机面)
+        es = new EventSource(`/api/gateway/events?token=${encodeURIComponent(token)}`);
+        es.onmessage = (msg) => {
+          try {
+            const event = JSON.parse(msg.data) as GatewayEvent;
+            if (event.type && event.type !== "hello") {
+              window.dispatchEvent(new CustomEvent("bot:event", { detail: event }));
+            }
+          } catch {
+            /* 跳过坏帧 */
+          }
+        };
+        es.onerror = () => {
+          es?.close();
+          es = null;
+          if (stopped) return;
+          retry = Math.min(retry + 1, 5);
+          setTimeout(open, 1000 * 2 ** retry);
+        };
+        es.onopen = () => {
+          retry = 0;
+        };
+        return;
+      } catch {
+        if (stopped) return;
+        retry = Math.min(retry + 1, 5);
+        await new Promise((r) => setTimeout(r, 1000 * 2 ** retry));
+      }
+    }
+  };
+  void open();
+
+  return () => {
+    stopped = true;
+    es?.close();
+  };
+}
+
+/** 视图侧监听窗口事件的便捷 hook 依赖: 事件类型过滤 */
+export function isGatewayEvent(e: Event, ...types: string[]): boolean {
+  const detail = (e as CustomEvent).detail as GatewayEvent | undefined;
+  return Boolean(detail && types.includes(detail.type));
+}
 
 /**
  * SSE 流式对话。后端在 Accept: text/event-stream 时返回
@@ -145,11 +294,12 @@ export async function chatStream(
 ): Promise<void> {
   const res = await fetch("/api/chat", {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    headers: await apiHeaders({ "Content-Type": "application/json", Accept: "text/event-stream" }),
     body: JSON.stringify({ agentId, message, sessionId }),
   });
 
   if (!res.ok || !res.body) {
+    handle401(res);
     throw new Error(await resErrorMessage(res));
   }
 

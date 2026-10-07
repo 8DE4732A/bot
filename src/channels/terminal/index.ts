@@ -1,8 +1,7 @@
 import * as readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { DatabaseStore } from "../../config/database-store.ts";
-import { AgentManager } from "../../core/agent-manager.ts";
-import { logger } from "../../utils/logger.ts";
+import { tryCommand } from "../../core/chat-orchestrator.ts";
 import type { ChannelAdapter } from "../base.ts";
 import { ChannelManager } from "../manager.ts";
 import {
@@ -165,97 +164,78 @@ export class TerminalChannel implements ChannelAdapter {
   }
 
   private async handleCommand(cmd: string): Promise<void> {
-    const parts = cmd.split(/\s+/);
-    const op = parts[0].toLowerCase();
+    const op = cmd.split(/\s+/)[0].toLowerCase();
 
-    switch (op) {
-      case "/exit":
-      case "/quit": {
-        console.log("Exiting Bot console...");
-        this.running = false;
-        // 走全局 cleanup (storage checkpoint / channel stop / db.close), 不硬退
-        process.kill(process.pid, "SIGTERM");
-        break;
-      }
-      case "/agent": {
-        if (parts.length > 1) {
-          const targetId = parts[1];
-          const targetAgent = this.store.getAgent(targetId);
-          if (!targetAgent) {
-            console.log(`\x1b[31mAgent not found: ${targetId}\x1b[0m`);
-          } else {
-            this.activeAgentId = targetId;
-            this.totals = createTotals(); // 统计随 agent 切换重置
-            this.cachedModelId = "?";
-            const chan = this.store.getChannel(this.id);
-            if (chan) {
-              chan.boundAgentId = targetId;
-              this.store.saveChannel(chan);
-            }
-            console.log(`\x1b[32mSwitched active agent to: ${targetAgent.name} [${targetId}]\x1b[0m\n`);
-          }
-        } else {
-          const agents = this.store.listAgents();
-          console.log("\n\x1b[1mAvailable Agents:\x1b[0m");
-          for (const a of agents) {
-            const currentTag = a.id === this.activeAgentId ? "\x1b[32m(active)\x1b[0m" : "";
-            console.log(`  - \x1b[33m${a.id}\x1b[0m: ${a.name} [${a.model.provider}/${a.model.modelId}] ${currentTag}`);
-          }
-          console.log(`\nUse \x1b[36m/agent <id>\x1b[0m to switch.\n`);
-        }
-        break;
-      }
-      case "/reset": {
-        await AgentManager.getInstance().resetSession(this.activeAgentId, `${this.id}:local-user`);
-        console.log(`\x1b[32mConversation context for ${this.activeAgentId} has been reset.\x1b[0m\n`);
-        break;
-      }
-      case "/compact": {
-        await AgentManager.getInstance().compactSession(this.activeAgentId, `${this.id}:local-user`);
-        console.log(`\x1b[32mConversation context for ${this.activeAgentId} has been compacted.\x1b[0m\n`);
-        break;
-      }
-      case "/status": {
-        const agent = this.store.getAgent(this.activeAgentId);
-        console.log("\n\x1b[1mSystem Status:\x1b[0m");
-        console.log(`  Agent ID:      ${this.activeAgentId}`);
-        console.log(`  Agent Name:    ${agent?.name}`);
-        console.log(`  Model:         ${agent?.model.provider}/${agent?.model.modelId}`);
-        console.log(`  Workspace:     ${agent?.workspaceDir}`);
-        console.log(`  Sandbox:       ${agent?.sandbox.enabled ? "\x1b[32mEnabled\x1b[0m" : "\x1b[31mDisabled\x1b[0m"}`);
-        console.log(`  Skills:        ${agent?.skills.join(", ")}`);
-        console.log("");
-        console.log(`\x1b[1mSession Usage (本进程内 · ${this.activeAgentId}):\x1b[0m`);
-        console.log(renderStatusPanel(
-          agent?.name ?? "?",
-          this.activeAgentId,
-          agent?.model.provider ?? "?",
-          agent?.model.modelId ?? "?",
-          this.totals,
-        ));
-        console.log("");
-        break;
-      }
-      case "/admin": {
-        const host = this.store.getConfig("web_host", "127.0.0.1");
-        const port = this.store.getConfig("web_port", "3000");
-        console.log(`\nWeb Admin URL: \x1b[4mhttp://${host}:${port}\x1b[0m\n`);
-        break;
-      }
-      case "/help":
-      default: {
-        console.log("\n\x1b[1mAvailable Commands:\x1b[0m");
-        console.log("  /agent           - 列出所有已配置的 Agent");
-        console.log("  /agent <id>      - 切换当前终端绑定的 Agent");
-        console.log("  /reset           - 重置当前 Agent 的对话上下文");
-        console.log("  /compact         - 压缩当前对话历史 (释放 Token)");
-        console.log("  /status          - 查看运行状态与可观测统计 (token/缓存/上下文)");
-        console.log("  /admin           - 查看管理后台 Web 访问地址");
-        console.log("  /exit            - 退出终端\n");
-        console.log("  提示: prompt 中实时显示上下文占用 (ctx %), 每轮回复后显示");
-        console.log("  ↑输入 ↓输出 R缓存读 W缓存写 CH命中率 $花费 与耗时。\n");
-        break;
-      }
+    // 本地命令双表分治 (设计 §4.3): 只影响本进程, 不经注册表
+    if (op === "/exit" || op === "/quit") {
+      console.log("Exiting Bot console...");
+      this.running = false;
+      // 走全局 cleanup (storage checkpoint / channel stop / db.close), 不硬退
+      process.kill(process.pid, "SIGTERM");
+      return;
     }
+    // 本地可观测面板 (三期特性: 进程内 totals + renderStatusPanel)——
+    // 保留终端特色; 其余 /status 语义由注册表统一
+    if (op === "/status") {
+      const agent = this.store.getAgent(this.activeAgentId);
+      console.log("\n\x1b[1mSystem Status:\x1b[0m");
+      console.log(`  Agent ID:      ${this.activeAgentId}`);
+      console.log(`  Agent Name:    ${agent?.name}`);
+      console.log(`  Model:         ${agent?.model.provider}/${agent?.model.modelId}`);
+      console.log(`  Workspace:     ${agent?.workspaceDir}`);
+      console.log(`  Sandbox:       ${agent?.sandbox.enabled ? "\x1b[32mEnabled\x1b[0m" : "\x1b[31mDisabled\x1b[0m"}`);
+      console.log(`  Skills:        ${agent?.skills.join(", ")}`);
+      console.log("");
+      console.log(`\x1b[1mSession Usage (本进程内 · ${this.activeAgentId}):\x1b[0m`);
+      console.log(renderStatusPanel(
+        agent?.name ?? "?",
+        this.activeAgentId,
+        agent?.model.provider ?? "?",
+        agent?.model.modelId ?? "?",
+        this.totals,
+      ));
+      console.log("");
+      return;
+    }
+
+    // 统一命令层 (四期 R1 评审 B9: REPL 不再有私有命令表——/reset /compact
+    // /agent /tasks /cancel /help 与 IM/Web/TUI 同一注册表、同一 busy 语义;
+    // /agent 按设计 F5 修正为视图语义, 不再写 terminal-main 渠道绑定)
+    const outcome = await tryCommand({
+      channel: "terminal",
+      channelInstanceId: this.id,
+      peerId: "local-user",
+      agentId: this.activeAgentId,
+      sessionId: `${this.id}:local-user`,
+      input: cmd,
+    });
+    if (outcome.handled) {
+      // /agent <id> 的视图切换 (R2 评审 N2: REPL 的 activeAgentId 就是
+      // 客户端视图——必须消费 switchTo, 否则命令谎报成功而实际不生效)
+      const target = (outcome.result?.data as { switchTo?: string } | undefined)?.switchTo;
+      if (target) {
+        this.activeAgentId = target;
+        this.totals = createTotals(); // 统计随 agent 切换重置
+        this.cachedModelId = "?";
+      }
+      if (outcome.result?.content) console.log(outcome.result.content);
+      return;
+    }
+    // 未知斜杠保留旧自由: 打印帮助而非送 LLM
+    this.printHelp();
+  }
+
+  private printHelp(): void {
+    console.log("\n\x1b[1mAvailable Commands:\x1b[0m");
+    console.log("  /agent           - 列出所有已配置的 Agent (绑定在管理台「渠道」页修改)");
+    console.log("  /reset           - 重置当前 Agent 的对话上下文 (/new 别名)");
+    console.log("  /compact         - 压缩当前对话历史 (释放 Token)");
+    console.log("  /tasks           - 列出本 Agent 的定时任务");
+    console.log("  /cancel          - 中断当前正在进行的生成");
+    console.log("  /status          - 查看运行状态与可观测统计 (token/缓存/上下文)");
+    console.log("  /admin           - 查看管理后台 Web 访问地址");
+    console.log("  /exit            - 退出终端\n");
+    console.log("  提示: prompt 中实时显示上下文占用 (ctx %), 每轮回复后显示");
+    console.log("  ↑输入 ↓输出 R缓存读 W缓存写 CH命中率 $花费 与耗时。\n");
   }
 }

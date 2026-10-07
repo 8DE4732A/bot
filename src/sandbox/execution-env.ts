@@ -27,8 +27,54 @@ import { logger } from "../utils/logger.ts";
 import { SandboxRuntimeManager } from "./manager.ts";
 import { PathGuard } from "./path-guard.ts";
 
-export interface SandboxedEnvOptions {
-  cwd: string;
+/**
+ * 防自杀闸模式 (四期 §3.1): 拦"停掉/卸载 gateway"的破坏面, 不误伤
+ * "gateway status" 等只读命令。覆盖四类形态 (R1 评审 B2/B3 + R2 评审 B2):
+ * ① bot 二进制或源码入口的 gateway 破坏性子命令 (bun .../cli.ts gateway stop 同样命中);
+ * ② launchctl 直杀——实际 label 是 com.bot.gateway.<sha8>, 以及旧 API unload;
+ * ③ systemctl 直杀 bot-gateway-* unit;
+ * ④ kill/pkill/killall 指向 gateway 进程特征 (含 pgrep -f 任意 pattern 形态、
+ *    编译单二进制进程名 bot)。
+ * 固有局限 (记录): plain `kill <pid>` 无法静态判定目标进程; shell 转义
+ * (boot\out) 可绕过字面匹配——纵深靠 gateway-token/pid/lock 全禁读断链 +
+ * 黑名单只覆盖可直接枚举的形态 (hermes 同款取舍)。
+ */
+export const SELF_DESTRUCT_PATTERN = new RegExp(
+  [
+    // ① gateway 破坏性子命令 (bot / bun src/cli.ts / bin/bot 任意入口前缀)
+    String.raw`gateway\s+(start\s+)?(stop|restart|uninstall|kill|bootout|disable)\b`,
+    // ② launchctl bootout/remove/kill/unload 指向本项目 label
+    String.raw`launchctl\s+[^|;&]*\b(bootout|remove|kill|unload)\b[^|;&]*(com\.bot\.gateway|bot-gateway)`,
+    // ③ systemctl stop/kill/disable/reset-failed 指向 bot-gateway unit
+    String.raw`systemctl\s+[^|;&]*\b(stop|kill|disable|reset-failed)\b[^|;&]*bot-gateway`,
+    // ④ kill/pkill/killall 指向 gateway 进程特征 (label / 启动特征 / 单二进制名)
+    String.raw`\b(kill|pkill|killall)\b[^|;&]*(com\.bot\.gateway|gateway.{0,3}start|cli\.ts|bin/bot|\bbot\b)`,
+  ].join("|"),
+);
+
+/** 只读白名单 (R2 评审 M-5 → R3 评审 B2 收敛): 命令文本出现 gateway 破坏性
+ *  字样通常是检索项目文档 (grep "gateway stop" CLAUDE.md)。**仅当整条命令
+ *  不含 shell 元字符** (分隔符/管道/重定向/命令替换/反引号) 时才豁免——
+ *  否则 `grep x; bot gateway stop`、`echo x | launchctl bootout ...` 会借
+ *  白名单整条绕过 (R3/R4 实测)。含元字符的复合命令一律走正则检查。
+ *  不含 awk/find 等可执行任意子命令的工具 (system()/-exec)。 */
+const READONLY_FIRST_WORDS = new Set([
+  "grep", "rg", "ag", "cat", "less", "more", "head", "tail", "echo", "ls", "wc",
+]);
+
+/** 防自杀闸完整判定 (导出供回归测试直接使用——R4 教训: 测试复制本函数
+ *  逻辑导致生产漂移全绿假象, 测试必须走生产实现)。 */
+export function selfDestructBlocked(commandText: string): boolean {
+  if (/[;&|<>`$\n]/.test(commandText)) return SELF_DESTRUCT_PATTERN.test(commandText);
+  const first = commandText.trim().split(/\s+/, 1)[0] ?? "";
+  if (READONLY_FIRST_WORDS.has(first)) return false;
+  return SELF_DESTRUCT_PATTERN.test(commandText);
+}
+
+
+
+
+export interface SandboxedEnvOptions {  cwd: string;
   agentId: string;
   sandboxConfig: BotSandboxConfig;
 }
@@ -53,6 +99,14 @@ function platformDenyRead(agentWorkspace: string, store: DatabaseStore): string[
   const deny = [
     join(paths.dotBot, "bot.sqlite*"),
     join(paths.dotBot, "conversations.sqlite*"),
+    // 四期新增 host 凭据 (R1 评审 B1/B4): gateway-token 是管理 API + WS
+    // 的根凭据; pid 文件断掉 "cat pid → kill" 自毁链; config-error 无害
+    // 但同族一并覆盖。与 kernelDenyRead 同步演进 (约束 7)
+    join(paths.dotBot, "gateway-token"),
+    join(paths.dotBot, "gateway.pid"),
+    join(paths.dotBot, "gateway.sock"),
+    join(paths.dotBot, "gateway.config-error"),
+    join(paths.dotBot, "gateway.lock"),
     // 渠道持久化凭据 (微信 bot_token/context_token 等)——0600 只防其他 OS 用户,
     // 沙盒 Agent 同一 OS 用户, 必须靠路径 deny (与 kernelDenyRead 同步演进)
     join(paths.dotBot, "channels"),
@@ -164,6 +218,22 @@ export class SandboxedExecutionEnv extends NodeExecutionEnv {
     options?: ShellExecOptions,
     context?: Context,
   ): Promise<Result<ShellExecResult, ExecutionError>> {
+    // 防自杀闸 (四期 §3.1, hermes _refuse_from_inside_gateway 同款):
+    // 模型经 bash 执行 gateway 停止/重启/卸载直接拒绝并审计——
+    // 防模型自毁宿主服务 (对宿主服务的运维是用户终端/管理台的事)。
+    // 独立于沙盒开关 (宿主保护不随 sandbox.enabled 关闭); argv 数组
+    // 形态 join 后同样匹配 (R1 评审 C-M9)
+    const execText = typeof command === "string" ? command : command.join(" ");
+    if (selfDestructBlocked(execText)) {
+      this.auditBlocked("exec", execText, "gateway self-destruct command refused from inside sandbox");
+      return err(
+        new ExecutionError(
+          "unknown",
+          "Command blocked: gateway 生命周期命令 (stop/restart/uninstall) 不能由 Agent 在沙盒内执行；请让用户在终端运行或使用管理台。",
+        ),
+      );
+    }
+
     let finalCommand = command;
 
     if (this.sandboxConfig.enabled) {

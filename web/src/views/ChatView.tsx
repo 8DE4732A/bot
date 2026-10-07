@@ -1,6 +1,6 @@
 import { memo, useEffect, useRef, useState } from "react";
 
-import { api, chatStream } from "../api";
+import { api, chatStream, isGatewayEvent } from "../api";
 import { Icon, useAsync, useToast } from "../components/ui";
 import type { Agent, ChatChunk } from "../types";
 
@@ -15,6 +15,16 @@ interface MsgItem {
   tools: ToolTrace[];
   error?: boolean;
   streaming?: boolean;
+}
+
+interface UsageInfo {
+  contextTokens: number;
+  contextWindow: number;
+  input: number;
+  output: number;
+  costTotal: number;
+  durationMs: number;
+  cacheHitRate?: number;
 }
 
 /** 消息行: memo 化, 流式期间只有最后一条变化时才重渲染它自己 */
@@ -57,6 +67,8 @@ export function ChatView({ initialAgentId }: { initialAgentId?: string }) {
   const [messages, setMessages] = useState<MsgItem[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [usage, setUsage] = useState<UsageInfo | null>(null);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   // 初始选中: 路由参数 > 默认 Agent
@@ -66,9 +78,42 @@ export function ChatView({ initialAgentId }: { initialAgentId?: string }) {
     }
   }, [agents, agentId, initialAgentId]);
 
-  // 切换 Agent 清空本地视图（会话上下文仍在后端，可用「重置」清掉）
+  // 切换 Agent: 清空本地视图并加载历史快照 (只读 conversation view,
+  // 刷新不再丢上下文——四期 §6.2 #2)
   useEffect(() => {
     setMessages([]);
+    setUsage(null);
+    setHistoryLoaded(false);
+    if (!agentId) return;
+    let alive = true;
+    (async () => {
+      try {
+        // 显式会话查找 (R1 评审 B6/B14: 后端按哨兵行/真实渠道行同一语义查,
+        // 前端不再猜 peerId 字符串——旧写法 peerId 恒不匹配, 历史从未加载过)
+        const row = await api.findSession(agentId, `web-playground:${agentId}`);
+        if (!alive) return;
+        if (row) {
+          const hist = await api.sessionHistory(row.conversationId);
+          if (!alive) return;
+          if (hist.messages.length > 0) {
+            setMessages(
+              hist.messages.slice(-40).map((m) => ({
+                role: m.role === "user" ? ("user" as const) : ("agent" as const),
+                text: m.text,
+                tools: [],
+              })),
+            );
+          }
+        }
+      } catch {
+        /* 历史加载失败不阻断输入 */
+      } finally {
+        if (alive) setHistoryLoaded(true);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
   }, [agentId]);
 
   useEffect(() => {
@@ -102,6 +147,12 @@ export function ChatView({ initialAgentId }: { initialAgentId?: string }) {
     try {
       // sessionId 不传, 由后端统一为 web-playground:<agentId> (与重置一致)
       await chatStream(agentId, undefined, text, (chunk: ChatChunk) => {
+        if (chunk.usage) setUsage(chunk.usage);
+        // /agent <id> 视图切换 (R2 评审 B7: 切换下一条消息的发送目标);
+        // 同帧 delta 仍入气泡 (R3 评审 M-1: 切换命令的回复文本要显示)
+        if (chunk.data?.switchTo) {
+          setAgentId(chunk.data.switchTo);
+        }
         updateLastAgentMsg((m) => {
           if (chunk.delta) m.text += chunk.delta;
           if (chunk.toolCall) {
@@ -136,9 +187,20 @@ export function ChatView({ initialAgentId }: { initialAgentId?: string }) {
     try {
       await api.resetChat(agentId, `web-playground:${agentId}`);
       setMessages([]);
+      setUsage(null);
       toast("会话上下文已重置");
     } catch (e) {
       toast(`重置失败: ${(e as Error).message}`, "risk");
+    }
+  };
+
+  /** 显式取消生成 (四期 §4.1: 取消是显式动作, 断开连接不再中止生成) */
+  const cancel = async () => {
+    if (!agentId || !sending) return;
+    try {
+      await api.cancelChat(agentId, `web-playground:${agentId}`);
+    } catch {
+      /* cancel 竞态可容忍: 流结束由 chatStream 兜底 */
     }
   };
 
@@ -153,6 +215,11 @@ export function ChatView({ initialAgentId }: { initialAgentId?: string }) {
           </p>
         </div>
         <div className="page__actions">
+          {sending && (
+            <button className="btn btn--danger btn--sm" onClick={cancel}>
+              <Icon name="x" size={13} /> 取消生成
+            </button>
+          )}
           <button className="btn btn--secondary" onClick={reset} disabled={!agentId}>
             <Icon name="refresh" size={13} /> 重置会话
           </button>
@@ -183,6 +250,22 @@ export function ChatView({ initialAgentId }: { initialAgentId?: string }) {
               <span className="mono mono--plain">
                 {agent.sandbox.enabled ? "sandbox:on" : "sandbox:off"}
               </span>
+              {usage ? (
+                <>
+                  <span className="mono mono--plain" title={`上下文 ${usage.contextTokens} tokens`}>
+                    ctx:{" "}
+                    {usage.contextWindow > 0
+                      ? `${Math.min(100, Math.round((usage.contextTokens / usage.contextWindow) * 100))}%`
+                      : `${usage.contextTokens} tok`}
+                  </span>
+                  <span className="mono mono--plain" title={`↑${usage.input} ↓${usage.output} · 缓存命中 ${usage.cacheHitRate?.toFixed(0) ?? "—"}%`}>
+                    ↑{usage.input} ↓{usage.output}
+                  </span>
+                  <span className="mono mono--plain" title={`本轮 ${(usage.durationMs / 1000).toFixed(1)}s`}>
+                    ${usage.costTotal.toFixed(4)}
+                  </span>
+                </>
+              ) : null}
             </div>
           ) : null}
         </div>
@@ -193,7 +276,9 @@ export function ChatView({ initialAgentId }: { initialAgentId?: string }) {
               <div className="empty__mark" style={{ marginBottom: 8 }}>
                 READY
               </div>
-              输入消息开始调试{agent ? `「${agent.name}」` : ""}。
+              {historyLoaded
+                ? `输入消息开始调试${agent ? `「${agent.name}」` : ""}。`
+                : "正在加载会话历史…"}
               <br />
               工具调用（沙盒命令执行、网页检索等）会以轨迹行实时显示。
             </div>

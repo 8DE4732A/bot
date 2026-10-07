@@ -1,5 +1,7 @@
 import { DatabaseStore } from "../config/database-store.ts";
 import { AgentManager, type ChatChunk } from "../core/agent-manager.ts";
+import { EventBus } from "../core/event-bus.ts";
+import { isDraining } from "../gateway/lifecycle.ts";
 import { logger } from "../utils/logger.ts";
 import type { ChannelAdapter, InboundMessage } from "./base.ts";
 import { createChannelAdapter } from "./factory.ts";
@@ -72,10 +74,17 @@ export class ChannelManager {
       try {
         await adapter.start();
         logger.info("ChannelManager", `Started channel: ${adapter.id}`);
+        EventBus.getInstance().publish({ type: "channel.status", channelId: adapter.id, state: "started" });
       } catch (err) {
         // 启动失败不留注册 (健康检查/通知寻址都依赖 adapters 表)
         this.adapters.delete(config.id);
         logger.error("ChannelManager", `Failed to start channel ${adapter.id}:`, err);
+        EventBus.getInstance().publish({
+          type: "channel.status",
+          channelId: adapter.id,
+          state: "error",
+          detail: String(err),
+        });
       }
     }
   }
@@ -85,6 +94,7 @@ export class ChannelManager {
       try {
         await adapter.stop();
         logger.info("ChannelManager", `Stopped channel: ${id}`);
+        EventBus.getInstance().publish({ type: "channel.status", channelId: id, state: "stopped" });
       } catch (err) {
         logger.warn("ChannelManager", `Error stopping channel ${id}: ${err}`);
       }
@@ -95,18 +105,17 @@ export class ChannelManager {
     message: InboundMessage,
     onChunk?: (chunk: ChatChunk) => void,
   ): Promise<string> {
-    const channelConfig = this.store.getChannel(message.channelInstanceId);
-    // 停用渠道的 WS/长轮询可能尚未停止 (重启竞态), 入站消息直接拒绝
-    if (channelConfig && !channelConfig.enabled) {
-      throw new Error(`Channel '${message.channelInstanceId}' is disabled`);
+    // drain 协议 (四期 §3.4): 重启在即时拒绝新任务——在飞 turn 保持运行
+    // 交付完最终响应, 新输入随进程退出由渠道层重投/用户重发
+    if (isDraining()) {
+      throw new Error("gateway 正在重启 (draining), 暂不接受新消息; 请稍后重发");
     }
-    const agentId = channelConfig?.boundAgentId;
-    // 绑定缺失/悬空时显式失败, 静默改投默认 Agent 会造成跨 Agent 上下文串扰
-    if (!agentId || !this.store.getAgent(agentId)) {
-      throw new Error(
-        `Channel '${message.channelInstanceId}' has no valid bound agent; fix the binding before sending messages`,
-      );
+    // 绑定校验收敛到 store.resolveBoundAgent (R8 simplify: 与命令层同一判定)
+    const bound = this.store.resolveBoundAgent(message.channelInstanceId);
+    if ("error" in bound) {
+      throw new Error(bound.error);
     }
+    const agentId = bound.agentId;
 
     logger.debug(
       "ChannelManager",
@@ -125,6 +134,11 @@ export class ChannelManager {
   /** 查找已注册 (含 startAll 实例化) 的适配器, 供 webhook 分发等外部入口使用 */
   public getAdapter(id: string): ChannelAdapter | undefined {
     return this.adapters.get(id);
+  }
+
+  /** 全部已注册适配器 (gateway status / 管理台健康聚合) */
+  public listAdapters(): ChannelAdapter[] {
+    return [...this.adapters.values()];
   }
 
   /**

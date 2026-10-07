@@ -24,6 +24,13 @@
   --risk-soft: #f8e8e4;
   --focus-ring: rgba(14, 122, 104, 0.35);
 
+  /* 反色块 (主按钮/选中项/墨色徽章): 浅色模式 = 墨块白字;
+     暗色模式翻转为亮块暗字——绝不能直接用 --ink 做底 (暗色下 --ink
+     是亮色文字语义, 白底白字事故) */
+  --block: #1b1c1e;
+  --block-hover: #33353a;
+  --block-fg: #ffffff;
+
   /* 字体 */
   --font-ui: "Instrument Sans", -apple-system, "PingFang SC", "Hiragino Sans GB",
     "Microsoft YaHei", "Segoe UI", sans-serif;
@@ -149,8 +156,8 @@ a:hover {
   width: 26px;
   height: 26px;
   border-radius: 7px;
-  background: var(--ink);
-  color: #fff;
+  background: var(--block);
+  color: var(--block-fg);
   display: grid;
   place-items: center;
   font-family: var(--font-mono);
@@ -191,8 +198,8 @@ a:hover {
   color: var(--ink);
 }
 .nav-item.is-active {
-  background: var(--ink);
-  color: #fff;
+  background: var(--block);
+  color: var(--block-fg);
 }
 .nav-item svg {
   width: 16px;
@@ -425,9 +432,9 @@ a:hover {
   border-color: rgba(185, 62, 47, 0.25);
 }
 .badge--ink {
-  background: var(--ink);
-  color: #fff;
-  border-color: var(--ink);
+  background: var(--block);
+  color: var(--block-fg);
+  border-color: var(--block);
 }
 
 .chips {
@@ -482,11 +489,11 @@ a:hover {
   height: 14px;
 }
 .btn--primary {
-  background: var(--ink);
-  color: #fff;
+  background: var(--block);
+  color: var(--block-fg);
 }
 .btn--primary:hover {
-  background: #33353a;
+  background: var(--block-hover);
 }
 .btn--secondary {
   background: var(--surface);
@@ -511,7 +518,8 @@ a:hover {
 }
 .btn--danger.is-armed {
   background: var(--risk);
-  color: #fff;
+  /* 字用 risk-soft: 浅色 ≈ 白字 (红底), 暗色翻转 = 亮红底 + 深字, 两种模式都可读 */
+  color: var(--risk-soft);
 }
 .btn:disabled {
   opacity: 0.45;
@@ -653,7 +661,8 @@ a:hover {
   flex-shrink: 0;
   display: grid;
   place-items: center;
-  color: #fff;
+  /* 勾选标记色 = live-soft: 浅色模式绿底浅勾 (≈白), 暗色翻转亮绿底深勾 */
+  color: var(--live-soft);
   font-size: 11px;
   line-height: 1;
 }
@@ -812,8 +821,8 @@ td .cell-sub {
   display: flex;
   align-items: center;
   gap: 9px;
-  background: var(--ink);
-  color: #fff;
+  background: var(--block);
+  color: var(--block-fg);
   border-radius: var(--radius-m);
   padding: 10px 16px;
   font-size: 0.84rem;
@@ -889,8 +898,8 @@ td .cell-sub {
   margin-top: 2px;
 }
 .msg--agent .msg__who {
-  background: var(--ink);
-  color: #fff;
+  background: var(--block);
+  color: var(--block-fg);
   font-family: var(--font-mono);
 }
 .msg--user .msg__who {
@@ -917,8 +926,8 @@ td .cell-sub {
   border: 1px solid var(--line);
 }
 .msg--user .msg__text {
-  background: var(--ink);
-  color: #fff;
+  background: var(--block);
+  color: var(--block-fg);
   border-bottom-right-radius: 3px;
 }
 .msg__text.is-error {
@@ -1143,4 +1152,282 @@ td .cell-sub {
   background: var(--live-soft);
   color: var(--live-deep);
   border-color: rgba(14, 122, 104, 0.4);
+}
+
+/* ============================================================
+   四期 M3: 会话浏览 / 审计过滤 / ScheduleBuilder / 事件流
+   ============================================================ */
+
+/* ---------------- 会话浏览 ---------------- */
+.sessions-layout {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  gap: 14px;
+  align-items: start;
+}
+.sessions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 640px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.session-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-m);
+  padding: 8px 10px;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.session-row:hover {
+  background: var(--surface-2);
+}
+.session-row.is-active {
+  border-color: var(--live);
+  background: var(--live-soft);
+}
+.session-row__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.session-row__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.session-row__peer {
+  font-size: 0.78rem;
+  color: var(--ink);
+}
+.session-row__meta {
+  font-size: 0.7rem;
+  color: var(--ink-3);
+}
+.session-row__time {
+  font-size: 0.68rem;
+  color: var(--ink-3);
+  flex-shrink: 0;
+}
+.sessions-detail {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-m);
+  padding: 14px 16px;
+  min-height: 320px;
+  max-height: 640px;
+  overflow-y: auto;
+}
+.sessions-detail__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.timeline__row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+.timeline__who {
+  font-size: 0.68rem;
+  color: var(--ink-3);
+  width: 34px;
+  flex-shrink: 0;
+  padding-top: 5px;
+}
+.timeline__bubble {
+  border-radius: var(--radius-m);
+  padding: 7px 11px;
+  font-size: 0.84rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 88%;
+}
+.timeline__bubble--user {
+  background: var(--surface-3);
+  color: var(--ink);
+}
+.timeline__bubble--agent {
+  background: var(--live-soft);
+  color: var(--ink);
+  border: 1px solid rgba(14, 122, 104, 0.18);
+}
+.timeline__tool summary {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--ink-2);
+  cursor: pointer;
+  padding: 2px 0 2px 42px;
+  list-style: none;
+}
+.timeline__tool summary:hover {
+  color: var(--ink);
+}
+.timeline__tool-out {
+  margin-left: 42px;
+  font-size: 0.72rem;
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border-radius: var(--radius-s);
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.timeline__handoff {
+  font-size: 0.74rem;
+  color: var(--ink-3);
+  text-align: center;
+  padding: 4px 0;
+  font-style: italic;
+}
+
+/* ---------------- 搜索条 ---------------- */
+.searchbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-m);
+  padding: 5px 10px;
+  color: var(--ink-3);
+}
+.searchbar__input {
+  border: none;
+  outline: none;
+  background: transparent;
+  font-family: var(--font-ui);
+  font-size: 0.82rem;
+  color: var(--ink);
+  width: 200px;
+}
+.searchbar__hits {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 12px;
+}
+.searchbar__hit {
+  text-align: left;
+  font-size: 0.76rem;
+  font-family: var(--font-mono);
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+  padding: 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.searchbar__hit:hover {
+  border-color: var(--live);
+  color: var(--live-deep);
+}
+
+/* ---------------- 审计过滤 / 分页 ---------------- */
+.audit-filters {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  margin-top: 14px;
+}
+.table-wrap.is-refreshing {
+  opacity: 0.72;
+  transition: opacity 0.15s;
+}
+
+/* ---------------- ScheduleBuilder chips ---------------- */
+.chip-btn {
+  font-size: 0.76rem;
+  font-family: var(--font-ui);
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+  padding: 3px 10px;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+.chip-btn:hover {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+.chip-btn.is-active {
+  background: var(--block);
+  border-color: var(--block);
+  color: var(--block-fg);
+}
+
+/* ---------------- 表单开关行 ---------------- */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 0.84rem;
+}
+.switch input {
+  accent-color: var(--live);
+}
+
+/* ============================================================
+   暗色模式 (§6.2 #8): prefers-color-scheme token 组整体翻转,
+   版式与语义色不变; anti-flash 防白闪
+   ============================================================ */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #141518;
+    --surface: #1c1e22;
+    --surface-2: #232529;
+    --surface-3: #2b2e33;
+    --ink: #e6e7e9;
+    --ink-2: #a4a7ae;
+    --ink-3: #6e7178;
+    --line: #2d3036;
+    --line-strong: #3d4046;
+    --live: #2fbfa6;
+    --live-deep: #57d6c2;
+    --live-soft: #16302b;
+    --warn: #d9a441;
+    --warn-soft: #352b16;
+    --risk: #e0705f;
+    --risk-soft: #381d18;
+    --focus-ring: rgba(47, 191, 166, 0.4);
+    --shadow-pop: 0 4px 22px rgba(0, 0, 0, 0.5), 0 1px 4px rgba(0, 0, 0, 0.4);
+    /* 反色块翻转: 亮块 + 暗字 (选中态/主按钮高对比可读) */
+    --block: #e8e9eb;
+    --block-hover: #cfd1d5;
+    --block-fg: #141518;
+    color-scheme: dark;
+  }
 }

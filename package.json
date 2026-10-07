@@ -1,15 +1,18 @@
 {
   "name": "bot",
-  "version": "1.0.0",
+  "version": "0.1.0",
+  "description": "基于 pi-durable 的多 Agent 沙盒对话网关 (终端 TUI / IM 渠道 / Web 管理台 / 定时任务)",
   "type": "module",
+  "license": "UNLICENSED",
   "bin": {
     "bot": "./bin/bot"
   },
   "scripts": {
-    "dev": "bun run src/cli.ts",
+    "dev": "bun run src/cli.ts start",
     "dev:web": "bun run scripts/dev-web.ts",
     "build:web": "cd web && bunx vite build && cd .. && bun run scripts/embed-web.ts",
     "build:binary": "bun run build:web && bun build src/cli.ts --compile --minify --outfile bin/bot",
+    "build:release": "bun run scripts/build-release.ts --all",
     "typecheck": "tsc --noEmit && tsc -p web/tsconfig.json",
     "test": "bun test"
   },
@@ -21,11 +24,15 @@
     "@larksuiteoapi/node-sdk": "^1.74.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@types/qrcode": "^1.5.6",
+    "@types/ws": "^8.18.2",
     "@wecom/aibot-node-sdk": "^1.0.7",
     "axios": "^1.20.0",
     "croner": "^10.0.1",
+    "ink": "^8.0.0",
     "qrcode": "^1.5.4",
-    "typebox": "^1.3.27"
+    "react-devtools-core": "file:./vendor/react-devtools-core-stub",
+    "typebox": "^1.3.27",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "@fontsource/ibm-plex-mono": "^5.3.0",

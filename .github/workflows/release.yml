@@ -1,0 +1,85 @@
+# 发布流水线 (0.1.0 起): tag 触发 → 四平台交叉编译 → GitHub Release
+#
+# 触发: git tag v0.1.0 && git push origin v0.1.0
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # GitHub Release 上传
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - bun-darwin-arm64
+          - bun-darwin-x64
+          - bun-linux-x64
+          - bun-linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # tag 是版本单一真相源; 同时校验 package.json 没忘改 (双源漂移防护)
+      - name: Verify version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag v$TAG_VERSION 与 package.json version ($PKG_VERSION) 不一致——请同步后重新打 tag"
+            exit 1
+          fi
+
+      # 四平台交叉编译全在 ubuntu 完成 (bun --compile 的 --target 交叉编译);
+      # 版本经 --define 注入二进制 (bot --version / gateway identify 可见)
+      - name: Build release artifacts
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VERSION="${VERSION#v}" bun run scripts/build-release.ts --all
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/release/
+
+  github-release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: release-*
+
+      - name: Stage binaries
+        run: |
+          mkdir -p dist
+          # artifact 目录: release-<target>/<platform>/bot → bot-<platform>.tar.gz
+          for dir in artifacts/release-*/*/; do
+            platform=$(basename "$dir")
+            tar -czf "dist/bot-${platform}.tar.gz" -C "$dir" bot
+          done
+          ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true

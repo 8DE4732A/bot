@@ -1,4 +1,5 @@
 import { DatabaseManager } from "../database/index.ts";
+import { EventBus } from "../core/event-bus.ts";
 import { logger } from "../utils/logger.ts";
 import { normalizeSandbox } from "./sandbox-defaults.ts";
 
@@ -466,6 +467,91 @@ export class DatabaseStore {
     );
   }
 
+  /**
+   * 全部会话映射 (管理台会话浏览页; 最近活跃优先)。
+   * 同一 conversation 可能有多行 (真实渠道行 + 'channel_session' 哨兵行):
+   * 真实渠道行优先; **无真实渠道行的会话 (web-playground/scheduler, R2 评审
+   * B8) 提升哨兵行为展示行**——channelInstanceId/peerId 改写为 sessionId
+   * 首段来源 (web-playground / scheduler), 前端来源徽章可正确着色。
+   */
+  public listSessions(): ChannelSession[] {
+    // 去重后再截断 (R3 评审 M-3: 哨兵+真实行成对存在, SQL 先 LIMIT 会把
+    // 真实行截掉只剩哨兵)——全量取行 (映射行总量有限), 分组后截 500
+    const rows = this.db.query<any>(
+      // 上界防全表扫描失控 (R5 评审 M-6); 超大部署的分页记 backlog
+      `SELECT * FROM channel_sessions ORDER BY last_active_at DESC LIMIT 5000`,
+    );
+    // 按 conversation 分组, 真实渠道行优先 (哨兵行兜底)——不能先到先得:
+    // 同 last_active_at 的插入序不定 (R2 评审回归实测踩坑)
+    const byConversation = new Map<string, any>();
+    for (const r of rows) {
+      const convId = String(r.conversation_id);
+      const existing = byConversation.get(convId);
+      if (!existing || (existing.channel_instance_id === "channel_session" && r.channel_instance_id !== "channel_session")) {
+        byConversation.set(convId, r);
+      }
+    }
+    return [...byConversation.values()]
+      .sort((a, b) => b.last_active_at - a.last_active_at)
+      .slice(0, 500)
+      .map((r) => {
+        let channelInstanceId = r.channel_instance_id as string;
+        let peerId = r.peer_id as string;
+        if (channelInstanceId === "channel_session") {
+          // 哨兵行提升: peerId 形态为 `${agentId}:${sessionId}`——剥 agentId
+          // 得 sessionId, 再剥 sessionId 首段为来源 (web-playground/scheduler)
+          const derivedPeer = peerId.slice(peerId.indexOf(":") + 1);
+          const sep = derivedPeer.indexOf(":");
+          channelInstanceId = sep > 0 ? derivedPeer.slice(0, sep) : "internal";
+          peerId = sep > 0 ? derivedPeer.slice(sep + 1) : derivedPeer;
+        }
+        return {
+          channelInstanceId,
+          peerId,
+          agentId: r.agent_id,
+          conversationId: r.conversation_id,
+          createdAt: r.created_at,
+          lastActiveAt: r.last_active_at,
+        };
+      });
+  }
+
+  /**
+   * 渠道绑定解析 (chat-orchestrator 的 IM fast path 与 ChannelManager.dispatchInbound
+   * 共用, R8 simplify Reuse#6: 此前两处各写一遍 enabled/悬空校验)。
+   * 返回 agentId 或错误说明。
+   */
+  public resolveBoundAgent(channelInstanceId: string): { agentId: string } | { error: string } {
+    const channelConfig = this.getChannel(channelInstanceId);
+    if (channelConfig && !channelConfig.enabled) {
+      return { error: `渠道 ${channelInstanceId} 已停用` };
+    }
+    const agentId = channelConfig?.boundAgentId;
+    if (!agentId || !this.getAgent(agentId)) {
+      return { error: `渠道 ${channelInstanceId} 尚未绑定有效 Agent, 请在管理台「渠道」页配置` };
+    }
+    return { agentId };
+  }
+
+  /**
+   * 按 agentId + sessionId 查会话映射 (管理台 /api/sessions/find, R1 评审
+   * B6/B14): 真实渠道行优先 (channelInstanceId=sessionId 首段), 哨兵行
+   * (`channel_session`, peerId=`${agentId}:${sessionId}`) 兜底——与
+   * AgentManager 的映射写入语义同一形态, 前端不再猜 peer 字符串。
+   */
+  public findSessionByKeys(agentId: string, sessionId: string): ChannelSession | undefined {
+    const idx = sessionId.indexOf(":");
+    if (idx > 0) {
+      const channelInstanceId = sessionId.slice(0, idx);
+      const peerId = sessionId.slice(idx + 1);
+      if (this.getChannel(channelInstanceId)) {
+        const real = this.getSession(channelInstanceId, peerId);
+        if (real) return real;
+      }
+    }
+    return this.getSession("channel_session", `${agentId}:${sessionId}`);
+  }
+
   // --- MCP Servers ---
   private mapMcpServerRow(row: any): McpServerDefinition {
     return {
@@ -673,6 +759,49 @@ export class DatabaseStore {
     return true;
   }
 
+  /** 原子递增 run_count (手动触发与到点调度并发防覆盖, R1 评审 B18/M15), 返回递增后的值 */
+  public incrementScheduledTaskRun(id: string): number {
+    this.db.run("UPDATE scheduled_tasks SET run_count = run_count + 1 WHERE id = ?", id);
+    const row = this.db.queryOne<any>("SELECT run_count FROM scheduled_tasks WHERE id = ?", id);
+    return row?.run_count ?? 0;
+  }
+
+  // --- WS 排队消息持久化 (四期 §4.2 "受理即落库"; R2 评审 B6) ---
+
+  /** 入队落库 (受理即持久), 返回行 id */
+  public enqueueQueuedPrompt(agentId: string, sessionId: string, message: string): number {
+    const result = this.db.run(
+      "INSERT INTO gateway_queued_prompts (agent_id, session_id, message, created_at) VALUES (?, ?, ?, ?)",
+      agentId,
+      sessionId,
+      message,
+      Date.now(),
+    );
+    return Number(result.lastInsertRowid ?? 0);
+  }
+
+  /** 出队 (已投递) 删行 */
+  public deleteQueuedPrompt(id: number): void {
+    this.db.run("DELETE FROM gateway_queued_prompts WHERE id = ?", id);
+  }
+
+  /** drain 清空某会话的持久队列 */
+  public clearQueuedPrompts(agentId: string, sessionId: string): number {
+    const { changes } = this.db.run(
+      "DELETE FROM gateway_queued_prompts WHERE agent_id = ? AND session_id = ?",
+      agentId,
+      sessionId,
+    );
+    return Number(changes ?? 0);
+  }
+
+  /** 启动恢复: 上次进程残留的排队消息 (出队失败/崩溃遗留) */
+  public listQueuedPrompts(): { id: number; agentId: string; sessionId: string; message: string }[] {
+    return this.db
+      .query<any>("SELECT * FROM gateway_queued_prompts ORDER BY id ASC")
+      .map((r) => ({ id: r.id, agentId: r.agent_id, sessionId: r.session_id, message: r.message }));
+  }
+
   // --- Audit Logs ---
   public recordAudit(eventType: string, details: Record<string, unknown>, agentId?: string, channelId?: string): void {
     const now = Date.now();
@@ -685,6 +814,10 @@ export class DatabaseStore {
       JSON.stringify(details),
       now,
     );
+    // 审计事件同步广播 (管理台审计页静默刷新); 发布端兜错, 不得影响调用方
+    try {
+      EventBus.getInstance().publish({ type: "audit.recorded", event: eventType, agentId });
+    } catch {}
   }
 
   public listAuditLogs(limit = 100): AuditLogEntry[] {
@@ -700,5 +833,53 @@ export class DatabaseStore {
       details: r.details,
       createdAt: r.created_at,
     }));
+  }
+
+  /** 审计过滤查询 (管理台 2.0: 事件类型 × Agent × 时间范围 + 分页) */
+  public listAuditLogsFiltered(filters: {
+    event?: string;
+    agentId?: string;
+    since?: number;
+    until?: number;
+    limit?: number;
+    offset?: number;
+  }): { items: AuditLogEntry[]; total: number } {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (filters.event) {
+      where.push("event_type LIKE ?");
+      params.push(`${filters.event}%`);
+    }
+    if (filters.agentId) {
+      where.push("agent_id = ?");
+      params.push(filters.agentId);
+    }
+    if (filters.since !== undefined) {
+      where.push("created_at >= ?");
+      params.push(filters.since);
+    }
+    if (filters.until !== undefined) {
+      where.push("created_at <= ?");
+      params.push(filters.until);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const total = this.db.queryOne<{ n: number }>(`SELECT COUNT(*) AS n FROM audit_logs ${whereSql}`, ...params)?.n ?? 0;
+    const rows = this.db.query<any>(
+      `SELECT * FROM audit_logs ${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`,
+      ...params,
+      filters.limit ?? 100,
+      filters.offset ?? 0,
+    );
+    return {
+      total,
+      items: rows.map((r) => ({
+        id: r.id,
+        agentId: r.agent_id,
+        channelInstanceId: r.channel_instance_id,
+        eventType: r.event_type,
+        details: r.details,
+        createdAt: r.created_at,
+      })),
+    };
   }
 }

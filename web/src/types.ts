@@ -162,5 +162,55 @@ export interface ChatChunk {
     name: string;
     status: string;
   };
+  /** 命令结果的结构化数据透传 (/agent <id> 的 switchTo 等, R2 评审 B7) */
+  data?: { switchTo?: string };
+  usage?: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    totalTokens: number;
+    contextTokens: number;
+    contextWindow: number;
+    cacheHitRate?: number;
+    costTotal: number;
+    durationMs: number;
+    reasoning?: number;
+  };
   error?: string;
+}
+
+/* ---------------- 会话浏览（四期 §6.2 #1） ---------------- */
+
+export interface SessionRow {
+  channelInstanceId: string;
+  peerId: string;
+  agentId: string;
+  conversationId: string;
+  createdAt: number;
+  lastActiveAt: number;
+}
+
+export interface SessionMessage {
+  role: "user" | "assistant" | "tool" | "handoff";
+  text: string;
+  toolName?: string;
+  seq: number;
+}
+
+export interface SessionHistory {
+  conversationId: number;
+  messages: SessionMessage[];
+  truncated: boolean;
+}
+
+export interface SessionSearchHit {
+  conversationId: number;
+  snippet: string;
+}
+
+/** 审计过滤分页响应（四期 §6.2 #4） */
+export interface AuditPage {
+  items: AuditLog[];
+  total: number;
 }

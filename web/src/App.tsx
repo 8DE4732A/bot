@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 
-import { api } from "./api";
+import { api, subscribeGatewayEvents } from "./api";
 import { Icon, ToastProvider, fmtUptime } from "./components/ui";
 import type { SystemStatus } from "./types";
 import { AgentsView } from "./views/AgentsView";
@@ -11,6 +11,7 @@ import { McpView } from "./views/McpView";
 import { OverviewView } from "./views/OverviewView";
 import { ProvidersView } from "./views/ProvidersView";
 import { ScheduledTasksView } from "./views/ScheduledTasksView";
+import { SessionsView } from "./views/SessionsView";
 
 /* ---------------- 视图注册表: 新增视图只需在此加一行 ---------------- */
 
@@ -30,6 +31,7 @@ const VIEWS: ViewDef[] = [
   { view: "channels", label: "对话渠道", icon: "swap", render: () => <ChannelsView /> },
   { view: "mcp", label: "MCP 服务", icon: "plug", render: () => <McpView /> },
   { view: "tasks", label: "定时任务", icon: "clock", render: () => <ScheduledTasksView /> },
+  { view: "sessions", label: "会话浏览", icon: "layers", render: () => <SessionsView /> },
   { view: "chat", label: "对话调试", icon: "message", render: ({ agentId }) => <ChatView initialAgentId={agentId} /> },
   { view: "audit", label: "沙盒审计", icon: "shield", render: () => <AuditView /> },
 ];
@@ -92,6 +94,10 @@ function useRuntime() {
 function Shell() {
   const route = useRoute();
   const status = useRuntime();
+
+  // 全局 Gateway 事件流 (四期 §6.1): 单连接订阅, 事件以 window CustomEvent
+  // 分发——各视图监听 "bot:event" 做静默刷新 (跳 spinner 保滚动位置)
+  useEffect(() => subscribeGatewayEvents(), []);
 
   const goto = useCallback((v: string) => navigate(`/${v}`), []);
   const current = VIEWS.find((v) => v.view === route.view) ?? VIEWS[0];

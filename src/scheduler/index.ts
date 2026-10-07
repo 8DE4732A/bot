@@ -37,6 +37,15 @@ export class SchedulerManager {
     logger.info("Scheduler", "Scheduler started (polling every 1s)");
   }
 
+  /** gateway drain/status 观测用 (control-socket) */
+  public get isStarted(): boolean {
+    return this.started;
+  }
+
+  public get inFlightCount(): number {
+    return this.inFlight.size;
+  }
+
   public stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
@@ -81,8 +90,10 @@ export class SchedulerManager {
   private async execute(task: ScheduledTaskDefinition, store: DatabaseStore): Promise<void> {
     this.inFlight.add(task.id);
     const startedAt = Date.now();
+    // runCount 原子递增 (R1 评审 B18: 与手动触发并发时不再读-改-写覆盖);
+    // 成功/失败都计一次 (触发即消耗一轮)
+    const runNumber = store.incrementScheduledTaskRun(task.id);
     try {
-      const runNumber = task.runCount + 1;
       const triggerMessage =
         `[定时任务「${task.name}」第 ${runNumber} 次触发 · ${new Date(startedAt).toISOString()}]\n\n${task.prompt}`;
       logger.info("Scheduler", `Triggering task '${task.id}' (${task.name}) for agent ${task.agentId}`);
@@ -106,7 +117,7 @@ export class SchedulerManager {
         lastRunAt: startedAt,
         lastStatus: runStatus,
         lastResult: answer.slice(0, LAST_RESULT_MAX_CHARS),
-        runCount: runNumber,
+        runCount: fresh.runCount, // incrementScheduledTaskRun 已计入
         updatedAt: Date.now(),
       });
       EventBus.getInstance().publish({
@@ -127,7 +138,7 @@ export class SchedulerManager {
           lastRunAt: startedAt,
           lastStatus: "error",
           lastResult: String(err).slice(0, LAST_RESULT_MAX_CHARS),
-          runCount: fresh.runCount + 1,
+          runCount: fresh.runCount, // execute 开头已原子递增
           updatedAt: Date.now(),
         });
       }
@@ -138,7 +149,7 @@ export class SchedulerManager {
         taskName: task.name,
         agentId: task.agentId,
         status: "error",
-        runNumber: task.runCount + 1,
+        runNumber,
         result: "",
         error: String(err),
       });

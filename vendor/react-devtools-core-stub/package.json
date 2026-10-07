@@ -1,0 +1,7 @@
+{
+  "name": "react-devtools-core",
+  "version": "0.0.0-stub",
+  "description": "空 stub: ink 的 React DevTools 连接是 opt-in 功能 (仅 DEV=true 且可达时加载)。单二进制构建无需真实的 react-devtools-core (数十 MB), 用此 stub 满足 bundler 解析; 生产路径永不执行。",
+  "type": "module",
+  "main": "index.js"
+}

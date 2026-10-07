@@ -1,4 +1,6 @@
-import { api } from "../api";
+import { useEffect } from "react";
+
+import { api, isGatewayEvent } from "../api";
 import { Empty, Icon, KindBadge, fmtTime, fmtUptime, initials, useAsync } from "../components/ui";
 
 export function OverviewView({ onNavigate }: { onNavigate: (v: string) => void }) {
@@ -6,13 +8,29 @@ export function OverviewView({ onNavigate }: { onNavigate: (v: string) => void }
   const agentsQ = useAsync(() => api.listAgents(), []);
   const providersQ = useAsync(() => api.listProviders(), []);
   const skillsQ = useAsync(() => api.listSkills(), []);
-  const auditQ = useAsync(() => api.listAuditLogs(), []);
+  const auditQ = useAsync(() => api.auditLogsFiltered({ limit: 50 }), []);
+
+  // 事件流静默刷新 (§6.2): 审计落库/渠道状态变化即重拉, 无手动刷新按钮
+  useEffect(() => {
+    const onEvent = (e: Event) => {
+      if (isGatewayEvent(e, "channel.status", "channel.health", "chat.turn")) {
+        statusQ.reload();
+      }
+      if (isGatewayEvent(e, "audit.recorded")) {
+        statusQ.reload();
+        auditQ.reload();
+      }
+    };
+    window.addEventListener("bot:event", onEvent);
+    return () => window.removeEventListener("bot:event", onEvent);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const status = statusQ.data;
   const agents = agentsQ.data ?? [];
   const providers = providersQ.data ?? [];
   const skills = skillsQ.data ?? [];
-  const audits = auditQ.data ?? [];
+  const audits = auditQ.data?.items ?? [];
 
   return (
     <div className="page">

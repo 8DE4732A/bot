@@ -20,6 +20,14 @@ function kernelDenyRead(extraDenyRead: string[] = []): string[] {
     join(paths.dotBot, "conversations.sqlite"),
     join(paths.dotBot, "conversations.sqlite-wal"),
     join(paths.dotBot, "conversations.sqlite-shm"),
+    // 四期新增 host 凭据 (R1 评审 B1/B4): gateway-token 是管理 API + WS
+    // 的根凭据; pid 文件断掉 "cat pid → kill" 自毁链。与 platformDenyRead
+    // 同步演进 (约束 7)
+    join(paths.dotBot, "gateway-token"),
+    join(paths.dotBot, "gateway.pid"),
+    join(paths.dotBot, "gateway.sock"),
+    join(paths.dotBot, "gateway.config-error"),
+    join(paths.dotBot, "gateway.lock"),
     // 渠道持久化凭据 (微信 bot_token/context_token 等)——0600 只防其他 OS 用户,
     // 沙盒 Agent 同一 OS 用户, 必须靠路径 deny (与 platformDenyRead 同步演进)
     join(paths.dotBot, "channels"),

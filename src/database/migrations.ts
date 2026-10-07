@@ -128,6 +128,21 @@ const MIGRATIONS: ((db: DatabaseSync) => void)[] = [
       ALTER TABLE scheduled_tasks ADD COLUMN notify_enabled INTEGER NOT NULL DEFAULT 1;
     `);
   },
+  // v5: WS 排队消息持久化 (四期 §4.2 "受理即落库"; R2 评审 B6——内存队列
+  // 在 drain/崩溃时丢失用户已确认受理的消息)
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gateway_queued_prompts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        message TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_gateway_queued_prompts_session
+        ON gateway_queued_prompts (agent_id, session_id);
+    `);
+  },
 ];
 
 export function runMigrations(db: DatabaseSync) {

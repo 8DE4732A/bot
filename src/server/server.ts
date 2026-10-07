@@ -1,9 +1,13 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { networkInterfaces } from "node:os";
 import QRCode from "qrcode";
 import { DatabaseStore } from "../config/database-store.ts";
 import { getAgentWorkspaceDir } from "../config/env-paths.ts";
 import { AgentManager } from "../core/agent-manager.ts";
+import { EventBus } from "../core/event-bus.ts";
+import { tokensEqual } from "../core/gateway-token.ts";
+import { handleChatInbound } from "../core/chat-orchestrator.ts";
+import { attachWsGateway } from "../gateway/ws-gateway.ts";
+import { isDraining } from "../gateway/lifecycle.ts";
 import { ModelFactory } from "../core/model-factory.ts";
 import { ChannelManager } from "../channels/manager.ts";
 import { createChannelAdapter } from "../channels/factory.ts";
@@ -15,6 +19,10 @@ import { SkillRegistry } from "../skills/registry.ts";
 import { loadCustomSkills } from "../skills/loader.ts";
 import { logger } from "../utils/logger.ts";
 import { EMBEDDED_UI } from "./ui/generated.ts";
+import type { WebSocketServer } from "ws";
+import { isTrustedHostname } from "../utils/trusted-hosts.ts";
+import { readConversationHistory, searchConversations } from "./session-history.ts";
+import { computeNextRunAt, validateCronExpr, MIN_INTERVAL_SECONDS } from "../scheduler/schedule.ts";
 
 /** Web Playground 的默认会话标识, 与 /api/chat 与 /api/chat/reset 共用 */
 const playgroundSession = (agentId: string) => `web-playground:${agentId}`;
@@ -22,27 +30,32 @@ const playgroundSession = (agentId: string) => `web-playground:${agentId}`;
 /** 内嵌二进制资源 (字体等) 的懒解码缓存: 每个资源只做一次 base64 → Buffer */
 const binaryCache = new Map<string, Buffer>();
 
-/** 允许出现在 Host / Origin 中的主机名 (防 DNS rebinding 与跨站写请求) */
-const TRUSTED_HOSTNAMES = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+/** 允许出现在 Host / Origin 中的主机名 (防 DNS rebinding 与跨站写请求);
+ *  信任集与 WS Origin 校验共享 (R8 simplify: 收敛到 utils/trusted-hosts) */
 
-// 本机全部网卡地址也在信任集内: --host 0.0.0.0 局域网开放时, Host 是实际 IP
-for (const addrs of Object.values(networkInterfaces())) {
-  for (const addr of addrs ?? []) {
-    TRUSTED_HOSTNAMES.add(addr.address);
-  }
+/** TCP 对端是否 loopback (R3 评审 B1: token 下发面必须用 socket 对端地址
+ *  判定——Host header 完全由客户端伪造, `curl -H "Host: 127.0.0.1"
+ *  http://<LAN-IP>:3000/` 即可绕过 Host 判定拿到注入 token)。
+ *  残余局限 (backlog): 同机其他 OS 用户的 remoteAddress 同为 127.0.0.1——
+ *  127.0.0.1 免密体验的根本取舍, 彻底隔离需 unix socket peer credentials
+ *  或 OAuth (设计 §8-4)。 */
+function isLoopbackPeer(req: IncomingMessage): boolean {
+  const raw = req.socket.remoteAddress ?? "";
+  const addr = raw.replace(/^::ffff:/, ""); // IPv4-mapped IPv6
+  return addr === "127.0.0.1" || addr === "::1";
 }
 
 function isTrustedHost(hostHeader: string | undefined, configuredHost: string): boolean {
   if (!hostHeader) return true; // 无 Host 的本机客户端 (curl/socket) 放行
   const hostname = hostHeader.replace(/:\d+$/, "");
-  return TRUSTED_HOSTNAMES.has(hostname) || hostname === configuredHost;
+  return isTrustedHostname(hostname) || hostname === configuredHost;
 }
 
 function isTrustedOrigin(origin: string | undefined, configuredHost: string): boolean {
   if (!origin) return true; // 非浏览器客户端 (curl/工具) 不带 Origin
   try {
     const hostname = new URL(origin).hostname;
-    return TRUSTED_HOSTNAMES.has(hostname) || hostname === configuredHost;
+    return isTrustedHostname(hostname) || hostname === configuredHost;
   } catch {
     return false;
   }
@@ -125,16 +138,37 @@ export class AdminWebServer {
   private port: number;
   private host: string;
   private store: DatabaseStore;
-  constructor(port = 3000, host = "127.0.0.1") {
+  /** 注入式 session token (四期 §6.1): null = 关闭校验 (测试/无凭据环境) */
+  private authToken: string | null;
+  /** 活跃 SSE 订阅 (事件流断开时清理) */
+  private eventStreams = new Set<ServerResponse>();
+  /** WS 第二传输 (SessionHub / TUI 客户端) */
+  private wsServer?: WebSocketServer;
+  /** 渠道周期健康探测定时器 */
+  private healthTimer?: ReturnType<typeof setInterval>;
+
+  constructor(port = 3000, host = "127.0.0.1", options?: { authToken?: string | null }) {
     this.port = port;
     this.host = host;
     this.store = new DatabaseStore();
+    this.authToken = options?.authToken ?? null;
   }
 
   public async start(): Promise<number> {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       this.server = createServer((req, res) => this.handleRequest(req, res));
+      // WS 第二传输 (四期 M2, §4.1): /api/gateway/ws —— SessionHub 事件流 +
+      // prompt.submit/command.exec RPC; 未识别路径直接销毁 socket
+      this.wsServer = attachWsGateway(this.server, this.authToken);
+      // 端口占用曾让 start promise 永不结束 (设计 §3.5): listen 错误必须显式上抛
+      this.server.once("error", (err: Error) => {
+        try {
+          this.wsServer?.close();
+        } catch {}
+        reject(err);
+      });
       this.server.listen(this.port, this.host, () => {
+        this.server.removeListener("error", reject);
         logger.info("WebServer", `Web Admin Dashboard running at http://${this.host}:${this.port}`);
         if (Object.keys(EMBEDDED_UI).length === 0) {
           logger.warn(
@@ -142,13 +176,78 @@ export class AdminWebServer {
             "管理界面资源为空: 请先运行 `bun run build:web` 生成 src/server/ui/generated.ts",
           );
         }
+        // 渠道周期健康探测 (§6.2 #3): 60s 一轮, 结果经 EventBus → SSE 推给
+        // 渠道页。R1 评审 B1: 此前这段写在 return 之后 (unreachable)——
+        // channel.health 事件从未产生。必须在 listen 成功后启动 (失败即不启动,
+        // R1 评审 M8)
+        this.healthTimer = setInterval(() => void this.broadcastChannelHealth(), 60_000);
+        void this.broadcastChannelHealth();
         resolve(this.port);
       });
     });
   }
 
+  /**
+   * 周期健康探测广播。覆盖**全部已启用渠道**而非仅活跃 adapter (R1 评审 M9):
+   * startAll 启动失败会注销 adapter, 只遍历 adapters 的话失败渠道永远没有
+   * 周期 false 事件, 页面晚打开会误显示"探测中"。
+   */
+  private async broadcastChannelHealth(): Promise<void> {
+    const manager = ChannelManager.getInstance();
+    const entries: { id: string; adapter?: ReturnType<ChannelManager["getAdapter"]> }[] = this.store
+      .listChannels()
+      .filter((c) => c.enabled)
+      .map((c) => ({ id: c.id, adapter: manager.getAdapter(c.id) }));
+    for (const { id, adapter } of entries) {
+      try {
+        const health = adapter?.healthCheck
+          ? await adapter.healthCheck()
+          : adapter?.type === "terminal"
+            ? { ok: true, detail: "local terminal" }
+            : { ok: false, detail: adapter ? "unknown (no health check implemented)" : "not running (启动失败或已停止)" };
+        EventBus.getInstance().publish({
+          type: "channel.health",
+          channelId: id,
+          ok: health.ok,
+          detail: health.detail,
+          checkedAt: Date.now(),
+        });
+      } catch (err) {
+        EventBus.getInstance().publish({
+          type: "channel.health",
+          channelId: id,
+          ok: false,
+          detail: String(err),
+          checkedAt: Date.now(),
+        });
+      }
+    }
+  }
+
   public stop(): Promise<void> {
     return new Promise((resolve) => {
+      for (const res of this.eventStreams) {
+        try {
+          res.end();
+        } catch {}
+      }
+      this.eventStreams.clear();
+      if (this.healthTimer) {
+        clearInterval(this.healthTimer);
+        this.healthTimer = undefined;
+      }
+      // WS 客户端显式终止 (R1 评审 M7): server.close 会等活跃连接,
+      // 不 terminate 则独立调用 stop() 可能长期挂起
+      if (this.wsServer) {
+        for (const client of this.wsServer.clients) {
+          try {
+            client.terminate();
+          } catch {}
+        }
+        try {
+          this.wsServer.close();
+        } catch {}
+      }
       if (this.server) {
         this.server.close(() => resolve());
       } else {
@@ -158,10 +257,26 @@ export class AdminWebServer {
   }
 
   /**
+   * 注入式 token 校验 (§6.1): header x-bot-token 常量时间比较;
+   * query ?token= 等价通道**仅限 GET** (EventSource 无法带 header 的场景;
+   * R1 评审 M3: POST/DELETE 把长期 token 放 URL 会进历史/代理日志)。
+   * 免密体验保留——浏览器从注入的 window.__BOT_TOKEN__ (或 /api/bootstrap)
+   * 取 token, 用户无感知; 非 HTML 客户端 (curl/测试) 需显式带 header。
+   */
+  private authorized(req: IncomingMessage, url?: URL): boolean {
+    if (!this.authToken) return true;
+    const provided = req.headers["x-bot-token"];
+    if (typeof provided === "string" && tokensEqual(provided, this.authToken)) return true;
+    if ((req.method?.toUpperCase() ?? "") !== "GET") return false;
+    const queryToken = url?.searchParams.get("token");
+    return typeof queryToken === "string" && tokensEqual(queryToken, this.authToken);
+  }
+
+  /**
    * 静态资源服务: 管理后台 SPA (React/Vite 构建产物内嵌于 generated.ts)。
    * 带 hash 的资源长缓存, 其余 (index.html) 每次校验; 未命中路径回退到 index.html。
    */
-  private serveStatic(pathname: string, res: ServerResponse, method: string): boolean {
+  private serveStatic(pathname: string, res: ServerResponse, method: string, req?: IncomingMessage): boolean {
     if (pathname.startsWith("/api")) return false;
 
     const isHead = method === "HEAD";
@@ -182,7 +297,14 @@ export class AdminWebServer {
 
     const index = EMBEDDED_UI["/index.html"];
     if (index) {
-      send(index.mime, "no-cache", index.body!);
+      // token 注入 (§6.1): HTML 出口统一挂 window.__BOT_TOKEN__——**仅 loopback
+      // Host** (R2 评审 B1: 局域网访问不注入, 认证边界不因 0.0.0.0 开放而失效)
+      let html = index.body!;
+      if (this.authToken && req && isLoopbackPeer(req)) {
+        const injected = `<script>window.__BOT_TOKEN__=${JSON.stringify(this.authToken)};</script></head>`;
+        html = html.includes("</head>") ? html.replace("</head>", injected) : html + injected;
+      }
+      send(index.mime, "no-cache", html);
       return true;
     }
 
@@ -242,8 +364,31 @@ export class AdminWebServer {
     }
 
     try {
-      // 1. Dashboard UI (static assets + SPA fallback)
-      if ((method === "GET" || method === "HEAD") && this.serveStatic(pathname, res, method)) {
+      // 0. bootstrap (token 下发, 先于鉴权): **仅限 loopback Host** (R2 评审
+      //    B1——web_host 0.0.0.0 局域网开放时, 远程客户端的 Host 是本机网卡
+      //    IP (在 TRUSTED_HOSTNAMES), 若仍下发 token 则认证边界失效; 局域网
+      //    用户需从服务器读 .bot/gateway-token 或走未来 OAuth (§8-4 backlog))
+      if (pathname === "/api/bootstrap" && method === "GET") {
+        if (!isLoopbackPeer(req)) {
+          this.sendError(res, 403, "token bootstrap is only available from loopback");
+          return;
+        }
+        this.sendJson(res, { token: this.authToken ?? "" });
+        return;
+      }
+
+      // 1. Dashboard UI (static assets + SPA fallback) 先于 token 鉴权:
+      //    浏览器首次加载 HTML 时还没有 token, token 恰在 HTML 注入层获取
+      if ((method === "GET" || method === "HEAD") && this.serveStatic(pathname, res, method, req)) {
+        return;
+      }
+
+      // 0b. 注入式 token 校验 (§6.1): 除 bootstrap 与渠道 webhook (回调方
+      //     由渠道验签负责) 外, 全部 API 需要 header
+      if (this.authToken &&
+          !pathname.startsWith("/api/channel-webhook/") &&
+          !this.authorized(req, url)) {
+        this.sendError(res, 401, "Unauthorized (missing/invalid x-bot-token)");
         return;
       }
 
@@ -701,10 +846,40 @@ export class AdminWebServer {
         return;
       }
 
-      // 10. Scheduled Tasks API (管理台视角: 全部 Agent 的任务; 删除为逻辑删除)
+      // 10. Scheduled Tasks API (管理台视角: 全部 Agent 的任务; 删除为逻辑删除;
+      //     四期新增手动创建/编辑与手动触发——人话编辑器 + 防连点)
       if (pathname === "/api/scheduled-tasks") {
         if (method === "GET") {
           this.sendJson(res, this.store.listScheduledTasks());
+          return;
+        }
+        if (method === "POST") {
+          const body = await this.readJsonBody(req);
+          const error = this.validateTaskInput(body);
+          if (error) {
+            this.sendError(res, 400, error);
+            return;
+          }
+          const previous = body.id ? this.store.getScheduledTask(body.id) : undefined;
+          const task = {
+            ...(previous ?? {}),
+            id: body.id || `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+            agentId: body.agentId,
+            name: body.name,
+            prompt: body.prompt,
+            scheduleType: body.scheduleType,
+            ...(body.scheduleType === "once" ? { runAt: Number(body.runAt) } : {}),
+            ...(body.scheduleType === "every" ? { intervalSeconds: Number(body.intervalSeconds) } : {}),
+            ...(body.scheduleType === "cron" ? { cronExpr: String(body.cronExpr) } : {}),
+            enabled: body.enabled !== false,
+            runCount: previous?.runCount ?? 0,
+            nextRunAt: computeNextRunAt({ ...body, scheduleType: body.scheduleType } as any, Date.now()),
+            updatedAt: Date.now(),
+          } as any;
+          this.store.saveScheduledTask(task);
+          this.store.recordAudit("scheduler.task_saved", { taskId: task.id, via: "admin", agentId: task.agentId });
+          EventBus.getInstance().publish({ type: "task.updated", taskId: task.id, agentId: task.agentId });
+          this.sendJson(res, { success: true, id: task.id, nextRunAt: task.nextRunAt });
           return;
         }
         if (method === "DELETE" && this.handleDelete(url, res, (id) => {
@@ -715,15 +890,123 @@ export class AdminWebServer {
         }
       }
 
-      // 11. Audit Logs API
-      if (pathname === "/api/audit-logs" && method === "GET") {
-        const logs = this.store.listAuditLogs(100);
-        this.sendJson(res, logs);
+      // 10b. 手动触发 (编辑器"立即运行"按钮; 前端防连点 + 审计留痕)
+      if (pathname === "/api/scheduled-tasks/trigger" && method === "POST") {
+        const body = await this.readJsonBody(req);
+        // drain 闸 body 后二次校验 (R4 评审 M-3, 与 cancel/reset 同款)
+        if (isDraining()) {
+          this.sendError(res, 503, "gateway 正在重启 (draining), 暂不接受手动触发");
+          return;
+        }
+        const task = this.store.getScheduledTask(String(body.id ?? ""));
+        if (!task || task.deletedAt) {
+          this.sendError(res, 404, "task not found");
+          return;
+        }
+        // runCount 原子递增 (R1 评审 B18: 与到点调度并发时不再读-改-写覆盖)
+        const runNumber = this.store.incrementScheduledTaskRun(task.id);
+        this.store.recordAudit("scheduler.task_triggered", { taskId: task.id, via: "admin", runNumber });
+        // 异步执行: 响应立即返回 (前端经任务列表 lastStatus/事件流观察结果)
+        void AgentManager.getInstance()
+          .chat(
+            task.agentId,
+            `scheduler:${task.id}`,
+            `[定时任务「${task.name}」手动触发 · ${new Date().toISOString()}]\n\n${task.prompt}`,
+          )
+          .then((answer) => {
+            const fresh = this.store.getScheduledTask(task.id);
+            if (fresh) {
+              this.store.saveScheduledTask({
+                ...fresh,
+                lastRunAt: Date.now(),
+                lastStatus: "ok",
+                lastResult: answer.slice(0, 800),
+                runCount: fresh.runCount, // 不回写本地快照 (原子递增已计入)
+                updatedAt: Date.now(),
+              });
+            }
+            EventBus.getInstance().publish({
+              type: "scheduler.completed",
+              taskId: task.id,
+              taskName: task.name,
+              agentId: task.agentId,
+              status: "ok",
+              runNumber,
+              result: answer,
+            });
+          })
+          .catch((err) => {
+            this.store.recordAudit("scheduler.error", { taskId: task.id, error: String(err) });
+          });
+        this.sendJson(res, { success: true, runNumber });
         return;
       }
 
-      // 11. Chat API (Web Playground)
+      // 11. Audit Logs API (四期: 事件类型 × Agent × 时间范围 过滤 + 分页)
+      if (pathname === "/api/audit-logs" && method === "GET") {
+        const event = url.searchParams.get("event") || undefined;
+        const agentId = url.searchParams.get("agentId") || undefined;
+        const since = url.searchParams.get("since");
+        const until = url.searchParams.get("until");
+        const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get("limit") || "100", 10) || 100));
+        const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+        const result = this.store.listAuditLogsFiltered({
+          event,
+          agentId,
+          since: since ? Number(since) : undefined,
+          until: until ? Number(until) : undefined,
+          limit,
+          offset,
+        });
+        this.sendJson(res, result);
+        return;
+      }
+
+      // 11a. 会话浏览 (四期 §6.2 #1): channel_sessions 列表 / 会话时间线 /
+      //      全文搜索——conversations.sqlite 只读 (框架无查询 API, 边界即"仅读")
+      if (pathname === "/api/sessions" && method === "GET") {
+        this.sendJson(res, this.store.listSessions());
+        return;
+      }
+      // 显式会话查找 (R1 评审 B6/B14): AgentManager 的哨兵映射行 peerId 是
+      // `${agentId}:${sessionId}`, 前端猜字符串形态不可靠——由后端按同一
+      // 语义查 (channel_session 哨兵行 + 真实渠道行, 真实行优先)
+      if (pathname === "/api/sessions/find" && method === "GET") {
+        const agentId = url.searchParams.get("agentId") || "";
+        const sessionId = url.searchParams.get("sessionId") || "";
+        if (!agentId || !sessionId) {
+          this.sendError(res, 400, "agentId and sessionId are required");
+          return;
+        }
+        const row =
+          this.store.findSessionByKeys(agentId, sessionId) ??
+          undefined;
+        this.sendJson(res, row ?? null);
+        return;
+      }
+      if (pathname === "/api/sessions/search" && method === "GET") {
+        const q = url.searchParams.get("q") || "";
+        this.sendJson(res, searchConversations(q));
+        return;
+      }
+      if (/^\/api\/sessions\/[^/]+\/history$/.test(pathname) && method === "GET") {
+        const conversationId = Number(pathname.split("/")[3]);
+        if (!Number.isInteger(conversationId) || conversationId <= 0) {
+          this.sendError(res, 400, "invalid conversation id");
+          return;
+        }
+        this.sendJson(res, readConversationHistory(conversationId));
+        return;
+      }
+
+      // 11. Chat API (Web Playground; 四期 M0: 统一经 ChatOrchestrator——
+      // 命令层先行, /reset 等在 Web 与 IM 语义一致, 未识别命令不再直达 LLM)
       if (pathname === "/api/chat" && method === "POST") {
+        // drain 期间拒绝新任务 (R1 评审 B6/M6: 与 IM/WS 同一闸口)
+        if (isDraining()) {
+          this.sendError(res, 503, "gateway 正在重启 (draining), 暂不接受新消息; 请稍后重发");
+          return;
+        }
         const body = await this.readJsonBody(req);
         const { agentId, message, sessionId } = body;
         if (!agentId || !message) {
@@ -732,7 +1015,6 @@ export class AdminWebServer {
         }
 
         const effectiveSessionId = sessionId || playgroundSession(agentId);
-        const agentManager = AgentManager.getInstance();
 
         if (req.headers.accept?.includes("text/event-stream")) {
           res.writeHead(200, {
@@ -743,21 +1025,25 @@ export class AdminWebServer {
 
           let finished = false;
           try {
-            // Bun 下 req 的 "close" 不因客户端断开而触发, 监听响应侧;
-            // 正常完成后 close 也会触发 (writableEnded), 不得误中止下一轮
-            res.on("close", () => {
-              if (!finished && !res.writableEnded) {
-                void AgentManager.getInstance().abortSession(agentId, effectiveSessionId);
-              }
-            });
-            await agentManager.chat(
+            // 断开 = detach (四期 §4.1, R1 评审 B10/B13): 客户端断开/刷新
+            // 不再中止生成——生成自然交付, 中止只走显式 /api/chat/cancel。
+            // 多标签同看一会话时, 关一个标签不再杀掉别人正在看的 turn
+            const outcome = await handleChatInbound({
+              channel: "web",
+              channelInstanceId: "web",
+              peerId: effectiveSessionId,
               agentId,
-              effectiveSessionId,
+              sessionId: effectiveSessionId,
               message,
-              (chunk) => {
+              onChunk: (chunk) => {
                 res.write(`data: ${JSON.stringify(chunk)}\n\n`);
               },
-            );
+            });
+            // 命令结果一次性下发 (前端按 delta 渲染, 无流式过程);
+            // data (switchTo 等) 透传给前端消费 (R2 评审 B7)
+            if (outcome.handled) {
+              res.write(`data: ${JSON.stringify({ delta: outcome.reply, data: outcome.data })}\n\n`);
+            }
             res.write(`data: [DONE]\n\n`);
           } catch (err: any) {
             res.write(`data: ${JSON.stringify({ error: err?.message || String(err) })}\n\n`);
@@ -769,24 +1055,97 @@ export class AdminWebServer {
         }
 
         try {
-          const answer = await agentManager.chat(
+          const outcome = await handleChatInbound({
+            channel: "web",
+            channelInstanceId: "web",
+            peerId: effectiveSessionId,
             agentId,
-            effectiveSessionId,
+            sessionId: effectiveSessionId,
             message,
-          );
-          this.sendJson(res, { success: true, answer });
+          });
+          this.sendJson(res, {
+            success: true,
+            answer: outcome.reply,
+            command: outcome.handled,
+            // /agent <id> 的 switchTo 等结构化数据透传 (R1 评审 B10)
+            data: outcome.data,
+          });
         } catch (err: any) {
           this.sendError(res, 500, err?.message || "Chat failed");
         }
         return;
       }
 
-      // 12. Reset Session API
+      // 11b. 显式取消生成 (四期 §4.1: 客户端断开 ≠ 销毁, 取消是显式动作)
+      if (pathname === "/api/chat/cancel" && method === "POST") {
+        const body = await this.readJsonBody(req);
+        const { agentId, sessionId } = body;
+        if (!agentId) {
+          this.sendError(res, 400, "agentId is required");
+          return;
+        }
+        // drain 闸在 body 读取后二次校验 (R3 评审 M-2: 消除读取窗口竞态)
+        if (isDraining()) {
+          this.sendError(res, 503, "gateway 正在重启 (draining), 暂不接受取消请求");
+          return;
+        }
+        // 取消 = 清队列 (内存 + 持久化, R3 评审 B6 统一 helper)
+        const { clearQueuedForSession } = await import("../gateway/lifecycle.ts");
+        clearQueuedForSession(agentId, sessionId || playgroundSession(agentId));
+        const aborted = await AgentManager.getInstance().abortSession(
+          agentId,
+          sessionId || playgroundSession(agentId),
+        );
+        this.sendJson(res, { success: true, aborted });
+        return;
+      }
+
+      // 11c. Gateway 事件流 (四期 §6.1): EventBus → SSE, 前端列表页订阅做
+      // 静默刷新; 心跳保活, 断开即清理订阅 (browser 重连 fallback 轮询)
+      if (pathname === "/api/gateway/events" && method === "GET") {
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+        res.write(`data: ${JSON.stringify({ type: "hello", uptime: Math.floor(process.uptime()) })}\n\n`);
+        this.eventStreams.add(res);
+        const unsubscribe = EventBus.getInstance().subscribe((e) => {
+          try {
+            res.write(`data: ${JSON.stringify(e)}\n\n`);
+          } catch {
+            // 流已断: 靠 close 清理
+          }
+        });
+        const heartbeat = setInterval(() => {
+          try {
+            res.write(`: ping\n\n`);
+          } catch {}
+        }, 25_000);
+        res.on("close", () => {
+          clearInterval(heartbeat);
+          unsubscribe();
+          this.eventStreams.delete(res);
+        });
+        return;
+      }
+
+      // 12. Reset Session API (复用统一 /reset 的 interrupt-then-dispatch 语义:
+      // R1 评审 B11——busy 时先 abort 再 reset, 与 IM/TUI 同名操作一致)
       if (pathname === "/api/chat/reset" && method === "POST") {
         const body = await this.readJsonBody(req);
         const { agentId, sessionId } = body;
         const targetAgentId = agentId || "agent-default";
         const effectiveSessionId = sessionId || playgroundSession(targetAgentId);
+        // drain 闸 body 后二次校验 (R3 评审 M-2)
+        if (isDraining()) {
+          this.sendError(res, 503, "gateway 正在重启 (draining), 暂不接受重置请求");
+          return;
+        }
+        // 复用统一 /reset 语义: 先 abort 再 reset + 清队列 (R3 评审 B6)
+        const { clearQueuedForSession } = await import("../gateway/lifecycle.ts");
+        clearQueuedForSession(targetAgentId, effectiveSessionId);
+        await AgentManager.getInstance().abortSession(targetAgentId, effectiveSessionId);
         await AgentManager.getInstance().resetSession(targetAgentId, effectiveSessionId);
         this.sendJson(res, { success: true });
         return;
@@ -797,6 +1156,28 @@ export class AdminWebServer {
       logger.error("WebServer", "Request error:", err);
       this.sendError(res, 500, err?.message || "Internal Server Error");
     }
+  }
+
+  /** 定时任务表单校验 (ScheduleBuilder 五模式 → 三类型 + 自定义 cron 逃生门) */
+  private validateTaskInput(body: any): string | null {
+    if (!body.agentId || !this.store.getAgent(body.agentId)) return "agentId 不存在";
+    if (!body.name || typeof body.name !== "string") return "name 必填";
+    if (!body.prompt || typeof body.prompt !== "string") return "prompt 必填";
+    const type = body.scheduleType;
+    if (type === "once") {
+      if (!body.runAt || Number(body.runAt) < Date.now() - 60_000) return "once 任务的触发时间必须在未来";
+      return null;
+    }
+    if (type === "every") {
+      const s = Number(body.intervalSeconds);
+      if (!Number.isFinite(s) || s < MIN_INTERVAL_SECONDS) return `interval 最小 ${MIN_INTERVAL_SECONDS}s (防高频烧 token)`;
+      return null;
+    }
+    if (type === "cron") {
+      const err = validateCronExpr(String(body.cronExpr ?? ""));
+      return err ?? null;
+    }
+    return "scheduleType 必须是 once / every / cron";
   }
 
   /** 统一处理 DELETE ?id=... 的样板 (异步删除: 响应等待回收完成, 防幽灵行) */

@@ -77,7 +77,7 @@ export async function safeFetch(rawUrl: string, init?: RequestInit): Promise<Res
   if (init?.headers) {
     // 兼容普通对象与 Headers 实例 (统一成对象便于跨源摘头)
     headers = init.headers instanceof Headers
-      ? Object.fromEntries(init.headers.entries())
+      ? Object.fromEntries(init.headers as unknown as Iterable<[string, string]>)
       : { ...(init.headers as Record<string, string>) };
   }
   for (let hop = 0; ; hop++) {

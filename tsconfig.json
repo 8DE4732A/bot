@@ -4,7 +4,12 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "lib": [
-      "ESNext"
+      "ESNext",
+      "DOM"
+    ],
+    "jsx": "react-jsx",
+    "types": [
+      "node"
     ],
     "strict": true,
     "noEmit": true,

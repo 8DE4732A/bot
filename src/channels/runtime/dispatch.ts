@@ -19,6 +19,21 @@ export interface InboundPipelineOptions {
 }
 
 /**
+ * slash 命令 fast path (四期 M0, 设计 §5.2): 由 ChatOrchestrator 注册。
+ * 拦截位置在 dedupe/访问策略/限流之后、媒体下载与防抖之前——命令必须即时
+ * 响应, 不能被 5s 防抖合并, 更不能等媒体下载。返回 true = 已处理 (回复已投递)。
+ */
+export type SlashFastPath = (message: InboundMessage, content: string) => Promise<boolean>;
+
+let slashFastPath: SlashFastPath | undefined;
+
+/** 函数注入而非 import: dispatch 处于 manager→factory→adapters 的依赖下游,
+ * 反向 import 会成环; 由 cli/server 启动时调 initCommandRouting() 接线。 */
+export function setSlashFastPath(fn: SlashFastPath | undefined): void {
+  slashFastPath = fn;
+}
+
+/**
  * 统一入站管道 (M0 渠道运行时): 去重 → 访问策略 → 媒体入站下载 →
  * 防抖合并 → (派发时) 防自循环熔断 → dispatch。每个渠道 adapter 一个实例。
  * 管道内一切失败只记录不抛出——adapter 的平台事件回调绝不能被网关侧错误杀死。
@@ -72,6 +87,17 @@ export class InboundPipeline {
       if (!this.inboundAllowed(message.peerId)) {
         logger.warn("ChannelPipeline", `[${this.options.channelId}] Peer ${message.peerId} exceeded inbound rate limit; dropped`);
         return;
+      }
+
+      // slash fast path (设计 §5.2): 命令即时响应, 不进媒体下载/防抖/会话生成。
+      // 最小判定 (startsWith("/")) 在此, 完整解析与"是否真是命令"交给注册表——
+      // false (路径/普通文本) 落回常规链路。
+      if (slashFastPath && message.content.startsWith("/")) {
+        try {
+          if (await slashFastPath(message, message.content)) return;
+        } catch (err) {
+          logger.error("ChannelPipeline", `[${this.options.channelId}] Slash fast path error:`, err);
+        }
       }
 
       // 媒体入站即下载 (设计 §3.1): 失败的附件丢弃并注明, 不阻断文本

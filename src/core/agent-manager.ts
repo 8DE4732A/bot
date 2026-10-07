@@ -10,6 +10,7 @@ import type { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { DatabaseStore, type AgentDefinition } from "../config/database-store.ts";
 import { getBotPaths } from "../config/env-paths.ts";
+import { EventBus } from "./event-bus.ts";
 import { SandboxedExecutionEnv } from "../sandbox/execution-env.ts";
 import { SkillsCatalog } from "../skills/builtin/skills-catalog.ts";
 import { SkillRegistry } from "../skills/registry.ts";
@@ -45,6 +46,35 @@ export interface ChatChunk {
   };
   usage?: TurnUsage;
 }
+
+/**
+ * 会话 usage 快照 (四期: /status 命令的会话上下文信息源)。
+ * 跨轮累计、进程生命周期内——会话重置即清零; 重启后从零开始累计
+ * (与终端 stats 同一语义边界)。
+ */
+export interface SessionUsageStats {
+  turns: number;
+  totalInput: number;
+  totalOutput: number;
+  totalCacheRead: number;
+  totalCacheWrite: number;
+  totalCost: number;
+  /** 最近一轮的上下文侧 (prompt tokens ≈ 当前上下文大小) */
+  contextTokens: number;
+  /** 模型上下文窗口 (BYOK 未知时 0) */
+  contextWindow: number;
+  /** 最近一轮缓存命中率 = cacheRead/(input+cacheRead+cacheWrite) */
+  cacheHitRate?: number;
+  lastTurnAt: number;
+  lastDurationMs: number;
+}
+
+/**
+ * 会话 turn 事件监听 (四期 M2, SessionHub 数据源): 流式 delta/工具轨迹/
+ * usage 逐 chunk 同步广播——订阅方 (WS 第二传输) 据此给 TUI/Web 客户端
+ * 回放与直播同一会话流。
+ */
+export type TurnListener = (agentId: string, sessionId: string, chunk: ChatChunk) => void;
 
 /** 内存中缓存的会话数上限 (LRU 淘汰, 淘汰后下次访问从存储恢复) */
 const MAX_CACHED_CONVERSATIONS = 100;
@@ -82,6 +112,13 @@ export class AgentManager {
   private conversationToAgent = new Map<string, string>();
   /** 同一会话的互斥队列: 保证串行处理, 避免 watch 流回调互踩与会话双重创建 */
   private sessionLocks = new Map<string, Promise<unknown>>();
+  /** 正在生成中的会话 → conversation 引用 (busy 判定 / cancel / drain 用;
+   *  存引用而非二次查缓存——会话被 LRU 逐出后 cancel 仍可中止, R1 评审 M10) */
+  private busyTurns = new Map<string, Conversation>();
+  /** turn 事件监听 (SessionHub / 未来订阅方) */
+  private turnListeners = new Set<TurnListener>();
+  /** 会话 usage 快照 (跨轮累计, /status 与订阅方读取) */
+  private usageStats = new Map<string, SessionUsageStats>();
 
   constructor(store?: DatabaseStore) {
     this.store = store ?? new DatabaseStore();
@@ -350,6 +387,79 @@ this.models.clearProviders();
     );
   }
 
+  /** 会话是否正在生成 (TUI busy 提示 / cancel / 命令 busyPolicy 判定) */
+  public isBusy(agentId: string, sessionId: string): boolean {
+    return this.busyTurns.has(`${agentId}:${sessionId}`);
+  }
+
+  /** 全进程在飞生成数 (gateway drain 协议的等待判据) */
+  public activeTurnCount(): number {
+    return this.busyTurns.size;
+  }
+
+  /** 会话 usage 快照 (跨轮累计; 无记录返回 undefined) */
+  public getUsageStats(agentId: string, sessionId: string): SessionUsageStats | undefined {
+    return this.usageStats.get(`${agentId}:${sessionId}`);
+  }
+
+  /** 轮完成时累计快照 (调用方已算好 contextWindow/cacheHitRate) */
+  private recordUsageStats(
+    key: string,
+    data: {
+      contextTokens: number;
+      contextWindow: number;
+      cacheHitRate?: number;
+      turnAgg: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
+      durationMs: number;
+    },
+  ): void {
+    const prev = this.usageStats.get(key);
+    const next: SessionUsageStats = {
+      turns: (prev?.turns ?? 0) + 1,
+      totalInput: (prev?.totalInput ?? 0) + data.turnAgg.input,
+      totalOutput: (prev?.totalOutput ?? 0) + data.turnAgg.output,
+      totalCacheRead: (prev?.totalCacheRead ?? 0) + data.turnAgg.cacheRead,
+      totalCacheWrite: (prev?.totalCacheWrite ?? 0) + data.turnAgg.cacheWrite,
+      totalCost: (prev?.totalCost ?? 0) + data.turnAgg.cost,
+      contextTokens: data.contextTokens,
+      contextWindow: data.contextWindow,
+      cacheHitRate: data.cacheHitRate,
+      lastTurnAt: Date.now(),
+      lastDurationMs: data.durationMs,
+    };
+    // Map 迭代序即插入序: LRU 触顶逐出最旧 (与会话缓存同量级)
+    this.usageStats.delete(key);
+    this.usageStats.set(key, next);
+    while (this.usageStats.size > MAX_CACHED_CONVERSATIONS) {
+      const oldest = this.usageStats.keys().next().value;
+      if (oldest === undefined) break;
+      this.usageStats.delete(oldest);
+    }
+  }
+
+  /**
+   * durable 层在飞任务数 (R4 评审 B2): harness.resume() 恢复的 running/ready
+   * 任务不在 busyTurns (那是本进程 chat 路径的登记)——drain 等待面与恢复
+   * 队列自驱动必须把这部分计入, 否则 crash 后恢复中的任务会被截断/并发投递。
+   */
+  public async durableBusyCount(): Promise<number> {
+    if (!this.harness) return 0;
+    // inspect 的 tasks 即全部 live work (R5 评审 B1: 只统计 running/ready
+    // 会漏 waiting/completing——等待中/收尾中的任务同样是"不能截断的工作");
+    // 失败抛错 (fail-closed, R5 评审 B1: 静默返回 0 会让 drain 在不知
+    // durable 状态时直接放行)——调用方决定保守语义
+    const inspection = await this.harness.inspect(BACKGROUND_CONTEXT);
+    return inspection.tasks.length;
+  }
+
+  /** 订阅全进程 turn 事件 (SessionHub); 返回退订函数 */
+  public onTurnEvent(listener: TurnListener): () => void {
+    this.turnListeners.add(listener);
+    return () => {
+      this.turnListeners.delete(listener);
+    };
+  }
+
 
   private async chatLocked(
     agentId: string,
@@ -357,9 +467,61 @@ this.models.clearProviders();
     userMessage: string,
     onChunk?: (chunk: ChatChunk) => void,
   ): Promise<string> {
+    const turnStartedAt = Date.now();
+    EventBus.getInstance().publish({ type: "chat.turn", agentId, sessionId, phase: "start" });
+    try {
+      const answer = await this.chatTurn(agentId, sessionId, userMessage, onChunk);
+      EventBus.getInstance().publish({
+        type: "chat.turn",
+        agentId,
+        sessionId,
+        phase: "completed",
+        durationMs: Date.now() - turnStartedAt,
+      });
+      return answer;
+    } catch (err) {
+      EventBus.getInstance().publish({
+        type: "chat.turn",
+        agentId,
+        sessionId,
+        phase: "error",
+        durationMs: Date.now() - turnStartedAt,
+        error: String(err),
+      });
+      throw err;
+    } finally {
+      this.busyTurns.delete(`${agentId}:${sessionId}`);
+    }
+  }
+
+  private async chatTurn(
+    agentId: string,
+    sessionId: string,
+    userMessage: string,
+    onChunk?: (chunk: ChatChunk) => void,
+  ): Promise<string> {
     const conv = await this.getOrCreateConversation(agentId, sessionId);
+    // busy 登记在拿到 conv 之后 (存引用: LRU 逐出后 cancel 仍可中止)
+    this.busyTurns.set(`${agentId}:${sessionId}`, conv);
     const context = BACKGROUND_CONTEXT;
     const turnStartedAt = Date.now();
+
+    // turn 事件 sink (四期 M2): 流式 chunk 同步广播给监听方 (SessionHub →
+    // WS 第二传输), 再交给调用方回调。无调用方回调但有监听方时也挂 watch——
+    // TUI/Web 观看 IM 等其他入口发起的会话需要同一事件流。
+    const sink =
+      onChunk || this.turnListeners.size > 0
+        ? (chunk: ChatChunk) => {
+            for (const listener of this.turnListeners) {
+              try {
+                listener(agentId, sessionId, chunk);
+              } catch {
+                // 订阅方异常不影响生成
+              }
+            }
+            onChunk?.(chunk);
+          }
+        : undefined;
 
     // 真实渠道映射行 (通知寻址用): sessionId 首段即渠道实例 id, 渠道真实存在
     // 才写映射——terminal/web-playground/scheduler 的差异由存在性决定, 调用方
@@ -386,7 +548,7 @@ this.models.clearProviders();
     const turnAgg = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, reasoning: 0, cost: 0 };
     let lastMsgUsage: { input: number; cacheRead: number; cacheWrite: number } | undefined;
 
-    if (onChunk) {
+    if (sink) {
       try {
         watch = await watchEvents(this.harness!, conv.id, context);
         let lastToolEvent = "";
@@ -416,18 +578,18 @@ this.models.clearProviders();
               for (const change of e.changes) {
                 if (change.type === "text_delta") {
                   lastRenderedText += change.delta;
-                  onChunk({ delta: change.delta });
+                  sink({ delta: change.delta });
                 }
               }
             } else if (e.type === "tool_execution_start" || e.type === "tool_execution_update") {
               if (lastToolEvent !== `${e.toolName}:running`) {
                 lastToolEvent = `${e.toolName}:running`;
-                onChunk({ toolCall: { name: e.toolName, status: "running" } });
+                sink({ toolCall: { name: e.toolName, status: "running" } });
               }
             } else if (e.type === "tool_execution_end") {
               if (lastToolEvent !== `${e.toolName}:done`) {
                 lastToolEvent = `${e.toolName}:done`;
-                onChunk({ toolCall: { name: e.toolName, status: "done" } });
+                sink({ toolCall: { name: e.toolName, status: "done" } });
               }
             }
           }
@@ -464,20 +626,20 @@ this.models.clearProviders();
 
         // 流式已发送的内容与最终回答不是前缀关系时 (多轮工具调用导致生成重置),
         // 不能按长度切片, 否则发出错位的中段子串——改为显式补发完整回答
-        if (onChunk) {
+        if (sink) {
           if (fullText.startsWith(lastRenderedText)) {
             if (fullText.length > lastRenderedText.length) {
-              onChunk({ delta: fullText.slice(lastRenderedText.length) });
+              sink({ delta: fullText.slice(lastRenderedText.length) });
             }
           } else if (fullText) {
-            onChunk({ delta: `\n${fullText}` });
+            sink({ delta: `\n${fullText}` });
           }
         }
 
         // 轮统计: 本轮消耗 = 轮内各 assistant 消息 usage 相加;
         // 当前上下文 = 最后一条 assistant 消息的 prompt 侧 (input+cacheRead+cacheWrite)
         // ——工具调用轮的"累计差值"会把多条消息 prompt 相加, 虚高于真实上下文 (实测踩坑)
-        if (onChunk && lastMsgUsage) {
+        if (lastMsgUsage) {
           const contextTokens = lastMsgUsage.input + lastMsgUsage.cacheRead + lastMsgUsage.cacheWrite;
           const cacheHitRate = contextTokens > 0 ? (lastMsgUsage.cacheRead / contextTokens) * 100 : undefined;
           let contextWindow = 0;
@@ -489,21 +651,35 @@ this.models.clearProviders();
               contextWindow = this.models?.getModel(agent.model.provider, agent.model.modelId)?.contextWindow ?? 0;
             }
           } catch { /* 未知模型不显示百分比 */ }
-          onChunk({
-            usage: {
-              input: turnAgg.input,
-              output: turnAgg.output,
-              cacheRead: turnAgg.cacheRead,
-              cacheWrite: turnAgg.cacheWrite,
-              totalTokens: turnAgg.totalTokens,
-              reasoning: turnAgg.reasoning || undefined,
-              contextTokens,
-              contextWindow,
-              cacheHitRate,
-              costTotal: turnAgg.cost,
-              durationMs: Date.now() - turnStartedAt,
-            },
+          const durationMs = Date.now() - turnStartedAt;
+
+          // 会话 usage 快照 (跨轮累计): /status 命令与订阅方的会话上下文信息源。
+          // 独立于 sink——即使无人观看 (IM 后台会话), 统计也持续累计
+          this.recordUsageStats(`${agentId}:${sessionId}`, {
+            contextTokens,
+            contextWindow,
+            cacheHitRate,
+            turnAgg,
+            durationMs,
           });
+
+          if (sink) {
+            sink({
+              usage: {
+                input: turnAgg.input,
+                output: turnAgg.output,
+                cacheRead: turnAgg.cacheRead,
+                cacheWrite: turnAgg.cacheWrite,
+                totalTokens: turnAgg.totalTokens,
+                reasoning: turnAgg.reasoning || undefined,
+                contextTokens,
+                contextWindow,
+                cacheHitRate,
+                costTotal: turnAgg.cost,
+                durationMs,
+              },
+            });
+          }
         }
 
         return fullText || "(无返回内容)";
@@ -518,15 +694,21 @@ this.models.clearProviders();
     }
   }
 
-  /** 中止该会话正在进行的生成 (SSE 客户端断开 / 用户取消)。会话未缓存则无事发生。 */
-  public async abortSession(agentId: string, sessionId: string): Promise<void> {
-    const cached = this.conversations.get(sessionKey(agentId, sessionId));
-    if (!cached) return;
+  /**
+   * 中止该会话正在进行的生成 (SSE 客户端断开 / 用户取消)。
+   * 返回 true = 该会话确实在生成中且已发出 abort; 会话未缓存或空闲则无事发生。
+   */
+  public async abortSession(agentId: string, sessionId: string): Promise<boolean> {
+    const key = sessionKey(agentId, sessionId);
+    if (!this.busyTurns.has(key)) return false;
+    const conv = this.busyTurns.get(key)!;
     try {
-      await cached.conv.abort(BACKGROUND_CONTEXT);
+      await conv.abort(BACKGROUND_CONTEXT);
       logger.info("AgentManager", `Aborted active generation for ${agentId}:${sessionId}`);
+      return true;
     } catch (err) {
       logger.warn("AgentManager", `Abort failed for ${agentId}:${sessionId}: ${err}`);
+      return false;
     }
   }
 
@@ -538,6 +720,8 @@ this.models.clearProviders();
     await this.withSessionLock(`${agentId}:${sessionId}`, async () => {
       const conv = await this.getOrCreateConversation(agentId, sessionId);
       await conv.reset(handoffNote, BACKGROUND_CONTEXT);
+      // 上下文已作废, usage 快照一并清零 (下次生成从新会话的第一轮起计)
+      this.usageStats.delete(`${agentId}:${sessionId}`);
       logger.info("AgentManager", `Reset session for ${agentId}:${sessionId}`);
     });
   }
