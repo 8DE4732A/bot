@@ -71,9 +71,11 @@ jobs:
       - name: Stage binaries
         run: |
           mkdir -p dist
-          # artifact 目录: release-<target>/<platform>/bot → bot-<platform>.tar.gz
+          # artifact 目录: release-<target>/<platform>/bot → bot-<platform>.tar.gz;
+          # chmod 保留可执行位 (artifact 上传不保证 mode, 缺失则解压后 permission denied)
           for dir in artifacts/release-*/*/; do
             platform=$(basename "$dir")
+            chmod +x "$dir/bot"
             tar -czf "dist/bot-${platform}.tar.gz" -C "$dir" bot
           done
           ls -la dist/
