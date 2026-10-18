@@ -1,8 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { rmSync } from "node:fs";
+import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { AdminWebServer } from "../src/server/server.ts";
 import { DatabaseManager } from "../src/database/index.ts";
+import { DatabaseStore } from "../src/config/database-store.ts";
 import { logger } from "../src/utils/logger.ts";
 
 const testPort = 3199;
@@ -88,6 +89,8 @@ describe("AdminWebServer API & BYOK", () => {
         name: "BYOK 测试助手",
         model: { provider: "my-custom-endpoint", modelId: "qwen2.5-72b" },
         instructions: "Test instructions with BYOK",
+        // 五期: 测试用工作区放在临时目录，避免写进真实 cwd 的 .bot/workspaces
+        workspaceDir: join(testHome, "ws-agent-byok-test"),
         sandbox: { enabled: true, network: { allowedDomains: [] }, filesystem: { allowWrite: ["."] } },
         skills: ["coding-tools"],
       }),
@@ -101,12 +104,223 @@ describe("AdminWebServer API & BYOK", () => {
     expect(createdAgent).toBeDefined();
     expect(createdAgent.model.provider).toBe("my-custom-endpoint");
     expect(createdAgent.model.modelId).toBe("qwen2.5-72b");
+    // 五期: 显式 workspaceDir 生效（默认代际后缀在 phase5 单测覆盖）
+    expect(createdAgent.workspaceDir).toBe(join(testHome, "ws-agent-byok-test"));
 
     // 5. Skills API
     const skillsRes = await fetch(`http://127.0.0.1:${testPort}/api/skills`);
     const skills = await skillsRes.json();
     expect(skills.find((s: any) => s.id === "coding-tools")).toBeDefined();
     expect(skills.find((s: any) => s.id === "web-search")).toBeDefined();
+    // 五期内置常驻文档技能
+    const creator = skills.find((s: any) => s.id === "skill-creator");
+    expect(creator).toBeDefined();
+    expect(creator.autoEnabled).toBe(true);
+    expect(creator.kind).toBe("skill");
+
+    // 5b. Workspace skills API: 写入 → 扫描 → 强制重扫
+    const wsSkillDir = join(createdAgent.workspaceDir, ".agents", "skills", "demo");
+    mkdirSync(wsSkillDir, { recursive: true });
+    writeFileSync(
+      join(wsSkillDir, "SKILL.md"),
+      "---\nname: demo\ndescription: Demo workspace skill\n---\n\n# Demo\n",
+    );
+    const wsRes = await fetch(
+      `http://127.0.0.1:${testPort}/api/agents/agent-byok-test/workspace-skills`,
+    );
+    expect(wsRes.status).toBe(200);
+    const wsSnapshot = await wsRes.json();
+    expect(wsSnapshot.skills.find((s: any) => s.id === "demo")).toBeDefined();
+    expect(wsSnapshot.skills.find((s: any) => s.id === "demo").path).toBe(
+      ".agents/skills/demo/SKILL.md",
+    );
+    expect(wsSnapshot.memory).toBeNull();
+
+    const reloadRes = await fetch(
+      `http://127.0.0.1:${testPort}/api/agents/agent-byok-test/workspace-skills/reload`,
+      { method: "POST" },
+    );
+    expect(reloadRes.status).toBe(200);
+
+    // 5c. workspaceDir 唯一性: 另一个 Agent 不能指向同一目录
+    const dupRes = await fetch(`http://127.0.0.1:${testPort}/api/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: "agent-ws-dup",
+        name: "重复工作区",
+        model: { provider: "my-custom-endpoint", modelId: "qwen2.5-72b" },
+        instructions: "",
+        workspaceDir: createdAgent.workspaceDir,
+        sandbox: { enabled: true, network: { allowedDomains: [] }, filesystem: { allowWrite: ["."] } },
+        skills: [],
+      }),
+    });
+    expect(dupRes.status).toBe(400);
+
+    // 5d. 自定义 workspaceDir 已含技能: 同 ID 重建必须显式 adopt
+    const delAgentRes = await fetch(
+      `http://127.0.0.1:${testPort}/api/agents?id=agent-byok-test`,
+      { method: "DELETE" },
+    );
+    expect(delAgentRes.status).toBe(200);
+    const recreateBody = {
+      id: "agent-byok-test",
+      name: "BYOK 测试助手 (重建)",
+      model: { provider: "my-custom-endpoint", modelId: "qwen2.5-72b" },
+      instructions: "",
+      workspaceDir: createdAgent.workspaceDir,
+      sandbox: { enabled: true, network: { allowedDomains: [] }, filesystem: { allowWrite: ["."] } },
+      skills: [],
+    };
+    const noAdoptRes = await fetch(`http://127.0.0.1:${testPort}/api/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(recreateBody),
+    });
+    expect(noAdoptRes.status).toBe(400);
+    const adoptRes = await fetch(`http://127.0.0.1:${testPort}/api/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...recreateBody, adoptExistingWorkspace: true }),
+    });
+    expect(adoptRes.status).toBe(200);
+    await fetch(`http://127.0.0.1:${testPort}/api/agents?id=agent-byok-test`, { method: "DELETE" });
+
+    // 5e. Agent ID 路径字符拒绝
+    const badIdRes = await fetch(`http://127.0.0.1:${testPort}/api/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: "../evil",
+        name: "Bad ID",
+        model: { provider: "my-custom-endpoint", modelId: "qwen2.5-72b" },
+        instructions: "",
+        sandbox: { enabled: true, network: { allowedDomains: [] }, filesystem: { allowWrite: ["."] } },
+        skills: [],
+      }),
+    });
+    expect(badIdRes.status).toBe(400);
+
+    // 5e-2. 历史非白名单 ID 仍可编辑（只限制新建）
+    const legacyStore = new DatabaseStore();
+    const legacyWs = join(testHome, "legacy-ws");
+    mkdirSync(legacyWs, { recursive: true });
+    legacyStore.saveAgent({
+      id: "legacy.id",
+      name: "Legacy",
+      description: "",
+      model: {
+        provider: "my-custom-endpoint",
+        modelId: "qwen2.5-72b",
+        temperature: 0.7,
+        thinkingLevel: "medium",
+      },
+      instructions: "",
+      workspaceDir: legacyWs,
+      sandbox: {
+        enabled: true,
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { allowWrite: [legacyWs], denyRead: [], denyWrite: [] },
+      },
+      skills: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    const editLegacy = await fetch(`http://127.0.0.1:${testPort}/api/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: "legacy.id",
+        name: "Legacy Edited",
+        model: { provider: "my-custom-endpoint", modelId: "qwen2.5-72b" },
+        instructions: "",
+        workspaceDir: legacyWs,
+        sandbox: {
+          enabled: true,
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: { allowWrite: [legacyWs], denyRead: [], denyWrite: [] },
+        },
+        skills: [],
+      }),
+    });
+    expect(editLegacy.status).toBe(200);
+    await fetch(`http://127.0.0.1:${testPort}/api/agents?id=${encodeURIComponent("legacy.id")}`, {
+      method: "DELETE",
+    });
+
+    // 5e-3. 历史重叠 workspaceDir: GET /api/agents 返回诊断
+    const conflictWs = join(testHome, "conflict-ws");
+    mkdirSync(conflictWs, { recursive: true });
+    const conflictBase = {
+      description: "",
+      model: {
+        provider: "my-custom-endpoint",
+        modelId: "qwen2.5-72b",
+        temperature: 0.7,
+        thinkingLevel: "medium" as const,
+      },
+      instructions: "",
+      workspaceDir: conflictWs,
+      sandbox: {
+        enabled: true,
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { allowWrite: [conflictWs], denyRead: [], denyWrite: [] },
+      },
+      skills: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    legacyStore.saveAgent({ ...conflictBase, id: "conflict-a", name: "Conflict A" });
+    legacyStore.saveAgent({ ...conflictBase, id: "conflict-b", name: "Conflict B" });
+    const conflictAgents = await (await fetch(`http://127.0.0.1:${testPort}/api/agents`)).json();
+    expect(conflictAgents.find((a: any) => a.id === "conflict-a")?.workspaceConflict).toBeDefined();
+    expect(conflictAgents.find((a: any) => a.id === "conflict-b")?.workspaceConflict).toBeDefined();
+    await fetch(`http://127.0.0.1:${testPort}/api/agents?id=conflict-a`, { method: "DELETE" });
+    await fetch(`http://127.0.0.1:${testPort}/api/agents?id=conflict-b`, { method: "DELETE" });
+
+    // 5f. symlink 父目录不得绕过 workspaceDir 唯一性
+    const realRoot = join(testHome, "real-root");
+    const linkRoot = join(testHome, "link-root");
+    mkdirSync(realRoot, { recursive: true });
+    symlinkSync(realRoot, linkRoot);
+    const agentPayload = (id: string, workspaceDir: string) => ({
+      id,
+      name: id,
+      model: { provider: "my-custom-endpoint", modelId: "qwen2.5-72b" },
+      instructions: "",
+      workspaceDir,
+      sandbox: { enabled: true, network: { allowedDomains: [] }, filesystem: { allowWrite: ["."] } },
+      skills: [],
+    });
+    const symA = await fetch(`http://127.0.0.1:${testPort}/api/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(agentPayload("agent-sym-a", join(realRoot, "ws"))),
+    });
+    expect(symA.status).toBe(200);
+    const symB = await fetch(`http://127.0.0.1:${testPort}/api/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(agentPayload("agent-sym-b", join(linkRoot, "ws"))),
+    });
+    expect(symB.status).toBe(400);
+
+    // 5g. 工作区包含关系（父目录）对称拒绝
+    const parentChild = await fetch(`http://127.0.0.1:${testPort}/api/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(agentPayload("agent-parent-child", join(testHome, "family", "child"))),
+    });
+    expect(parentChild.status).toBe(200);
+    const parentRoot = await fetch(`http://127.0.0.1:${testPort}/api/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(agentPayload("agent-parent-root", join(testHome, "family"))),
+    });
+    expect(parentRoot.status).toBe(400);
+    await fetch(`http://127.0.0.1:${testPort}/api/agents?id=agent-parent-child`, { method: "DELETE" });
+    await fetch(`http://127.0.0.1:${testPort}/api/agents?id=agent-sym-a`, { method: "DELETE" });
 
     // 6. Config API (GET and POST)
     await fetch(`http://127.0.0.1:${testPort}/api/config`, {
@@ -186,8 +400,9 @@ describe("AdminWebServer 渠道生命周期 (POST 热替换 / DELETE 回收)", (
     const list = await (await fetch(`http://127.0.0.1:${testPort}/api/channels`)).json();
     expect(list.find((c: any) => c.id === "lifecycle-weixin")).toBeUndefined();
 
-    // 全部 API 测试结束: 清理临时目录 (server 不 stop, 进程退出回收)
+    // 全部 API 测试结束: 只 stop server。
+    // 不要删除 testHome：DatabaseManager 单例可能绑定到这里的 bot.sqlite，
+    // 其他测试套件仍在共享它（CLAUDE.md 测试纪律；删除会导致确定性 disk I/O error）。
     await server.stop();
-    rmSync(testHome, { recursive: true, force: true });
   });
 });

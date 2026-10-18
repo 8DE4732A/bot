@@ -315,7 +315,7 @@ export function Empty({
 
 /* ---------------- 数据加载 hook ---------------- */
 export function useAsync<T>(loader: () => Promise<T>, deps: unknown[] = []) {
-  const [data, setData] = useState<T | null>(null);
+  const [data, setDataState] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [tick, setTick] = useState(0);
@@ -326,7 +326,7 @@ export function useAsync<T>(loader: () => Promise<T>, deps: unknown[] = []) {
     loader()
       .then((d) => {
         if (alive) {
-          setData(d);
+          setDataState(d);
           setError(null);
         }
       })

@@ -1,7 +1,16 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import QRCode from "qrcode";
 import { DatabaseStore } from "../config/database-store.ts";
-import { getAgentWorkspaceDir } from "../config/env-paths.ts";
+import {
+  createAgentWorkspaceDir,
+  getWorkspaceArchiveDir,
+  getBotPaths,
+  isInsidePath,
+  safeAgentId,
+} from "../config/env-paths.ts";
+import { canonicalPath, detectWorkspaceConflicts } from "../config/workspace-conflicts.ts";
+import { existsSync, mkdirSync, renameSync } from "node:fs";
+import { dirname, basename, relative, resolve } from "node:path";
 import { AgentManager } from "../core/agent-manager.ts";
 import { EventBus } from "../core/event-bus.ts";
 import { tokensEqual } from "../core/gateway-token.ts";
@@ -17,6 +26,7 @@ import { McpBridge } from "../skills/mcp/bridge.ts";
 import type { McpServerDefinition } from "../config/database-store.ts";
 import { SkillRegistry } from "../skills/registry.ts";
 import { loadCustomSkills } from "../skills/loader.ts";
+import { hasWorkspaceContent, syncWorkspaceSkills } from "../skills/workspace.ts";
 import { logger } from "../utils/logger.ts";
 import { EMBEDDED_UI } from "./ui/generated.ts";
 import type { WebSocketServer } from "ws";
@@ -26,6 +36,61 @@ import { computeNextRunAt, validateCronExpr, MIN_INTERVAL_SECONDS } from "../sch
 
 /** Web Playground 的默认会话标识, 与 /api/chat 与 /api/chat/reset 共用 */
 const playgroundSession = (agentId: string) => `web-playground:${agentId}`;
+
+/**
+ * 五期: workspaceDir 唯一性/边界校验。
+ * 两个 Agent 指向同一目录时 platformDenyRead 无法互相隔离；指向其他 Agent
+ * 工作区内部或平台 .bot 关键目录同样拒绝。
+ */
+function validateWorkspaceDir(store: DatabaseStore, agentId: string, workspaceDir: string): string | undefined {
+  const paths = getBotPaths();
+  const ws = canonicalPath(workspaceDir);
+  if (isInsidePath(paths.dotBot, ws) && !isInsidePath(paths.workspacesDir, ws)) {
+    return "workspaceDir 不能位于 .bot 平台目录内（workspaces 除外）";
+  }
+  if (ws === resolve(paths.workspacesDir)) return "workspaceDir 不能是 workspaces 根目录";
+  const archiveRoot = canonicalPath(resolve(paths.workspacesDir, ".archive"));
+  if (isInsidePath(archiveRoot, ws)) return "workspaceDir 不能指向已归档的工作区";
+  // 复用历史冲突检测：保存时与启动/聊天路径使用同一"重叠"定义
+  const conflict = detectWorkspaceConflicts([
+    { id: agentId, workspaceDir },
+    ...store.listAgents().filter((a) => a.id !== agentId && a.workspaceDir),
+  ]).get(agentId);
+  if (conflict) return conflict;
+  return undefined;
+}
+
+/** workspaceDir 变化时把 allowWrite 中的旧工作区替换为新工作区（相对 "." 不动）。 */
+function migrateWorkspaceAllowWrite(previousDir: string, nextDir: string, sandbox: any): void {
+  if (!sandbox?.filesystem?.allowWrite || !Array.isArray(sandbox.filesystem.allowWrite)) return;
+  const prev = canonicalPath(previousDir);
+  sandbox.filesystem.allowWrite = sandbox.filesystem.allowWrite.map((p: string) =>
+    canonicalPath(p) === prev ? nextDir : p,
+  );
+}
+
+/** 删除 Agent 时归档默认工作区（仅 .bot/workspaces/<id> 直属目录）。 */
+function archiveDefaultWorkspace(agent: { id: string; workspaceDir: string }): {
+  moved: boolean;
+  archivePath?: string;
+  reason?: string;
+} {
+  const paths = getBotPaths();
+  const ws = resolve(agent.workspaceDir);
+  if (resolve(dirname(ws)) !== resolve(paths.workspacesDir)) {
+    return { moved: false, reason: "custom workspaceDir is not archived" };
+  }
+  if (!existsSync(ws)) return { moved: false, reason: "workspace does not exist" };
+  const archiveRoot = getWorkspaceArchiveDir();
+  mkdirSync(archiveRoot, { recursive: true });
+  const dest = resolve(archiveRoot, `${safeAgentId(agent.id)}-${Date.now()}`);
+  // 防御历史脏数据: 归档目标必须仍在 archive root 内
+  if (!isInsidePath(resolve(archiveRoot), dest)) {
+    return { moved: false, reason: "unsafe agent id for archive path" };
+  }
+  renameSync(ws, dest);
+  return { moved: true, archivePath: dest };
+}
 
 /** 内嵌二进制资源 (字体等) 的懒解码缓存: 每个资源只做一次 base64 → Buffer */
 const binaryCache = new Map<string, Buffer>();
@@ -170,6 +235,15 @@ export class AdminWebServer {
       this.server.listen(this.port, this.host, () => {
         this.server.removeListener("error", reject);
         logger.info("WebServer", `Web Admin Dashboard running at http://${this.host}:${this.port}`);
+        // 历史脏数据: 启动时发现重叠 workspaceDir 并留痕（新保存已被 validate 拒绝）
+        for (const [agentId, reason] of detectWorkspaceConflicts(this.store.listAgents())) {
+          logger.warn("WebServer", `Workspace conflict [${agentId}]: ${reason}`);
+          try {
+            this.store.recordAudit("workspace.conflict", { reason }, agentId);
+          } catch {
+            /* ignore */
+          }
+        }
         if (Object.keys(EMBEDDED_UI).length === 0) {
           logger.warn(
             "WebServer",
@@ -530,7 +604,14 @@ export class AdminWebServer {
       // 7. Agents API
       if (pathname === "/api/agents") {
         if (method === "GET") {
-          this.sendJson(res, this.store.listAgents());
+          const agents = this.store.listAgents();
+          const conflicts = detectWorkspaceConflicts(agents);
+          this.sendJson(
+            res,
+            agents.map((a) =>
+              conflicts.has(a.id) ? { ...a, workspaceConflict: conflicts.get(a.id) } : a,
+            ),
+          );
           return;
         }
         if (method === "POST") {
@@ -539,19 +620,111 @@ export class AdminWebServer {
             this.sendError(res, 400, "id and name are required");
             return;
           }
+          const previous = this.store.getAgent(body.id);
+          // 可选编辑契约：客户端显式携带 originalId 时，必须与 id 一致且对象存在，
+          // 防止“以为在编辑、实际创建了另一个 id”
+          if (body.originalId !== undefined) {
+            if (typeof body.originalId !== "string" || body.originalId !== body.id) {
+              this.sendError(res, 400, "originalId must equal id");
+              return;
+            }
+            if (!previous) {
+              this.sendError(res, 404, `agent '${body.id}' not found`);
+              return;
+            }
+          }
+          // Agent id 进入工作区目录名/归档路径/技能作用域，必须是安全字符。
+          // 仅限制新建：历史数据可能含旧格式 ID，编辑既有 Agent 不能被阻断。
+          if (
+            !previous &&
+            (typeof body.id !== "string" || !/^[a-zA-Z0-9_-]+$/.test(body.id))
+          ) {
+            this.sendError(res, 400, "id must contain only letters, digits, '_' and '-'");
+            return;
+          }
           if (!body.model?.provider || !body.model?.modelId) {
             this.sendError(res, 400, "model.provider and model.modelId are required");
             return;
           }
+          // 五期: 新 Agent 默认工作区带代际后缀，避免同 ID 重建继承旧技能/记忆；
+          // 编辑时缺省沿用原路径。
           if (!body.workspaceDir) {
-            body.workspaceDir = getAgentWorkspaceDir(body.id);
+            body.workspaceDir = previous
+              ? previous.workspaceDir
+              : createAgentWorkspaceDir(body.id);
+          }
+          body.workspaceDir = resolve(body.workspaceDir);
+          const workspaceChanged =
+            !previous || canonicalPath(previous.workspaceDir) !== canonicalPath(body.workspaceDir);
+          if (
+            workspaceChanged &&
+            hasWorkspaceContent(body.workspaceDir) &&
+            body.adoptExistingWorkspace !== true
+          ) {
+            this.sendError(
+              res,
+              400,
+              "workspaceDir 已包含 .agents/skills 或 AGENTS.md；如确认沿用旧工作区，请传 adoptExistingWorkspace: true",
+            );
+            return;
+          }
+          const workspaceError = validateWorkspaceDir(this.store, body.id, body.workspaceDir);
+          if (workspaceError) {
+            this.sendError(res, 400, workspaceError);
+            return;
+          }
+          if (!existsSync(body.workspaceDir)) {
+            mkdirSync(body.workspaceDir, { recursive: true, mode: 0o700 });
+          }
+          if (previous && workspaceChanged) {
+            migrateWorkspaceAllowWrite(previous.workspaceDir, body.workspaceDir, body.sandbox);
           }
           this.store.saveAgent(body);
+          // 任意配置保存都可能影响工作区读取（尤其 denyRead/allowWrite）：
+          // 清进程内快照/会话缓存，让下一轮按新配置重新扫描/构建
+          AgentManager.getInstance().purgeAgent(body.id);
           AgentManager.getInstance().reloadModels();
           this.sendJson(res, { success: true });
           return;
         }
-        if (method === "DELETE" && this.handleDelete(url, res, (id) => this.store.deleteAgent(id))) {
+        if (method === "DELETE") {
+          const id = url.searchParams.get("id");
+          if (!id) {
+            this.sendError(res, 400, "id is required");
+            return;
+          }
+          const agent = this.store.getAgent(id);
+          if (!agent) {
+            this.sendError(res, 404, `agent '${id}' not found`);
+            return;
+          }
+          try {
+            // 归档前先过 store 的删除策略（保留项/渠道绑定），避免无谓的目录移动
+            this.store.assertAgentDeletable(id);
+          } catch (err) {
+            this.sendError(res, 400, (err as Error).message);
+            return;
+          }
+          const archived = archiveDefaultWorkspace(agent);
+          try {
+            this.store.deleteAgent(id);
+          } catch (err) {
+            // DB 删除失败 → 回滚归档
+            if (archived.moved && archived.archivePath && existsSync(archived.archivePath)) {
+              try {
+                renameSync(archived.archivePath, agent.workspaceDir);
+              } catch (rollbackErr) {
+                logger.warn("Server", `Failed to roll back workspace archive for '${id}': ${rollbackErr}`);
+              }
+            }
+            throw err;
+          }
+          AgentManager.getInstance().purgeAgent(id);
+          this.sendJson(res, {
+            success: true,
+            ...(archived.moved ? { archivedWorkspace: archived.archivePath } : {}),
+            ...(archived.reason ? { archiveNote: archived.reason } : {}),
+          });
           return;
         }
       }
@@ -738,6 +911,9 @@ export class AdminWebServer {
           category: s.category,
           builtin: s.builtin,
           kind: s.kind,
+          scope: s.scope ?? "platform",
+          ...(s.ownerAgentId ? { ownerAgentId: s.ownerAgentId } : {}),
+          ...(s.autoEnabled ? { autoEnabled: true } : {}),
           toolCount: s.extension.tools?.length ?? 0,
           ...(s.document
             ? {
@@ -745,10 +921,77 @@ export class AdminWebServer {
                 bodyPreview: s.document.body.slice(0, 400),
                 warnings: s.document.warnings,
                 disableModelInvocation: s.document.disableModelInvocation,
+                ...(s.document.spec ? { spec: s.document.spec } : {}),
               }
             : {}),
         }));
         this.sendJson(res, skills);
+        return;
+      }
+
+      // 9b-1b. 工作区技能/记忆（五期）: 受保护扫描 + 强制重扫
+      const workspaceMatch = pathname.match(/^\/api\/agents\/([^/]+)\/workspace-skills(?:\/reload)?$/);
+      if (workspaceMatch && (method === "GET" || method === "POST")) {
+        const agentId = decodeURIComponent(workspaceMatch[1]);
+        if (!this.store.getAgent(agentId)) {
+          this.sendError(res, 404, `agent '${agentId}' not found`);
+          return;
+        }
+        if (method === "POST" && !pathname.endsWith("/reload")) {
+          this.sendError(res, 405, "use POST .../workspace-skills/reload");
+          return;
+        }
+        // GET 走普通指纹同步（面板打开/SSE 刷新不强制全量扫描）；
+        // POST /reload 才强制重扫
+        const snapshot =
+          method === "POST"
+            ? await syncWorkspaceSkills(agentId, { force: true })
+            : await syncWorkspaceSkills(agentId);
+        if (!snapshot) {
+          this.sendError(res, 404, `agent '${agentId}' not found`);
+          return;
+        }
+        const agent = this.store.getAgent(agentId);
+        const wsCanonical = agent ? canonicalPath(agent.workspaceDir) : "";
+        const wsLexical = agent ? resolve(agent.workspaceDir) : "";
+        const relPath = (p?: string): string | undefined => {
+          if (!p) return undefined;
+          if (wsCanonical && isInsidePath(wsCanonical, p)) return relative(wsCanonical, p);
+          if (wsLexical && isInsidePath(wsLexical, p)) return relative(wsLexical, p);
+          return basename(p);
+        };
+        const sanitizeReason = (reason: string): string =>
+          (wsCanonical ? reason.replaceAll(wsCanonical, "<workspace>") : reason)
+            .replaceAll(wsLexical || "\u0000", "<workspace>");
+        this.sendJson(res, {
+          agentId: snapshot.agentId,
+          enabled: snapshot.enabled,
+          roots: snapshot.roots.map((r) => relPath(r) ?? r),
+          skills: snapshot.skills.map((s) => ({
+            id: s.id,
+            name: s.name,
+            description: s.description,
+            path: relPath(s.sourcePath ?? s.document?.location),
+            warnings: s.document?.warnings ?? [],
+            ...(s.document?.spec ? { spec: s.document.spec } : {}),
+          })),
+          // 诊断同样只暴露相对路径/文件名，避免管理 API 泄露宿主绝对路径
+          diagnostics: snapshot.diagnostics.map((d) => ({
+            ...d,
+            path: relPath(d.path) ?? d.path,
+            reason: sanitizeReason(d.reason),
+          })),
+          // 默认不返回记忆正文预览：只给文件名/大小/截断标记
+          memory: snapshot.memory
+            ? {
+                path: relPath(snapshot.memory.path) ?? basename(snapshot.memory.path),
+                bytes: snapshot.memory.bytes,
+                truncated: snapshot.memory.truncated,
+                mtimeMs: snapshot.memory.mtimeMs,
+              }
+            : null,
+          scannedAt: snapshot.scannedAt,
+        });
         return;
       }
 

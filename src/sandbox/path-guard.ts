@@ -219,8 +219,13 @@ export class PathGuard {
       : this.matchRelativeDeep(norm, rawPattern);
   }
 
-  public checkCanRead(rawPath: string): { allowed: boolean; reason?: string; realPath?: string } {
-    if (!this.enabled) return { allowed: true, realPath: this.resolveReal(this.normalizePath(rawPath)) };
+  public checkCanRead(
+    rawPath: string,
+    options: { force?: boolean } = {},
+  ): { allowed: boolean; reason?: string; realPath?: string } {
+    if (!this.enabled && !options.force) {
+      return { allowed: true, realPath: this.resolveReal(this.normalizePath(rawPath)) };
+    }
     const norm = this.resolveReal(this.normalizePath(rawPath));
 
     // 硬链接与平台保护文件同 inode 时按路径 deny 无法识别, 用 inode 指纹拦截

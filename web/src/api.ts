@@ -15,6 +15,7 @@ import type {
   Skill,
   SystemStatus,
   WeixinQrLogin,
+  WorkspaceSkillSnapshot,
 } from "./types";
 
 /** 从非 2xx 响应中提取错误消息 (统一给 json() 与 chatStream 使用) */
@@ -144,6 +145,12 @@ export const api = {
     ),
 
   listSkills: () => request<Skill[]>("/api/skills"),
+  getWorkspaceSkills: (agentId: string) =>
+    request<WorkspaceSkillSnapshot>(`/api/agents/${encodeURIComponent(agentId)}/workspace-skills`),
+  reloadWorkspaceSkills: (agentId: string) =>
+    request<WorkspaceSkillSnapshot>(`/api/agents/${encodeURIComponent(agentId)}/workspace-skills/reload`, {
+      method: "POST",
+    }),
   listAuditLogs: () => request<AuditLog[]>("/api/audit-logs"),
 
   listMcpServers: () => request<McpServer[]>("/api/mcp-servers"),

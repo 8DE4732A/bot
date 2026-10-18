@@ -59,7 +59,7 @@ export const SELF_DESTRUCT_PATTERN = new RegExp(
  *  白名单整条绕过 (R3/R4 实测)。含元字符的复合命令一律走正则检查。
  *  不含 awk/find 等可执行任意子命令的工具 (system()/-exec)。 */
 const READONLY_FIRST_WORDS = new Set([
-  "grep", "rg", "ag", "cat", "less", "more", "head", "tail", "echo", "ls", "wc",
+  "grep", "rg", "ag", "cat", "less", "more", "head", "tail", "echo", "printf", "ls", "wc",
 ]);
 
 /** 防自杀闸完整判定 (导出供回归测试直接使用——R4 教训: 测试复制本函数
@@ -69,6 +69,108 @@ export function selfDestructBlocked(commandText: string): boolean {
   const first = commandText.trim().split(/\s+/, 1)[0] ?? "";
   if (READONLY_FIRST_WORDS.has(first)) return false;
   return SELF_DESTRUCT_PATTERN.test(commandText);
+}
+
+const WRAPPER_WORDS = new Set(["env", "command", "busybox", "sudo", "doas", "nice", "time", "nohup", "exec"]);
+
+function stripCommandWrappers(tokens: string[]): string[] {
+  let i = 0;
+  while (i < tokens.length) {
+    const token = tokens[i];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+      i++; // VAR=value 前缀
+      continue;
+    }
+    const base = token.split("/").pop() ?? token;
+    if (WRAPPER_WORDS.has(base)) {
+      i++;
+      // 跳过 wrapper 自身选项；sudo/doas 的 -u/-g/-p/-C 还带一个值
+      while (i < tokens.length && tokens[i].startsWith("-")) {
+        const opt = tokens[i].replace(/['"]/g, "");
+        const takesValue = (base === "sudo" || base === "doas") && ["-u", "-g", "-p", "-C"].includes(opt);
+        i += takesValue ? 2 : 1;
+      }
+      continue;
+    }
+    break;
+  }
+  return tokens.slice(i);
+}
+
+/**
+ * 硬链接闸（五期安全修复）：SQLite 的 WAL 连接在主库文件出现第二个硬链接后
+ * 会持续返回 "disk I/O error"（实测：`ln .bot/bot.sqlite ws/x` 后读写全部失败）。
+ * PathGuard 只能挡住"读"，挡不住 `link(2)` 本身；因此对常见硬链接命令
+ * 在 exec 入口直接拒绝（独立于 sandbox.enabled）。
+ *
+ * 覆盖：ln（非 -s）、link、cp -l/--link，以及 env/command/busybox/sudo/
+ * bash -c/find -exec 等常见 wrapper 形态。脚本内动态构造的 link(2) 仍然
+ * 无法静态穷举——残余面由 DatabaseManager 的 IO 错误自动 reopen 恢复兜底。
+ */
+export function hardlinkBlocked(commandText: string): boolean {
+  // 脚本内硬链接 API（python/node/perl/ruby 等常见形态）；在 split 前匹配，
+  // 避免括号被 shell 分隔符切掉
+  if (/(?:os\.link|fs\.link|linkSync|File\.link)\s*\(/.test(commandText)) return true;
+  // 命令替换里的 ln（$(ln a b) / `ln a b`）
+  if (/(?:\$\(|`)[^)`\n]*\bln\b/.test(commandText)) return true;
+
+  const clean = (token: string): string => token.replace(/['"]/g, "");
+  const segments = commandText.split(/[;&|()`\n]+/);
+  for (const segment of segments) {
+    // 纯查询命令（which/man/type/help/command -v）不是硬链接创建
+    if (/^\s*(which|man|type|help)\b/.test(segment)) continue;
+    if (/^\s*command\s+-[vV]\b/.test(segment)) continue;
+    const tokens = segment.trim().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) continue;
+
+    // 只读命令（grep/cat/echo/printf...）里出现 "ln" 多半是搜索/展示文本
+    const stripped = stripCommandWrappers(tokens);
+    const baseIndex = tokens.length - stripped.length;
+    const first = clean(tokens[baseIndex] ?? tokens[0]);
+    const firstBase = first.split("/").pop() ?? first;
+    if (READONLY_FIRST_WORDS.has(firstBase)) continue;
+
+    // 只检查“命令位置”，避免把参数里的 link（git checkout link / rm link）误杀
+    const commandPositions = new Set<number>([baseIndex]);
+    const interpreter = new Set(["bash", "sh", "zsh", "dash", "python", "python3", "node", "perl", "ruby", "bun"]);
+    for (let i = 0; i < tokens.length; i++) {
+      const t = clean(tokens[i]);
+      if (t === "-exec" || t === "-execdir") commandPositions.add(i + 1);
+      if (interpreter.has(firstBase) && (t === "-c" || t === "-e" || t === "--eval" || t === "--command")) {
+        commandPositions.add(i + 1);
+      }
+      if (firstBase === "xargs" && i === baseIndex) {
+        for (let j = i + 1; j < tokens.length; j++) {
+          if (!clean(tokens[j]).startsWith("-")) {
+            commandPositions.add(j);
+            break;
+          }
+        }
+      }
+    }
+
+    for (const i of commandPositions) {
+      if (i < 0 || i >= tokens.length) continue;
+      const token = clean(tokens[i]);
+      const base = token.split("/").pop() ?? token;
+      const args = tokens.slice(i + 1).map(clean);
+      if (base === "link") return true;
+      if (base === "ln") {
+        const symbolic = args.some(
+          (a) => a === "-s" || a === "--symbolic" || (!a.startsWith("--") && a.startsWith("-") && a.includes("s")),
+        );
+        if (!symbolic) return true;
+        continue;
+      }
+      if (base === "cp") {
+        const hardlink = args.some(
+          (a) => a === "-l" || a === "--link" || (!a.startsWith("--") && a.startsWith("-") && a.includes("l")),
+        );
+        if (hardlink) return true;
+      }
+    }
+  }
+  return false;
 }
 
 
@@ -94,7 +196,7 @@ function sandboxShellEnv(): Record<string, string> {
  * skills 目录只禁代码 (*.ts/*.js/node_modules)——文档型技能 SKILL.md
  * 的正文需模型经 read 工具读取 (渐进披露), 代码与数据分别对待。
  */
-function platformDenyRead(agentWorkspace: string, store: DatabaseStore): string[] {
+export function platformDenyRead(agentWorkspace: string, store: DatabaseStore): string[] {
   const paths = getBotPaths();
   const deny = [
     join(paths.dotBot, "bot.sqlite*"),
@@ -143,6 +245,27 @@ function platformDenyRead(agentWorkspace: string, store: DatabaseStore): string[
 }
 
 /**
+ * 构造叠加平台硬规则的 PathGuard（执行环境与宿主侧工作区扫描共用）。
+ * 平台 deny 清单与 skills 目录的 inode 例外必须只有一处定义，防止安全语义漂移。
+ */
+export function createSandboxPathGuard(
+  workspace: string,
+  sandboxConfig: BotSandboxConfig,
+  store: DatabaseStore,
+): PathGuard {
+  const denyRead = platformDenyRead(workspace, store);
+  const skillsDir = getBotPaths().skillsDir;
+  return new PathGuard(
+    workspace,
+    sandboxConfig,
+    denyRead,
+    // skills 源码 deny 模式不进 inode 指纹: glob 收集会枚举整个技能目录,
+    // 把需要放行的 SKILL.md 一并指纹化; 源码无机密, 路径 deny 已足够
+    denyRead.filter((p) => !p.startsWith(skillsDir)),
+  );
+}
+
+/**
  * 双层防护的应用层: 在 pi-durable 执行环境上统一拦截全部文件访问与命令执行。
  * 覆盖是机制级的——基类 FileSystem 接口的每个带路径方法都归入 read/write 两类
  * 检查 (guardRead/guardWrite), 上游新增方法时按同一模式接入, 不存在枚举遗漏。
@@ -161,16 +284,7 @@ export class SandboxedExecutionEnv extends NodeExecutionEnv {
     this.agentId = options.agentId;
     this.sandboxConfig = options.sandboxConfig;
     this.audit = new DatabaseStore();
-    const denyRead = platformDenyRead(options.cwd, this.audit);
-    // skills 源码 deny 模式不进 inode 指纹: glob 收集会枚举整个技能目录,
-    // 把需要放行的 SKILL.md 一并指纹化; 源码无机密, 路径 deny 已足够
-    const skillsDir = getBotPaths().skillsDir;
-    this.pathGuard = new PathGuard(
-      options.cwd,
-      options.sandboxConfig,
-      denyRead,
-      denyRead.filter((p) => !p.startsWith(skillsDir)),
-    );
+    this.pathGuard = createSandboxPathGuard(options.cwd, options.sandboxConfig, this.audit);
   }
 
   /** 拦截闭环: 越界尝试写入结构化审计存储, 审计失败不阻断主流程。 */
@@ -230,6 +344,18 @@ export class SandboxedExecutionEnv extends NodeExecutionEnv {
         new ExecutionError(
           "unknown",
           "Command blocked: gateway 生命周期命令 (stop/restart/uninstall) 不能由 Agent 在沙盒内执行；请让用户在终端运行或使用管理台。",
+        ),
+      );
+    }
+
+    // 硬链接闸: SQLite 主库出现第二硬链接后会持续 disk I/O error；
+    // 此闸独立于 sandbox.enabled（关掉沙盒也不能成为宿主库自毁通道）
+    if (hardlinkBlocked(execText)) {
+      this.auditBlocked("exec", execText, "hardlink creation refused (SQLite DoS protection)");
+      return err(
+        new ExecutionError(
+          "unknown",
+          "Command blocked: Agent 沙盒内禁止创建硬链接 (ln/link/cp -l)；请复制文件而不是 hardlink。",
         ),
       );
     }

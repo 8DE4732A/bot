@@ -285,7 +285,8 @@ export class DatabaseStore {
     );
   }
 
-  public deleteAgent(id: string): boolean {
+  /** 删除前置校验（保留项/渠道绑定）；需要在副作用（如归档工作区）之前单独调用。 */
+  public assertAgentDeletable(id: string): void {
     if (id === "agent-default") {
       throw new Error("Cannot delete default agent");
     }
@@ -296,6 +297,10 @@ export class DatabaseStore {
     if (bound && bound.count > 0) {
       throw new Error(`Agent '${id}' is still bound to ${bound.count} channel(s); rebind them first`);
     }
+  }
+
+  public deleteAgent(id: string): boolean {
+    this.assertAgentDeletable(id);
     // 级联停掉该 Agent 的定时任务: 否则任务按周期触发 → chat 找不到 agent →
     // 每周期 error 审计 + 失败通知循环骚扰 (孤儿任务)。级联在单事务内原子完成
     this.db.exec("BEGIN IMMEDIATE");

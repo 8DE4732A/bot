@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { api } from "../api";
 import {
@@ -195,7 +195,7 @@ function AgentForm({
 
       <Field label={`技能选配 · 已选 ${pickedSkills.length} 项`} hint="TOOL = 工具扩展 · DOC = 文档型技能 (SKILL.md) · MCP = MCP 服务工具集">
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          {skills.map((s) => (
+          {skills.filter((s) => !s.autoEnabled).map((s) => (
             <div
               key={s.id}
               className={`skill-row${pickedSkills.includes(s.id) ? " is-on" : ""}`}
@@ -225,6 +225,11 @@ function AgentForm({
               <KindBadge kind={s.kind} />
             </div>
           ))}
+          {skills.some((s) => s.autoEnabled) ? (
+            <div className="field__hint">
+              内置常驻：{skills.filter((s) => s.autoEnabled).map((s) => s.name).join("、")}，无需勾选，所有 Agent 自动可见。
+            </div>
+          ) : null}
         </div>
       </Field>
 
@@ -319,6 +324,125 @@ function AgentForm({
   );
 }
 
+/* ---------------- 工作区技能/记忆面板 (五期) ---------------- */
+function WorkspacePanel({ agent, onClose }: { agent: Agent; onClose: () => void }) {
+  const q = useAsync(() => api.getWorkspaceSkills(agent.id), [agent.id]);
+  const toast = useToast();
+  const snap = q.data;
+
+  // SSE 静默刷新: 工作区技能/记忆变化事件只刷新当前 Agent 的面板
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { type?: string; agentId?: string } | undefined;
+      if (
+        detail?.agentId === agent.id &&
+        (detail.type === "workspace.skills.changed" || detail.type === "workspace.memory.changed")
+      ) {
+        q.reload();
+      }
+    };
+    window.addEventListener("bot:event", handler);
+    return () => window.removeEventListener("bot:event", handler);
+  }, [agent.id, q.reload]);
+
+  const reload = async () => {
+    try {
+      await api.reloadWorkspaceSkills(agent.id);
+      q.reload();
+      toast("已重新扫描工作区");
+    } catch (e) {
+      toast(`扫描失败: ${(e as Error).message}`, "risk");
+    }
+  };
+
+  return (
+    <Modal
+      title={`工作区 · ${agent.name}`}
+      onClose={onClose}
+      foot={
+        <>
+          <span className="field__hint">{agent.workspaceDir}</span>
+          <div className="modal__foot-group">
+            <button className="btn btn--secondary" onClick={reload} disabled={q.loading}>
+              重新扫描
+            </button>
+            <button className="btn btn--primary" onClick={onClose}>
+              关闭
+            </button>
+          </div>
+        </>
+      }
+    >
+      {q.error ? (
+        <Empty mark="ERROR" title="扫描失败" desc={q.error} />
+      ) : q.loading && !snap ? (
+        <div className="field__hint">正在扫描工作区…</div>
+      ) : snap ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {!snap.enabled ? (
+            <div className="badge badge--warn">工作区技能已在 system_config 中关闭</div>
+          ) : null}
+
+          <div>
+            <div className="section-title">技能 · {snap.skills.length}</div>
+            {snap.skills.length === 0 ? (
+              <div className="field__hint">工作区里还没有技能。Agent 写入 .agents/skills/&lt;name&gt;/SKILL.md 后会自动出现。</div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {snap.skills.map((s) => (
+                  <div key={s.id} className="card">
+                    <div className="card__head">
+                      <div className="card__title-wrap">
+                        <div className="card__title">
+                          {s.name}
+                          <span className="mono mono--plain">{s.id}</span>
+                        </div>
+                        <div className="card__sub mono mono--plain">{s.path}</div>
+                      </div>
+                    </div>
+                    <div className="card__body">{s.description}</div>
+                    {s.warnings.length > 0 ? (
+                      <div className="field__hint" style={{ color: "var(--warn)" }}>{s.warnings.join("; ")}</div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div>
+            <div className="section-title">工作区记忆</div>
+            {snap.memory ? (
+              <div className="card">
+                <div className="card__sub mono mono--plain">{snap.memory.path}</div>
+                <div className="field__hint">
+                  {snap.memory.bytes} bytes · {new Date(snap.memory.mtimeMs).toLocaleString()}
+                  {snap.memory.truncated ? " · 超过上限，注入时会截断" : ""}
+                </div>
+              </div>
+            ) : (
+              <div className="field__hint">未发现 AGENTS.md / AGENTS.override.md / CLAUDE.md。</div>
+            )}
+          </div>
+
+          {snap.diagnostics.length > 0 ? (
+            <div>
+              <div className="section-title">诊断 · {snap.diagnostics.length}</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {snap.diagnostics.map((d, i) => (
+                  <div key={`${d.path}-${i}`} className="field__hint" style={{ color: "var(--warn)" }}>
+                    <span className="mono mono--plain">{d.path}</span> — {d.reason}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </Modal>
+  );
+}
+
 /* ---------------- Agent 列表视图 ---------------- */
 export function AgentsView() {
   const agentsQ = useAsync(() => api.listAgents(), []);
@@ -326,6 +450,7 @@ export function AgentsView() {
   const providersQ = useAsync(() => api.listProviders(), []);
   const toast = useToast();
   const form = useFormDialog<Agent>();
+  const [workspaceAgent, setWorkspaceAgent] = useState<Agent | null>(null);
 
   const agents = agentsQ.data ?? [];
   const skills = skillsQ.data ?? [];
@@ -388,6 +513,11 @@ export function AgentsView() {
                     <div className="card__sub mono mono--plain" title={a.workspaceDir}>
                       {a.workspaceDir ? a.workspaceDir.split("/").slice(-2).join("/") : ""}
                     </div>
+                    {a.workspaceConflict ? (
+                      <span className="badge badge--warn" title={a.workspaceConflict}>
+                        工作区冲突
+                      </span>
+                    ) : null}
                   </div>
                 </div>
 
@@ -431,6 +561,9 @@ export function AgentsView() {
                     <Icon name="message" size={13} /> 对话
                   </button>
                   <div style={{ display: "flex", gap: 6 }}>
+                    <button className="btn btn--ghost btn--sm" onClick={() => setWorkspaceAgent(a)}>
+                      工作区
+                    </button>
                     <button className="btn btn--secondary btn--sm" onClick={() => form.open(a)}>
                       <Icon name="pencil" size={13} /> 配置
                     </button>
@@ -456,6 +589,10 @@ export function AgentsView() {
             agentsQ.reload();
           }}
         />
+      )}
+
+      {workspaceAgent !== null && (
+        <WorkspacePanel agent={workspaceAgent} onClose={() => setWorkspaceAgent(null)} />
       )}
     </div>
   );

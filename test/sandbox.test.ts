@@ -1,6 +1,55 @@
 import { describe, expect, it } from "bun:test";
 import { linkSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { PathGuard } from "../src/sandbox/path-guard.ts";
+import { hardlinkBlocked } from "../src/sandbox/execution-env.ts";
+
+describe("Sandbox hardlink guard", () => {
+  it("blocks hardlink creation commands", () => {
+    expect(hardlinkBlocked("ln a b")).toBe(true);
+    expect(hardlinkBlocked("ln -f a b")).toBe(true);
+    expect(hardlinkBlocked("/bin/ln a b")).toBe(true);
+    expect(hardlinkBlocked("link a b")).toBe(true);
+    expect(hardlinkBlocked("cp -l a b")).toBe(true);
+    expect(hardlinkBlocked("cp --link a b")).toBe(true);
+    expect(hardlinkBlocked("cp -rl a b")).toBe(true);
+    expect(hardlinkBlocked("echo ok; ln a b")).toBe(true);
+    // wrapper / 间接执行形态
+    expect(hardlinkBlocked("env ln a b")).toBe(true);
+    expect(hardlinkBlocked("command ln a b")).toBe(true);
+    expect(hardlinkBlocked("busybox ln a b")).toBe(true);
+    expect(hardlinkBlocked("sudo ln a b")).toBe(true);
+    expect(hardlinkBlocked("bash -c 'ln a b'")).toBe(true);
+    expect(hardlinkBlocked("find . -exec ln a b \\;")).toBe(true);
+    expect(hardlinkBlocked("python3 -c 'os.link(\"a\", \"b\")'")).toBe(true);
+    expect(hardlinkBlocked("node -e 'require(\"fs\").linkSync(\"a\",\"b\")'")).toBe(true);
+    expect(hardlinkBlocked('l"n" a b')).toBe(true);
+    expect(hardlinkBlocked('/bin/l""n a b')).toBe(true);
+    expect(hardlinkBlocked("sudo -u root ln a b")).toBe(true);
+    expect(hardlinkBlocked("env PATH=/tmp ln a b")).toBe(true);
+    expect(hardlinkBlocked("xargs ln a b")).toBe(true);
+  });
+
+  it("allows symlinks, ordinary copies and read-only queries", () => {
+    expect(hardlinkBlocked("ln -s a b")).toBe(false);
+    expect(hardlinkBlocked("ln -sf a b")).toBe(false);
+    expect(hardlinkBlocked("bash -c 'ln -s a b'")).toBe(false);
+    expect(hardlinkBlocked("cp a b")).toBe(false);
+    expect(hardlinkBlocked("cp -r a b")).toBe(false);
+    expect(hardlinkBlocked("/bin/cp a b")).toBe(false);
+    expect(hardlinkBlocked("grep ln file.txt")).toBe(false);
+    expect(hardlinkBlocked("echo 'ln a b'")).toBe(false);
+    expect(hardlinkBlocked("printf 'link'")).toBe(false);
+    expect(hardlinkBlocked("which ln")).toBe(false);
+    expect(hardlinkBlocked("man ln")).toBe(false);
+    expect(hardlinkBlocked("command -v ln")).toBe(false);
+    // 参数里出现 link 不应误杀
+    expect(hardlinkBlocked("git checkout link")).toBe(false);
+    expect(hardlinkBlocked("npm run link")).toBe(false);
+    expect(hardlinkBlocked("rm link")).toBe(false);
+    expect(hardlinkBlocked("chmod +x link")).toBe(false);
+    expect(hardlinkBlocked("cp file link")).toBe(false);
+  });
+});
 
 describe("Sandbox PathGuard", () => {
   const workspace = "/tmp/sandbox-agent-ws";

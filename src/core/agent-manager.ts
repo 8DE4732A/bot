@@ -10,9 +10,13 @@ import type { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { DatabaseStore, type AgentDefinition } from "../config/database-store.ts";
 import { getBotPaths } from "../config/env-paths.ts";
+import { detectWorkspaceConflicts } from "../config/workspace-conflicts.ts";
 import { EventBus } from "./event-bus.ts";
 import { SandboxedExecutionEnv } from "../sandbox/execution-env.ts";
 import { SkillsCatalog } from "../skills/builtin/skills-catalog.ts";
+import { WorkspaceContext } from "../skills/builtin/workspace-context.ts";
+import { setAgentIdResolver } from "../skills/agent-scope.ts";
+import { purgeWorkspaceSkills } from "../skills/workspace.ts";
 import { SkillRegistry } from "../skills/registry.ts";
 import { logger } from "../utils/logger.ts";
 import { ModelFactory } from "./model-factory.ts";
@@ -119,6 +123,10 @@ export class AgentManager {
   private turnListeners = new Set<TurnListener>();
   /** 会话 usage 快照 (跨轮累计, /status 与订阅方读取) */
   private usageStats = new Map<string, SessionUsageStats>();
+  /** 删除/改配置时在飞 turn 尚未收尾的 Agent：turn 结束后再清该代际缓存 */
+  private pendingPurge = new Set<string>();
+  /** 历史 workspaceDir 冲突缓存（保存/删除 Agent 时失效，避免每轮 chat 全表重算） */
+  private workspaceConflicts?: Map<string, string>;
 
   constructor(store?: DatabaseStore) {
     this.store = store ?? new DatabaseStore();
@@ -169,6 +177,49 @@ this.models.clearProviders();
     return agentId;
   }
 
+  /**
+   * 删除 Agent / 配置变更时的进程内清理：
+   * 工作区技能注册表分区与扫描缓存立即清；会话缓存/映射若有在飞 turn，
+   * 延迟到 turn 收尾（避免工具调用归属解析断链或复用旧代际的 conversation）。
+   */
+  public purgeAgent(agentId: string): void {
+    purgeWorkspaceSkills(agentId);
+    this.workspaceConflicts = undefined;
+    this.pendingPurge.add(agentId);
+    if (!this.hasBusyTurn(agentId)) this.finishPendingPurge(agentId);
+  }
+
+  /** 历史 workspaceDir 冲突映射；保存/删除 Agent 经 purgeAgent 失效。 */
+  private getWorkspaceConflicts(): Map<string, string> {
+    if (!this.workspaceConflicts) {
+      this.workspaceConflicts = detectWorkspaceConflicts(this.store.listAgents());
+    }
+    return this.workspaceConflicts;
+  }
+
+  /** 是否有该 Agent 的在飞 turn（busyTurns 的 key 格式由 sessionKey 统一派生）。 */
+  private hasBusyTurn(agentId: string): boolean {
+    const prefix = `${agentId}:`;
+    for (const key of this.busyTurns.keys()) {
+      if (key.startsWith(prefix)) return true;
+    }
+    return false;
+  }
+
+  private finishPendingPurge(agentId: string): void {
+    const prefix = `${agentId}:`;
+    for (const key of [...this.conversations.keys()]) {
+      if (key.startsWith(prefix)) this.conversations.delete(key);
+    }
+    for (const [convId, owner] of [...this.conversationToAgent.entries()]) {
+      if (owner === agentId) this.conversationToAgent.delete(convId);
+    }
+    for (const key of [...this.usageStats.keys()]) {
+      if (key.startsWith(prefix)) this.usageStats.delete(key);
+    }
+    this.pendingPurge.delete(agentId);
+  }
+
   public async init(cwd: string = process.cwd()): Promise<void> {
     if (this.harness) return;
 
@@ -182,13 +233,18 @@ this.models.clearProviders();
 
     const registry = createRegistry();
     this.registry = registry;
+    // 五期: 会话 → Agent 归属解析（工作区技能/记忆注入用）；fail-closed
+    setAgentIdResolver((conversationId) =>
+      this.getAgentIdForConversation(conversationId),
+    );
     const allSkills = SkillRegistry.getInstance().listSkills();
     for (const skill of allSkills) {
       registry.install(skill.extension);
     }
-    // skills-catalog 不进 SkillRegistry (避免出现在选配列表), 但必须 install:
-    // 会话按名字解析扩展, 选配数组里的 SkillsCatalog 若无同名注册物会被丢弃
+    // skills-catalog / workspace-context 不进 SkillRegistry (避免出现在选配列表),
+    // 但必须 install: 会话按名字解析扩展, 选配数组里没有同名注册物会被丢弃
     registry.install(SkillsCatalog);
+    registry.install(WorkspaceContext);
 
     this.harness = await Harness.open(
       storage,
@@ -285,8 +341,27 @@ this.models.clearProviders();
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`Agent not found: ${agentId}`);
 
-    // skills-catalog 常驻: section 渲染该 Agent 选配的文档型技能目录 (只呈现已选条目)
-    const agentSkills = [...SkillRegistry.getInstance().resolveExtensions(agent.skills), SkillsCatalog];
+    // 历史重叠 workspaceDir 无法在 platformDenyRead 中互相隔离：fail-closed
+    const workspaceConflict = this.getWorkspaceConflicts().get(agentId);
+    if (workspaceConflict) {
+      throw new Error(
+        `Agent '${agentId}' workspace conflict: ${workspaceConflict}; fix workspaceDir before chatting`,
+      );
+    }
+
+    // 配置变更/删除的 pending purge 期间：不复用旧代际的 conversation 缓存，
+    // 让新请求按最新 Agent 配置重建（同会话仍由 sessionLock 串行）
+    if (cached && this.pendingPurge.has(agentId)) {
+      this.conversations.delete(cacheKey);
+      cached = undefined;
+    }
+
+    // skills-catalog / workspace-context 常驻: 前者渲染技能目录，后者注入工作区记忆
+    const agentSkills = [
+      ...SkillRegistry.getInstance().resolveExtensions(agent.skills),
+      SkillsCatalog,
+      WorkspaceContext,
+    ];
 
     if (!cached) {
       // Check if session mapping exists
@@ -491,6 +566,10 @@ this.models.clearProviders();
       throw err;
     } finally {
       this.busyTurns.delete(`${agentId}:${sessionId}`);
+      // 删除/改配置请求可能在 turn 在飞时到达；最后一个 turn 收尾后再清代际缓存
+      if (this.pendingPurge.has(agentId) && !this.hasBusyTurn(agentId)) {
+        this.finishPendingPurge(agentId);
+      }
     }
   }
 

@@ -1,15 +1,18 @@
 import type { Extension } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
-import type { DocumentSkill } from "./document-skills.ts";
-import type { AgentDefinition } from "../config/database-store.ts";
+import { parseSkillMdContent, type DocumentSkill } from "./document-skills.ts";
 import { logger } from "../utils/logger.ts";
 import { DatetimeTools } from "./builtin/datetime.ts";
 import { FrontendDesignTools } from "./builtin/frontend-design.ts";
 import { WebSearchTools } from "./builtin/web-search.ts";
+import { SKILL_CREATOR_MD } from "./builtin/skill-creator.ts";
 import { SchedulerTools } from "../scheduler/tools.ts";
 
 /** 三类统一技能: 工具型 Extension / 文档型 SKILL.md / MCP server 桥接 */
 export type SkillKind = "extension" | "skill" | "mcp";
+
+/** 平台技能 vs 某 Agent 的工作区私有技能 */
+export type SkillScope = "platform" | "workspace";
 
 export interface BotSkillMetadata {
   id: string;
@@ -22,11 +25,19 @@ export interface BotSkillMetadata {
   extension: Extension;
   /** kind === "skill" 时的解析结果 */
   document?: DocumentSkill;
+  /** 五期: 作用域与归属 */
+  scope?: SkillScope;
+  ownerAgentId?: string;
+  sourcePath?: string;
+  /** 内置文档技能恒生效（如 skill-creator），不依赖 agent.skills 勾选 */
+  autoEnabled?: boolean;
 }
 
 export class SkillRegistry {
   private static instance?: SkillRegistry;
   private skills = new Map<string, BotSkillMetadata>();
+  /** agentId -> skillId -> metadata（工作区私有技能） */
+  private workspaceSkills = new Map<string, Map<string, BotSkillMetadata>>();
 
   constructor() {
     this.registerBuiltins();
@@ -90,10 +101,33 @@ export class SkillRegistry {
       kind: "extension",
       extension: SchedulerTools,
     });
+
+    // 五期内置文档技能: 指导 Agent 在自身工作区按 Agent Skills 规范创建技能。
+    // 正文内嵌，不依赖编译后的磁盘文件；autoEnabled 使其无需勾选即出现在目录。
+    const creator = parseSkillMdContent("skill-creator", SKILL_CREATOR_MD, undefined, {
+      strict: true,
+      builtin: true,
+    });
+    if (creator.skill) {
+      this.register({
+        id: "skill-creator",
+        name: "技能创建指南 (Skill Creator)",
+        description: creator.skill.description,
+        category: "document",
+        builtin: true,
+        kind: "skill",
+        extension: { name: "skill-creator" },
+        document: creator.skill,
+        autoEnabled: true,
+      });
+    } else {
+      logger.warn("SkillRegistry", `Built-in skill-creator failed to parse: ${creator.errors.join("; ")}`);
+    }
   }
 
   public register(skill: BotSkillMetadata): void {
-    this.skills.set(skill.id, skill);
+    const normalized: BotSkillMetadata = { ...skill, scope: skill.scope ?? "platform" };
+    this.skills.set(skill.id, normalized);
     logger.debug("SkillRegistry", `Registered ${skill.kind} skill: ${skill.id} (${skill.name})`);
   }
 
@@ -108,6 +142,31 @@ export class SkillRegistry {
   /** 注销技能 (MCP server 禁用/删除时由 bridge 调用) */
   public removeSkill(id: string): boolean {
     return this.skills.delete(id);
+  }
+
+  // --- 工作区技能 (per-agent 私有) ---
+
+  public replaceWorkspaceSkills(agentId: string, skills: BotSkillMetadata[]): void {
+    const map = new Map<string, BotSkillMetadata>();
+    for (const skill of skills) {
+      map.set(skill.id, { ...skill, scope: "workspace", ownerAgentId: agentId });
+    }
+    this.workspaceSkills.set(agentId, map);
+  }
+
+  public getWorkspaceSkill(agentId: string, id: string): BotSkillMetadata | undefined {
+    return this.workspaceSkills.get(agentId)?.get(id);
+  }
+
+  public clearWorkspaceSkills(agentId: string): void {
+    this.workspaceSkills.delete(agentId);
+  }
+
+  /** 内置 autoEnabled 文档技能（目录恒可见） */
+  public listAutoEnabledDocumentSkills(): BotSkillMetadata[] {
+    return Array.from(this.skills.values()).filter(
+      (s) => s.autoEnabled && s.kind === "skill" && s.document,
+    );
   }
 
   public resolveExtensions(enabledSkillIds: string[]): Extension[] {

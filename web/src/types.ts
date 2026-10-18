@@ -41,6 +41,8 @@ export interface Agent {
   };
   instructions: string;
   workspaceDir: string;
+  /** 历史数据中与其他 Agent 的工作区重叠时的诊断（只读） */
+  workspaceConflict?: string;
   sandbox: SandboxConfig;
   skills: string[];
   createdAt: number;
@@ -77,6 +79,11 @@ export interface Skill {
   category: "coding" | "search" | "utility" | "design" | "custom" | "document" | "mcp";
   builtin: boolean;
   kind: SkillKind;
+  /** platform | workspace（五期） */
+  scope?: "platform" | "workspace";
+  ownerAgentId?: string;
+  /** 内置常驻文档技能（如 skill-creator），不参与勾选 */
+  autoEnabled?: boolean;
   /** kind === "mcp" 时桥接的工具数 */
   toolCount?: number;
   /** kind === "skill" 时后端附加的文档技能信息 */
@@ -84,6 +91,47 @@ export interface Skill {
   bodyPreview?: string;
   warnings?: string[];
   disableModelInvocation?: boolean;
+  spec?: {
+    license?: string;
+    compatibility?: string;
+    metadata?: Record<string, string>;
+    allowedTools?: string;
+  };
+}
+
+export interface WorkspaceSkill {
+  id: string;
+  name: string;
+  description: string;
+  path?: string;
+  warnings: string[];
+  spec?: {
+    license?: string;
+    compatibility?: string;
+    metadata?: Record<string, string>;
+    allowedTools?: string;
+  };
+}
+
+export interface WorkspaceSkillDiagnostic {
+  skill?: string;
+  path: string;
+  reason: string;
+}
+
+export interface WorkspaceSkillSnapshot {
+  agentId: string;
+  enabled: boolean;
+  roots: string[];
+  skills: WorkspaceSkill[];
+  diagnostics: WorkspaceSkillDiagnostic[];
+  memory: {
+    path: string;
+    bytes: number;
+    truncated: boolean;
+    mtimeMs: number;
+  } | null;
+  scannedAt: number;
 }
 
 export type McpTransport = "stdio" | "http";

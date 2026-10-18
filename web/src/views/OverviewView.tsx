@@ -184,7 +184,7 @@ export function OverviewView({ onNavigate }: { onNavigate: (v: string) => void }
       <div className="section-title">技能库 · {skills.length} 项</div>
       <div className="grid">
         {skills.map((s) => {
-          const users = agents.filter((a) => a.skills.includes(s.id));
+          const users = s.autoEnabled ? agents : agents.filter((a) => a.skills.includes(s.id));
           return (
             <div key={s.id} className="card">
               <div className="card__head">
@@ -193,7 +193,9 @@ export function OverviewView({ onNavigate }: { onNavigate: (v: string) => void }
                     {s.name}
                     <span className="mono mono--plain">{s.id}</span>
                   </div>
-                  <div className="card__sub">{s.builtin ? "内置技能" : "本地扩展"}</div>
+                  <div className="card__sub">
+                    {s.autoEnabled ? "内置常驻 · 所有 Agent 自动启用" : s.builtin ? "内置技能" : "本地扩展"}
+                  </div>
                 </div>
                 <KindBadge kind={s.kind} />
               </div>

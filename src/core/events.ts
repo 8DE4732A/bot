@@ -20,7 +20,16 @@ export type PlatformEvent =
   | ChannelStatusEvent
   | ChannelHealthEvent
   | TaskUpdatedEvent
-  | AuditRecordedEvent;
+  | AuditRecordedEvent
+  | WorkspaceChangedEvent;
+
+/** 工作区技能/记忆发生变化 (五期; 管理台静默刷新用) */
+export interface WorkspaceChangedEvent {
+  type: "workspace.skills.changed" | "workspace.memory.changed";
+  agentId: string;
+  /** 技能 id 列表 (skills.changed) 或记忆文件路径 (memory.changed) */
+  detail: string[];
+}
 
 /** 一轮对话的生命周期 (管理台事件流 / SessionHub 会话订阅的粒度锚点) */
 export interface ChatTurnEvent {
