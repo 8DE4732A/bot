@@ -18,9 +18,19 @@ const PLATFORMS = [
 
 const root = process.cwd();
 const all = process.argv.includes("--all");
-// 版本单一真相源 = git tag (CI 从 GITHUB_REF_NAME 剥 v 前缀传入); 本地
-// 无 tag 时 "dev"。经 --define 注入二进制 (bot --version / identify 可见)
-const version = process.env.VERSION || "dev";
+
+/** HEAD 恰好落在 tag 上时返回 tag 版本（去掉 v 前缀）；否则 undefined。 */
+function gitTagVersion(): string | undefined {
+  const proc = Bun.spawnSync(["git", "describe", "--tags", "--exact-match", "HEAD"], { cwd: root });
+  if (proc.exitCode !== 0) return undefined;
+  const tag = proc.stdout.toString().trim();
+  return tag.startsWith("v") ? tag.slice(1) : tag;
+}
+
+// 版本单一真相源 = git tag。CI 显式传 VERSION；本地在 tag 提交上直接构建
+// 也会自动取 tag（无 tag 时 "dev"）。经 --define 注入二进制
+// (bot --version / gateway identify 可见)
+const version = process.env.VERSION || gitTagVersion() || "dev";
 
 async function sh(cmd: string[], label: string): Promise<void> {
   console.log(`▶ ${label}`);

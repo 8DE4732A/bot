@@ -120,11 +120,11 @@ export const SkillsCatalog = defineExtension({
         const skill = workspaceSkill ?? platformSkill;
 
         if (!skill || !skill.document) {
-          return { content: [{ type: "text", text: `Unknown skill: ${args.id}` }], isError: true };
+          return { output: [{ type: "text", text: `Unknown skill: ${args.id}` }], isError: true };
         }
         // disable-model-invocation: 模型不可自主调用 (即使已选配)，仅供宿主触发
         if (skill.document.disableModelInvocation) {
-          return { content: [{ type: "text", text: `Skill '${args.id}' is not model-invocable` }], isError: true };
+          return { output: [{ type: "text", text: `Skill '${args.id}' is not model-invocable` }], isError: true };
         }
 
         // autoEnabled 内置文档技能也必须绑定有效 Agent、总开关与执行环境
@@ -133,7 +133,7 @@ export const SkillsCatalog = defineExtension({
           (!agentId || !workspaceSkillsEnabled() || !(api as any).env)
         ) {
           return {
-            content: [{ type: "text", text: `Skill '${args.id}' is not available in this context` }],
+            output: [{ type: "text", text: `Skill '${args.id}' is not available in this context` }],
             isError: true,
           };
         }
@@ -147,13 +147,13 @@ export const SkillsCatalog = defineExtension({
           } catch (err) {
             logger.warn("SkillsCatalog", `Failed to resolve calling agent: ${err}`);
             return {
-              content: [{ type: "text", text: `Unable to resolve calling agent; skill read refused` }],
+              output: [{ type: "text", text: `Unable to resolve calling agent; skill read refused` }],
               isError: true,
             };
           }
           if (!selected.has(args.id)) {
             return {
-              content: [{ type: "text", text: `Skill '${args.id}' is not enabled for this agent` }],
+              output: [{ type: "text", text: `Skill '${args.id}' is not enabled for this agent` }],
               isError: true,
             };
           }
@@ -162,7 +162,7 @@ export const SkillsCatalog = defineExtension({
         // 1. 内置文档技能：正文在内存中
         if (skill.document.builtin) {
           return {
-            content: [
+            output: [
               {
                 type: "text",
                 text: formatSkillContent(skill, skill.document.body, undefined, []),
@@ -174,12 +174,12 @@ export const SkillsCatalog = defineExtension({
         // 2. 工作区技能：走受保护读取（每次重新校验，不使用缓存路径）
         if (workspaceSkill) {
           if (!agentId || !skill.document.location) {
-            return { content: [{ type: "text", text: `Skill '${args.id}' has no readable location` }], isError: true };
+            return { output: [{ type: "text", text: `Skill '${args.id}' has no readable location` }], isError: true };
           }
           // 设计契约: 工作区读取必须依附执行环境；无 env 一律 fail-closed
           if (!(api as any).env) {
             return {
-              content: [{ type: "text", text: `Failed to read skill: execution environment unavailable` }],
+              output: [{ type: "text", text: `Failed to read skill: execution environment unavailable` }],
               isError: true,
             };
           }
@@ -188,7 +188,7 @@ export const SkillsCatalog = defineExtension({
             // 工作区资源不做目录枚举：readdir 仍存在祖先 symlink 竞态，
             // 模型可按 SKILL.md 里的相对路径用 read/bash 自行读取
             return {
-              content: [
+              output: [
                 {
                   type: "text",
                   text: formatSkillContent(skill, read.text, read.realPath, []),
@@ -198,7 +198,7 @@ export const SkillsCatalog = defineExtension({
           } catch (err) {
             logger.warn("SkillsCatalog", `workspace skill read failed for '${args.id}': ${err}`);
             return {
-              content: [{ type: "text", text: `Failed to read skill: read_error` }],
+              output: [{ type: "text", text: `Failed to read skill: read_error` }],
               isError: true,
             };
           }
@@ -211,7 +211,7 @@ export const SkillsCatalog = defineExtension({
           const env = (api as any).env;
           if (!env?.readTextFile || !context) {
             return {
-              content: [{ type: "text", text: `Failed to read skill: execution environment unavailable` }],
+              output: [{ type: "text", text: `Failed to read skill: execution environment unavailable` }],
               isError: true,
             };
           }
@@ -220,19 +220,19 @@ export const SkillsCatalog = defineExtension({
             if (res && res.ok) {
               content = res.value as string;
             } else {
-              return { content: [{ type: "text", text: `Failed to read skill: permission_denied` }], isError: true };
+              return { output: [{ type: "text", text: `Failed to read skill: permission_denied` }], isError: true };
             }
           } catch (err) {
             logger.warn("SkillsCatalog", `env read failed for skill '${args.id}': ${err}`);
-            return { content: [{ type: "text", text: `Failed to read skill: read_error` }], isError: true };
+            return { output: [{ type: "text", text: `Failed to read skill: read_error` }], isError: true };
           }
         }
         if (content === undefined) {
-          return { content: [{ type: "text", text: `Skill '${args.id}' has no readable location` }], isError: true };
+          return { output: [{ type: "text", text: `Skill '${args.id}' has no readable location` }], isError: true };
         }
         const resources = location ? listPlatformResources(dirname(location)) : [];
         return {
-          content: [{ type: "text", text: formatSkillContent(skill, content, location, resources) }],
+          output: [{ type: "text", text: formatSkillContent(skill, content, location, resources) }],
         };
       },
     }),

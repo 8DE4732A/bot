@@ -8,7 +8,7 @@ const getCurrentTimeTool = defineTool({
   async execute() {
     const now = new Date();
     return {
-      content: [
+      output: [
         {
           type: "text",
           text: JSON.stringify({

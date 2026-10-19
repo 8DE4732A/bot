@@ -136,7 +136,7 @@ describe("scheduler: 工具归属 (fail-closed)", () => {
     });
     const listTool = SchedulerTools.tools!.find((t) => t.name === "schedule_list")!;
     const result: any = await listTool.execute({}, { conversationId: "777001" } as any, undefined as any);
-    const payload = JSON.parse(result.content[0].text);
+    const payload = JSON.parse(result.output[0].text);
     expect(Array.isArray(payload.tasks)).toBe(true);
   });
 
@@ -156,7 +156,7 @@ describe("scheduler: 工具归属 (fail-closed)", () => {
       { conversationId: "777001" } as any,
       undefined as any,
     );
-    expect(JSON.parse(result.content[0].text).error).toContain("intervalSeconds");
+    expect(JSON.parse(result.output[0].text).error).toContain("intervalSeconds");
   });
 });
 

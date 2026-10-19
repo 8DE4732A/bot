@@ -161,9 +161,9 @@ describe("二期: 文档型技能 (SKILL.md)", () => {
     const api = { agent: async () => ({ extensions: [{ name: "some-other-skill" }] }) };
     const result: any = await readSkill.execute({ id: "sec-doc" }, api as any, {} as any);
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("not enabled");
+    expect(result.output[0].text).toContain("not enabled");
     // 未选配时绝不读文件
-    expect(result.content[0].text).not.toContain("SECRET");
+    expect(result.output[0].text).not.toContain("SECRET");
     registry.removeSkill("sec-doc");
   });
 
@@ -182,8 +182,8 @@ describe("二期: 文档型技能 (SKILL.md)", () => {
     };
     const result: any = await readSkill.execute({ id: "fail-closed-doc" }, selectedApi as any, {} as any);
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("permission_denied");
-    expect(result.content[0].text).not.toContain("DENIED SECRET");
+    expect(result.output[0].text).toContain("permission_denied");
+    expect(result.output[0].text).not.toContain("DENIED SECRET");
     registry.removeSkill("fail-closed-doc");
   });
 
@@ -307,11 +307,11 @@ describe("二期: MCP 桥接", () => {
 
     const echoTool = extension.tools!.find((t) => t.name === "mcp__echo-mem__echo")!;
     const result: any = await echoTool.execute({ text: "hello" }, {} as any, undefined as any);
-    expect(result.content[0].text).toBe('echo: "hello"');
+    expect(result.output[0].text).toBe('echo: "hello"');
 
     const boomTool = extension.tools!.find((t) => t.name === "mcp__echo-mem__boom")!;
     const boomResult: any = await boomTool.execute({}, {} as any, undefined as any);
-    expect(boomResult.content[0].text).toContain("[mcp tool reported an error]");
+    expect(boomResult.output[0].text).toContain("[mcp tool reported an error]");
     expect(boomResult.isError).toBe(true);
     await client.close();
   });

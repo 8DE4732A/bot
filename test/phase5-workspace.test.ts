@@ -243,7 +243,7 @@ describe("五期: 技能目录与 read_skill", () => {
       {} as any,
     );
     expect(res.isError).toBeFalsy();
-    const text = res.content[0].text as string;
+    const text = res.output[0].text as string;
     expect(text).toContain("# Reader");
     expect(text).toContain("scripts/run.sh");
     expect(text).not.toContain("<skill_resources>");
@@ -264,7 +264,7 @@ describe("五期: 技能目录与 read_skill", () => {
       {} as any,
     );
     expect(res.isError).toBeFalsy();
-    expect(res.content[0].text).toContain("Skill Creator");
+    expect(res.output[0].text).toContain("Skill Creator");
   });
 
   test("总开关关闭时 skill-creator 也不可读", async () => {
@@ -336,7 +336,7 @@ describe("五期: 技能目录与 read_skill", () => {
       { conversationId: `conv-${a.id}`, agent: async () => ({ extensions: [] }), env: {} } as any,
       {} as any,
     );
-    const text = res.content[0].text as string;
+    const text = res.output[0].text as string;
     expect(text).toContain("# Steps");
     expect(text).not.toContain("<skill_resources>");
     expect(text).not.toContain("leak.sh");

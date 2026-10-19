@@ -88,9 +88,9 @@ pi-durable **没有专门的 skill 概念**——它的原语是 Extension（工
 
 ### 2.6 实验性框架的使用姿势
 
-pi-durable 处于 1.0.x 早期，API 仍在动（`ToolSlot.name` 曾被删除又恢复）。本项目的策略：
+pi-durable 已进入 1.3.x（1.2.0 有工具结果与存储错误语义的破坏性变更）。本项目的策略：
 
-1. **纯 npm 依赖**：npm `^1.0.2`，`bun install` 后完全独立（构建/测试/typecheck 均不需要本地 `../pi`）。**关键事实**：Bun 运行时恒解析 node_modules 的 dist，tsconfig paths 对运行时无效（仅 tsc 遵循）——若保留 paths 会出现"类型超前于运行时"的漂移（typecheck 绿但 dist 里没有该 API），因此 tsconfig 已移除框架 paths 映射，typecheck 与运行时同源；npm 1.0.2 缺失的少数 API（watch 等）以兼容调用 + fail-closed fallback 标注（`execution-env.ts`）。升级 = 等 npm 发版后提升版本号。`../pi` 仅作源码阅读参考。
+1. **纯 npm 依赖**：npm 精确 `1.3.0`，`bun install` 后完全独立（构建/测试/typecheck 均不需要本地 `../pi`）。**关键事实**：Bun 运行时恒解析 node_modules 的 dist，tsconfig paths 对运行时无效（仅 tsc 遵循）——若保留 paths 会出现"类型超前于运行时"的漂移（typecheck 绿但 dist 里没有该 API），因此 tsconfig 已移除框架 paths 映射，typecheck 与运行时同源；1.0.3 起 `watch`/`openBinaryReader`/`openDirReader` 均为基类正式 API，`execution-env.ts` 直接类型化 override 并前置 PathGuard。工具返回值使用 `output`（1.2.0 起，`content` 已移除）。升级 = 提升三个包的精确版本并重跑 typecheck/tests。`../pi` 仅作源码阅读参考。
 2. **只用公开导出**：`Harness`/`watchEvents`/`AssistantEntry`/`defineTool` 均从主入口 import；凡是需要 `as any` 读框架内部的地方都是升级雷区，一律换成类型化 API 或封装适配层。
 3. **对框架行为做实证**：不信任文档记忆，关键契约（undefined 语义、env 重建时机、configure 提交成本、close 链）都在框架源码中核实过（见 `../pi/packages/durable/src/`），部分写入了 `test/` 固化。
 

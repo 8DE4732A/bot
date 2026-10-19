@@ -3,22 +3,18 @@ import { join, resolve } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { err, ExecutionError, FileError } from "@earendil-works/pi-durable/env";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
-// 注意: BinaryReader/DirReader/WatchChange/WatchTarget 在 npm 1.0.2 的类型面
-// 尚未导出 (本地 ../pi 源码才有)——这里只用 1.0.2 的导出, 差异点用最小结构 +
-// @ts-ignore 标注, 保证有无本地 pi 两种模式 typecheck 均通过
 import type {
+  BinaryReader,
+  DirReader,
   FileInfo,
+  FileWatcher,
   Result,
   ShellExecOptions,
   ShellExecResult,
   TextLineReader,
+  WatchChange,
+  WatchTarget,
 } from "@earendil-works/pi-durable/env";
-
-/** 1.0.2 兼容的最小 watch 目标结构 (框架完整定义见本地 pi 源码 WatchTarget) */
-interface WatchTargetLike {
-  path: string;
-  [key: string]: unknown;
-}
 import type { BotSandboxConfig } from "../config/database-store.ts";
 import { DatabaseStore } from "../config/database-store.ts";
 import { buildChildProcessEnv } from "../config/sandbox-defaults.ts";
@@ -305,9 +301,7 @@ export class SandboxedExecutionEnv extends NodeExecutionEnv {
   ): Promise<Result<R, FileError>> {
     const check = this.pathGuard.checkCanRead(path);
     if (check.allowed) {
-      const result = await go(check.realPath ?? path);
-      // 兼容调用 (npm 1.0.2 基类缺方法) 返回 undefined 时保持 Result 契约
-      return result ?? err(new FileError("not_supported", "operation not supported by this execution env", path));
+      return go(check.realPath ?? path);
     }
     this.auditBlocked("read", path, check.reason!);
     return err(new FileError("permission_denied", check.reason!, path));
@@ -319,8 +313,7 @@ export class SandboxedExecutionEnv extends NodeExecutionEnv {
   ): Promise<Result<R, FileError>> {
     const check = this.pathGuard.checkCanWrite(path);
     if (check.allowed) {
-      const result = await go(check.realPath ?? path);
-      return result ?? err(new FileError("not_supported", "operation not supported by this execution env", path));
+      return go(check.realPath ?? path);
     }
     this.auditBlocked("write", path, check.reason!);
     return err(new FileError("permission_denied", check.reason!, path));
@@ -421,15 +414,12 @@ export class SandboxedExecutionEnv extends NodeExecutionEnv {
     return this.guardRead(path, (rp) => super.openTextLineReader(rp, context));
   }
 
-  // @ts-ignore 1.0.2 基类暂无 openBinaryReader (本地源码模式有); 守卫必须前置
-  public async openBinaryReader(
+  public override async openBinaryReader(
     path: string,
     options: { noFollow?: boolean } | undefined,
     context: Context,
-  ): Promise<Result<any, FileError>> {
-    return this.guardRead(path, (rp) =>
-      (NodeExecutionEnv.prototype as any).openBinaryReader?.call(this, rp, options, context),
-    );
+  ): Promise<Result<BinaryReader, FileError>> {
+    return this.guardRead(path, (rp) => super.openBinaryReader(rp, options, context));
   }
 
   public override async fileInfo(path: string, context: Context): Promise<Result<FileInfo, FileError>> {
@@ -440,13 +430,11 @@ export class SandboxedExecutionEnv extends NodeExecutionEnv {
     return this.guardRead(path, (rp) => super.listDir(rp, context));
   }
 
-  // @ts-ignore 同 openBinaryReader
-  public async openDirReader(
+  public override async openDirReader(
     path: string,
     context: Context,
-  ): Promise<Result<any, FileError>> {
-    return this.guardRead(path, (rp) =>
-      (NodeExecutionEnv.prototype as any).openDirReader?.call(this, rp, context));
+  ): Promise<Result<DirReader, FileError>> {
+    return this.guardRead(path, (rp) => super.openDirReader(rp, context));
   }
 
   public override async canonicalPath(path: string, context: Context): Promise<Result<string, FileError>> {
@@ -457,13 +445,12 @@ export class SandboxedExecutionEnv extends NodeExecutionEnv {
     return this.guardRead(path, (rp) => super.exists(rp, context));
   }
 
-  // @ts-ignore 1.0.2 基类暂无 watch (本地源码模式有)
-  public async watch(
-    targets: readonly WatchTargetLike[],
-    onChange: (change: any) => void,
+  public override async watch(
+    targets: readonly WatchTarget[],
+    onChange: (change: WatchChange) => void,
     context: Context,
-  ): Promise<Result<any, FileError>> {
-    const resolved: WatchTargetLike[] = [];
+  ): Promise<Result<FileWatcher, FileError>> {
+    const resolved: WatchTarget[] = [];
     for (const target of targets) {
       const check = this.pathGuard.checkCanRead(target.path);
       if (!check.allowed) {
@@ -473,8 +460,7 @@ export class SandboxedExecutionEnv extends NodeExecutionEnv {
       // 监控目标以校验时刻的真实路径注册 (与读/写同语义)
       resolved.push({ ...target, path: check.realPath ?? target.path });
     }
-    return (NodeExecutionEnv.prototype as any).watch?.call(this, resolved, onChange, context) ??
-      err(new FileError("unknown", "watch is not supported by this execution env", resolved[0]?.path));
+    return super.watch(resolved, onChange, context);
   }
 
   // --- Write-class interception ---

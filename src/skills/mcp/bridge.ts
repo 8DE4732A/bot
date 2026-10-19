@@ -274,7 +274,7 @@ export class McpBridge {
                   { server: server.id, tool: t.name, argsSummary, durationMs: Date.now() - started, serverError: (result as any).isError === true },
                 );
                 return {
-                  content: [{ type: "text", text: formatCallResult(result as Record<string, unknown>) }],
+                  output: [{ type: "text", text: formatCallResult(result as Record<string, unknown>) }],
                   isError: (result as any).isError === true,
                 };
               } catch (err) {
@@ -282,7 +282,7 @@ export class McpBridge {
                   "mcp.call_tool",
                   { server: server.id, tool: t.name, argsSummary, durationMs: Date.now() - started, error: String(err) },
                 );
-                return { content: [{ type: "text", text: `MCP tool failed: ${err instanceof Error ? err.message : err}` }], isError: true };
+                return { output: [{ type: "text", text: `MCP tool failed: ${err instanceof Error ? err.message : err}` }], isError: true };
               }
             },
           }),

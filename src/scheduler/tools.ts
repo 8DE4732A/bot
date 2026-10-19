@@ -110,7 +110,7 @@ function taskSummary(t: ScheduledTaskDefinition) {
   };
 }
 
-const text = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] });
+const text = (value: unknown) => ({ output: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] });
 
 const createTaskTool = defineTool({
   name: "schedule_create",

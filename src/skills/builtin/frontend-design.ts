@@ -31,7 +31,7 @@ const getDesignSystemGuidelinesTool = defineTool({
     };
 
     return {
-      content: [
+      output: [
         {
           type: "text",
           text: JSON.stringify(guidelines, null, 2),

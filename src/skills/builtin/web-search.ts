@@ -41,7 +41,7 @@ const fetchUrlTool = defineTool({
       const truncated = text.length > limit ? text.slice(0, limit) + "\n...[truncated]" : text;
 
       return {
-        content: [
+        output: [
           {
             type: "text",
             text: truncated,
@@ -83,7 +83,7 @@ const searchWebTool = defineTool({
         .join("\n\n");
 
       return {
-        content: [
+        output: [
           {
             type: "text",
             text: result || `No immediate summary found for query: ${args.query}`,

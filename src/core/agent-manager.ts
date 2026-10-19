@@ -127,6 +127,13 @@ export class AgentManager {
   private pendingPurge = new Set<string>();
   /** 历史 workspaceDir 冲突缓存（保存/删除 Agent 时失效，避免每轮 chat 全表重算） */
   private workspaceConflicts?: Map<string, string>;
+  /** init() 已完成；会话库故障后允许懒重建 harness */
+  private initialized = false;
+  /** 首次 init 的 cwd：故障重建仍指向同一 .bot */
+  private cwd = process.cwd();
+  private recovery?: Promise<void>;
+  /** 持久故障的重试冷却，避免每条消息/队列轮询都同步重建 */
+  private recoveryRetryAt = 0;
 
   constructor(store?: DatabaseStore) {
     this.store = store ?? new DatabaseStore();
@@ -222,68 +229,148 @@ this.models.clearProviders();
 
   public async init(cwd: string = process.cwd()): Promise<void> {
     if (this.harness) return;
+    this.cwd = cwd;
 
     const paths = getBotPaths(cwd);
     logger.info("AgentManager", `Initializing Agent Harness with conversations DB at ${paths.conversationsDbFile}`);
 
-    // 会话状态机独立分库: 与业务库 (bot.sqlite) 物理隔离, 由 pi-durable 全权管理
-    const storage = await openNodeSqliteStorage(paths.conversationsDbFile);
-    this.storage = storage;
-    this.models = ModelFactory.createConfiguredModels();
-
-    const registry = createRegistry();
-    this.registry = registry;
-    // 五期: 会话 → Agent 归属解析（工作区技能/记忆注入用）；fail-closed
-    setAgentIdResolver((conversationId) =>
-      this.getAgentIdForConversation(conversationId),
-    );
-    const allSkills = SkillRegistry.getInstance().listSkills();
-    for (const skill of allSkills) {
-      registry.install(skill.extension);
+    // models/registry 与 Harness 生命周期无关：Session 故障重建时复用，
+    // 不重新创建 provider 实例、也不重装全部技能扩展。
+    this.models ??= ModelFactory.createConfiguredModels();
+    if (!this.registry) {
+      const registry = createRegistry();
+      this.registry = registry;
+      // 五期: 会话 → Agent 归属解析（工作区技能/记忆注入用）；fail-closed
+      setAgentIdResolver((conversationId) =>
+        this.getAgentIdForConversation(conversationId),
+      );
+      for (const skill of SkillRegistry.getInstance().listSkills()) {
+        registry.install(skill.extension);
+      }
+      // skills-catalog / workspace-context 不进 SkillRegistry (避免出现在选配列表),
+      // 但必须 install: 会话按名字解析扩展, 选配数组里没有同名注册物会被丢弃
+      registry.install(SkillsCatalog);
+      registry.install(WorkspaceContext);
     }
-    // skills-catalog / workspace-context 不进 SkillRegistry (避免出现在选配列表),
-    // 但必须 install: 会话按名字解析扩展, 选配数组里没有同名注册物会被丢弃
-    registry.install(SkillsCatalog);
-    registry.install(WorkspaceContext);
 
-    this.harness = await Harness.open(
-      storage,
-      {
-        models: this.models,
-        registry,
-        env: (target) => {
-          const convId = String(target.conversationId);
-          let agentId = this.conversationToAgent.get(convId);
-          if (!agentId) {
-            // 内存映射缺失 (进程重启后 resume / 后台任务): 从持久化会话映射反查
-            agentId = this.store.getAgentIdByConversation(convId);
-            if (agentId) this.conversationToAgent.set(convId, agentId);
-          }
-          if (!agentId) {
-            // fail-closed: 归属不明的会话拒绝提供执行环境, 绝不回退到默认 Agent 的沙盒
-            throw new Error(`No agent mapping for conversation ${convId}; refusing to provide execution env`);
-          }
-          const agent = this.store.getAgent(agentId);
-          if (!agent) throw new Error(`Agent not found: ${agentId}`);
-          const workspace = target.cwd ?? agent.workspaceDir;
-
-          return new SandboxedExecutionEnv({
-            cwd: workspace,
-            agentId: agent.id,
-            sandboxConfig: agent.sandbox,
-          });
-        },
-      },
-      BACKGROUND_CONTEXT,
-    );
-
-    this.harness.resume();
+    await this.openHarness();
+    this.initialized = true;
     logger.info("AgentManager", "Agent Harness successfully initialized and resumed");
+  }
+
+  /** 打开 conversations 存储与 Harness（首次启动与会话故障重建共用）。 */
+  private async openHarness(): Promise<void> {
+    if (!this.models || !this.registry) {
+      throw new Error("AgentManager bootstrap is incomplete");
+    }
+    const storage = await openNodeSqliteStorage(getBotPaths(this.cwd).conversationsDbFile);
+    let harness: HarnessType;
+    try {
+      harness = await Harness.open(
+        storage,
+        {
+          models: this.models,
+          registry: this.registry,
+          env: (target) => {
+            const convId = String(target.conversationId);
+            let agentId = this.conversationToAgent.get(convId);
+            if (!agentId) {
+              // 内存映射缺失 (进程重启后 resume / 后台任务): 从持久化会话映射反查
+              agentId = this.store.getAgentIdByConversation(convId);
+              if (agentId) this.conversationToAgent.set(convId, agentId);
+            }
+            if (!agentId) {
+              // fail-closed: 归属不明的会话拒绝提供执行环境, 绝不回退到默认 Agent 的沙盒
+              throw new Error(`No agent mapping for conversation ${convId}; refusing to provide execution env`);
+            }
+            const agent = this.store.getAgent(agentId);
+            if (!agent) throw new Error(`Agent not found: ${agentId}`);
+            const workspace = target.cwd ?? agent.workspaceDir;
+
+            return new SandboxedExecutionEnv({
+              cwd: workspace,
+              agentId: agent.id,
+              sandboxConfig: agent.sandbox,
+            });
+          },
+        },
+        BACKGROUND_CONTEXT,
+      );
+    } catch (err) {
+      await storage.close(BACKGROUND_CONTEXT).catch(() => {});
+      throw err;
+    }
+    // 先挂监听再 resume：open/resume 期间失败同样能被观察到
+    this.watchSessionFailure(harness);
+    try {
+      harness.resume();
+    } catch (err) {
+      await storage.close(BACKGROUND_CONTEXT).catch(() => {});
+      throw err;
+    }
+    this.storage = storage;
+    this.harness = harness;
+  }
+
+  /**
+   * conversations.sqlite 的存储错误会让整个 Session 自关 (1.2.0 语义)；
+   * 记录故障并清会话缓存，下一次请求经 ensureHarness() 懒重建。
+   */
+  private watchSessionFailure(harness: HarnessType): void {
+    void harness.closed.then((end) => {
+      // 旧 harness 的 closed 可能在重建后才 settle；不能让它标记新会话失败
+      if (this.harness === harness && end.reason === "failed") {
+        this.handleSessionFailure(end.error);
+      }
+    });
+  }
+
+  private handleSessionFailure(err: unknown): void {
+    if (!this.harness) return;
+    logger.error(
+      "AgentManager",
+      `Conversation session failed; harness will be reopened on next request: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    // Conversation 句柄绑定在已失败的 Session 上，不能继续复用；
+    // conversationToAgent 来自业务库，跨 Session 重建仍然有效。
+    this.harness = undefined;
+    this.conversations.clear();
+  }
+
+  /** harness 可用则直接返回；会话库故障/已关闭时串行重建一次。 */
+  private async ensureHarness(): Promise<void> {
+    if (!this.initialized) throw new Error("AgentManager is not initialized");
+    if (this.harness) return;
+    if (this.recovery) return this.recovery;
+    if (Date.now() < this.recoveryRetryAt) {
+      throw new Error("Conversation storage is unavailable; retry shortly");
+    }
+    this.recovery = (async () => {
+      const oldStorage = this.storage;
+      this.storage = undefined;
+      await oldStorage?.close(BACKGROUND_CONTEXT);
+      await this.openHarness();
+      this.recoveryRetryAt = 0;
+    })()
+      .catch((err) => {
+        this.recoveryRetryAt = Date.now() + 5000;
+        throw err;
+      })
+      .finally(() => {
+        this.recovery = undefined;
+      });
+    return this.recovery;
   }
 
   /** 进程退出前收尾: 先 join 运行中的 Harness 任务再 checkpoint 会话库 (WAL 收敛)。 */
   public async shutdown(): Promise<void> {
+    // 先关闸：shutdown 期间的新请求不再触发重建
+    this.initialized = false;
     try {
+      // 重建可能正在进行：等它落地后再关闭，避免关闭后又被重新打开
+      if (this.recovery) await this.recovery.catch(() => {});
       if (this.harness) {
         await this.harness.close(BACKGROUND_CONTEXT);
         logger.info("AgentManager", "Harness closed (tasks joined)");
@@ -333,7 +420,12 @@ this.models.clearProviders();
     agentId: string,
     sessionId: string,
   ): Promise<Conversation> {
-    if (!this.harness) throw new Error("AgentManager is not initialized");
+    let harness = this.harness;
+    if (!harness) {
+      await this.ensureHarness();
+      harness = this.harness;
+    }
+    if (!harness) throw new Error("AgentManager is not initialized");
 
     const cacheKey = sessionKey(agentId, sessionId);
     let cached = this.conversations.get(cacheKey);
@@ -371,7 +463,7 @@ this.models.clearProviders();
         // 框架契约: conversation 对不存在的记录返回 undefined (而非抛错)。
         // undefined → 映射失效 (如会话库被重置), 新建会话并覆盖映射, 可自愈;
         // 抛错则是瞬时/底层存储错误, 不能静默新建覆盖用户历史, 直接上抛。
-        const existing = await this.harness.conversation(
+        const existing = await harness.conversation(
           Number(sessionRecord.conversationId) as ConversationId,
           BACKGROUND_CONTEXT,
         );
