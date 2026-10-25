@@ -6,6 +6,7 @@ import type { ScheduleType, ScheduledTaskDefinition } from "../config/database-s
 import { DatabaseStore } from "../config/database-store.ts";
 import { AgentManager } from "../core/agent-manager.ts";
 import { MIN_INTERVAL_SECONDS, computeNextRunAt, validateCronExpr } from "./schedule.ts";
+import { SchedulerRuntime } from "./durable-runtime.ts";
 
 /**
  * 系统级定时任务工具组 (呈现为技能 scheduler, 无需外部 MCP server):
@@ -107,6 +108,12 @@ function taskSummary(t: ScheduledTaskDefinition) {
       enabled: t.notifyEnabled,
       target: t.notifyChannelInstanceId ? `${t.notifyChannelInstanceId}:${t.notifyPeerId}` : null,
     },
+    durable: {
+      taskId: t.durableTaskId ?? null,
+      state: t.conversationPoisoned ? "poisoned" : t.durableState,
+      scheduleVersion: t.scheduleVersion,
+      conversationId: t.conversationId ?? null,
+    },
   };
 }
 
@@ -136,7 +143,7 @@ const createTaskTool = defineTool({
     const now = Date.now();
     // 通知目标 = 创建任务的会话所在渠道 (渠道层寻址, 会话重置不影响投递)
     const originSession = store.getSessionByConversation(String(api.conversationId));
-    const task: ScheduledTaskDefinition = {
+    let task: ScheduledTaskDefinition = {
       id: `task-${now.toString(36)}-${randomBytes(3).toString("hex")}`,
       agentId,
       name: args.name.trim() || "unnamed task",
@@ -147,11 +154,31 @@ const createTaskTool = defineTool({
       notifyPeerId: originSession?.peerId,
       notifyEnabled: args.notifyEnabled !== false,
       runCount: 0,
+      durableState: "pending",
+      scheduleVersion: 0,
+      conversationPoisoned: false,
       createdAt: now,
       updatedAt: now,
     };
     task.nextRunAt = computeNextRunAt(task, now);
-    store.saveScheduledTask(task);
+    try {
+      const durableActive = SchedulerRuntime.isDurableActive();
+      if (!durableActive) {
+        // polling 回滚模式：保持旧行为（不创建 durable task）
+        store.saveScheduledTask(task);
+      } else {
+        if (!SchedulerRuntime.getInstance().isReady()) {
+          return text({ error: "scheduler is not ready (draining/starting)" });
+        }
+        const saved = await SchedulerRuntime.getInstance().saveTaskDefinition(task, {
+          scheduleChanged: true,
+          enabledChanged: true,
+        });
+        task = saved.task;
+      }
+    } catch (err) {
+      return text({ error: err instanceof Error ? err.message : String(err) });
+    }
     store.recordAudit("scheduler.task_created", {
       taskId: task.id,
       agentId,
@@ -226,9 +253,26 @@ const updateTaskTool = defineTool({
     };
     // once 任务被恢复/改期后重新启用占位
     if (scheduleType === "once" && updated.nextRunAt) updated.enabled = true;
-    store.saveScheduledTask(updated);
-    store.recordAudit("scheduler.task_updated", { taskId: updated.id, agentId, changes: Object.keys(args) });
-    return text({ task: taskSummary(updated) });
+    const enabledChanged = args.enabled !== undefined && updated.enabled !== task.enabled;
+    try {
+      const durableActive = SchedulerRuntime.isDurableActive();
+      if (!durableActive) {
+        store.saveScheduledTask(updated);
+        store.recordAudit("scheduler.task_updated", { taskId: updated.id, agentId, changes: Object.keys(args) });
+        return text({ task: taskSummary(updated) });
+      }
+      if (!SchedulerRuntime.getInstance().isReady()) {
+        return text({ error: "scheduler is not ready (draining/starting)" });
+      }
+      const saved = await SchedulerRuntime.getInstance().saveTaskDefinition(updated, {
+        scheduleChanged,
+        enabledChanged,
+      });
+      store.recordAudit("scheduler.task_updated", { taskId: saved.task.id, agentId, changes: Object.keys(args) });
+      return text({ task: taskSummary(saved.task), ...(saved.aborting ? { aborting: true } : {}) });
+    } catch (err) {
+      return text({ error: err instanceof Error ? err.message : String(err) });
+    }
   },
 });
 
@@ -242,13 +286,23 @@ const deleteTaskTool = defineTool({
     const agentId = resolveAgentId(api);
     const store = new DatabaseStore();
     try {
-      const ok = store.softDeleteScheduledTask(args.taskId, agentId);
-      if (!ok) return text({ error: `Task not found: ${args.taskId}` });
+      const durableActive = SchedulerRuntime.isDurableActive();
+      if (!durableActive) {
+        const ok = store.softDeleteScheduledTask(args.taskId, agentId);
+        if (!ok) return text({ error: `Task not found: ${args.taskId}` });
+        store.recordAudit("scheduler.task_deleted", { taskId: args.taskId, agentId });
+        return text({ deleted: args.taskId });
+      }
+      if (!SchedulerRuntime.getInstance().isReady()) {
+        return text({ error: "scheduler is not ready (draining/starting)" });
+      }
+      const result = await SchedulerRuntime.getInstance().deleteTask(args.taskId, agentId);
+      if (!result.deleted) return text({ error: `Task not found: ${args.taskId}` });
+      store.recordAudit("scheduler.task_deleted", { taskId: args.taskId, agentId });
+      return text({ deleted: args.taskId, ...(result.aborting ? { aborting: true } : {}) });
     } catch (err) {
       return text({ error: err instanceof Error ? err.message : String(err) });
     }
-    store.recordAudit("scheduler.task_deleted", { taskId: args.taskId, agentId });
-    return text({ deleted: args.taskId });
   },
 });
 

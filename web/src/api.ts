@@ -5,9 +5,11 @@ import type {
   ChatChunk,
   Channel,
   ChannelHealth,
+  DurableTaskInfo,
   McpServer,
   ModelProvider,
   ScheduledTask,
+  ScheduledTaskRun,
   ScheduleType,
   SessionHistory,
   SessionRow,
@@ -170,8 +172,25 @@ export const api = {
     }),
 
   listScheduledTasks: () => request<ScheduledTask[]>("/api/scheduled-tasks"),
+  listScheduledRuns: (id: string, limit = 50, offset = 0) =>
+    request<{ items: ScheduledTaskRun[]; total: number }>(
+      `/api/scheduled-tasks/${encodeURIComponent(id)}/runs?limit=${limit}&offset=${offset}`,
+    ),
+  resetScheduledConversation: (id: string) =>
+    request<{ success: boolean; conversationId: string }>(
+      `/api/scheduled-tasks/${encodeURIComponent(id)}/reset-conversation`,
+      { method: "POST" },
+    ),
   deleteScheduledTask: (id: string) =>
     request<{ success: boolean }>(`/api/scheduled-tasks?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  listDurableTasks: () => request<{ tasks: DurableTaskInfo[] }>("/api/durable-tasks"),
+  retryDurableTask: (taskId: string) =>
+    request<{ success: boolean }>("/api/durable-tasks/retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ taskId }),
+    }),
 
   resetChat: (agentId: string, sessionId: string) =>
     request<{ success: boolean }>("/api/chat/reset", {
@@ -219,7 +238,7 @@ export const api = {
       body: JSON.stringify(t),
     }),
   triggerScheduledTask: (id: string) =>
-    request<{ success: boolean; runNumber: number }>("/api/scheduled-tasks/trigger", {
+    request<{ success: boolean; runNumber: number; runId: string }>("/api/scheduled-tasks/trigger", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id }),

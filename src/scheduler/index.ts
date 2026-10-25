@@ -2,26 +2,31 @@ import type { ScheduledTaskDefinition } from "../config/database-store.ts";
 import { DatabaseStore } from "../config/database-store.ts";
 import { AgentManager } from "../core/agent-manager.ts";
 import { EventBus } from "../core/event-bus.ts";
-import { computeNextRunAt, LAST_RESULT_MAX_CHARS } from "./schedule.ts";
+import { buildTriggerMessage, computeNextRunAt, LAST_RESULT_MAX_CHARS } from "./schedule.ts";
 import { logger } from "../utils/logger.ts";
+import { SchedulerRuntime } from "./durable-runtime.ts";
 
-/** 调度循环轮询周期 */
+/** 调度循环轮询周期（仅 polling 回滚模式） */
 const TICK_MS = 1000;
 
+export type SchedulerMode = "durable" | "polling";
+
 /**
- * 系统级定时任务调度器 (宿主进程轮询 scheduled_tasks 表):
- * - 触发即执行: 以创建任务的 Agent 跑一个任务会话, sessionKey = `scheduler:<taskId>`;
- *   AgentManager 的会话恢复机制保证重复触发复用同一 conversation;
- * - 先占坑再执行: 触发前先推进 next_run_at, 执行慢/进程崩溃都不会同一点重复触发;
- * - catch-up: 重启后 next_run_at 已过期的任务补跑一次 (every 丢弃错过的周期, 不追发);
- * - once 任务触发后 next_run_at 置空并标记 done。
+ * 系统级定时任务调度器启动/生命周期。
+ *
+ * 六期默认走 durable 模式（每业务任务一个 durable task，精确 sleepUntil，无 1s 轮询）：
+ *   start = SchedulerRuntime.init → reconcile → markReady
+ * polling 模式保留为 `system_config.scheduler_durable_enabled=0` 的回滚路径；
+ * 模式只在启动时决定，进程内不切换（1.4.0 没有 pause/stop scheduler API）。
  */
 export class SchedulerManager {
   private static instance?: SchedulerManager;
   private timer?: ReturnType<typeof setInterval>;
-  /** 正在执行的任务: 同一任务不并发 (chat 的会话锁之外的第二道防线) */
+  /** 正在执行的任务: 同一任务不并发 (polling 模式的第二道防线) */
   private inFlight = new Set<string>();
   private started = false;
+  private mode?: SchedulerMode;
+  private startPromise?: Promise<void>;
 
   public static getInstance(): SchedulerManager {
     if (!SchedulerManager.instance) {
@@ -30,25 +35,100 @@ export class SchedulerManager {
     return SchedulerManager.instance;
   }
 
-  public start(): void {
+  public async start(): Promise<void> {
     if (this.started) return;
-    this.started = true;
-    this.timer = setInterval(() => void this.tick(), TICK_MS);
-    logger.info("Scheduler", "Scheduler started (polling every 1s)");
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = this.doStart();
+    try {
+      await this.startPromise;
+    } finally {
+      this.startPromise = undefined;
+    }
   }
 
-  /** gateway drain/status 观测用 (control-socket) */
-  public get isStarted(): boolean {
-    return this.started;
+  private async doStart(): Promise<void> {
+    const store = new DatabaseStore();
+    const durableEnabled = store.getConfig("scheduler_durable_enabled", "1") !== "0";
+    const harnessReady = Boolean(AgentManager.getInstance().getHarness());
+    if (durableEnabled && harnessReady) {
+      const runtime = SchedulerRuntime.getInstance();
+      await runtime.init();
+      await runtime.reconcile();
+      runtime.markReady();
+      this.mode = "durable";
+      this.started = true;
+      logger.info("Scheduler", "Durable scheduler started (per-task durable sleeps)");
+      return;
+    }
+    if (durableEnabled && !harnessReady) {
+      logger.warn(
+        "Scheduler",
+        "AgentManager Harness is not initialized; falling back to polling scheduler",
+      );
+    }
+    this.mode = "polling";
+    this.started = true;
+    this.timer = setInterval(() => void this.tick(), TICK_MS);
+    logger.info("Scheduler", "Scheduler started (polling every 1s; durable disabled)");
+  }
+
+  /** 唯一就绪状态：durable 模式读 runtime gate；polling 模式读 started */
+  public get isReady(): boolean {
+    return this.mode === "durable" ? SchedulerRuntime.getInstance().isReady() : this.started;
   }
 
   public get inFlightCount(): number {
-    return this.inFlight.size;
+    return this.inFlight.size + SchedulerRuntime.getInstance().inFlightCount;
+  }
+
+  /**
+   * drain 兼容计数：stop() 后 started=false（不再有新 run），仍等待 in-flight；
+   * durable gate 尚未 ready（启动中）时保守计 1。
+   */
+  public get drainPendingCount(): number {
+    if (this.started && this.mode === "durable" && !SchedulerRuntime.getInstance().isReady()) {
+      return 1;
+    }
+    return this.inFlightCount;
+  }
+
+  public async status(): Promise<{
+    mode?: SchedulerMode;
+    started: boolean;
+    ready: boolean;
+    inFlight: number;
+    nextWakeAt?: number;
+    tasksActive: number;
+    tasksBlocked: number;
+  }> {
+    if (this.mode === "durable") {
+      const runtime = await SchedulerRuntime.getInstance().status();
+      return {
+        mode: "durable",
+        started: runtime.started,
+        ready: runtime.ready,
+        inFlight: this.inFlightCount,
+        nextWakeAt: runtime.nextWakeAt,
+        tasksActive: runtime.tasksActive,
+        tasksBlocked: runtime.tasksBlocked,
+      };
+    }
+    return {
+      mode: this.mode,
+      started: this.started,
+      ready: this.started,
+      inFlight: this.inFlightCount,
+      tasksActive: 0,
+      tasksBlocked: 0,
+    };
   }
 
   public stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    if (this.mode === "durable") {
+      SchedulerRuntime.getInstance().stop();
+    }
     this.started = false;
     logger.info("Scheduler", "Scheduler stopped");
   }
@@ -94,8 +174,12 @@ export class SchedulerManager {
     // 成功/失败都计一次 (触发即消耗一轮)
     const runNumber = store.incrementScheduledTaskRun(task.id);
     try {
-      const triggerMessage =
-        `[定时任务「${task.name}」第 ${runNumber} 次触发 · ${new Date(startedAt).toISOString()}]\n\n${task.prompt}`;
+      const triggerMessage = buildTriggerMessage({
+        name: task.name,
+        prompt: task.prompt,
+        scheduledFor: startedAt,
+        runNumber,
+      });
       logger.info("Scheduler", `Triggering task '${task.id}' (${task.name}) for agent ${task.agentId}`);
       store.recordAudit("scheduler.trigger", { taskId: task.id, name: task.name, agentId: task.agentId, runNumber });
 

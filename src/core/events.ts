@@ -11,6 +11,10 @@ export interface SchedulerCompletedEvent {
   /** 执行结果全文 (调度器已截断入库的那份) */
   result: string;
   error?: string;
+  /** 六期：run ledger id（outbox 唯一键；polling 回滚模式无此字段） */
+  runId?: string;
+  source?: "schedule" | "manual";
+  scheduledFor?: number;
 }
 
 export type PlatformEvent =

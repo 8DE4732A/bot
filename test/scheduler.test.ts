@@ -172,10 +172,10 @@ describe("scheduler: 注册与生命周期", () => {
     ]);
   });
 
-  test("SchedulerManager start/stop 幂等", () => {
+  test("SchedulerManager start/stop 幂等", async () => {
     const mgr = SchedulerManager.getInstance();
-    mgr.start();
-    mgr.start(); // 重复 start 不叠加定时器
+    await mgr.start();
+    await mgr.start(); // 重复 start 不叠加定时器
     mgr.stop();
     mgr.stop();
   });

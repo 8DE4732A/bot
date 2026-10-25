@@ -1,6 +1,6 @@
 # Bot Agent — 基于 pi-durable 的轻量级多 Agent 平台
 
-> 架构详解、pi-durable 框架理解见 **docs/TECHNICAL.md**；二期设计（SKILL/MCP/统一技能模型，已交付）见 **docs/PHASE2-DESIGN.md**；三期设计（多渠道：飞书/QQ/微信/企微，已交付）见 **docs/PHASE3-DESIGN.md**；四期（用户体验：gateway 服务化/TUI 分离/统一命令/管理台 2.0，**已交付**）见 **docs/PHASE4-DESIGN.md**（调研全文在 docs/PHASE4-research/）；五期（工作区技能/AGENTS.md 记忆，**已交付**）见 **docs/PHASE5-DESIGN.md**。
+> 架构详解、pi-durable 框架理解见 **docs/TECHNICAL.md**；二期设计（SKILL/MCP/统一技能模型，已交付）见 **docs/PHASE2-DESIGN.md**；三期设计（多渠道：飞书/QQ/微信/企微，已交付）见 **docs/PHASE3-DESIGN.md**；四期（用户体验：gateway 服务化/TUI 分离/统一命令/管理台 2.0，**已交付**）见 **docs/PHASE4-DESIGN.md**（调研全文在 docs/PHASE4-research/）；五期（工作区技能/AGENTS.md 记忆，**已交付**）见 **docs/PHASE5-DESIGN.md**；六期（Durable 调度与任务生命周期，**已交付**）见 **docs/PHASE6-DESIGN.md**。
 
 基于 `@earendil-works/pi-durable` 的多 Agent 对话网关：零配置文件（一切存 SQLite）、双层安全沙盒、多渠道接入（终端 + 企微/微信/QQ 预留）、免密 Web 管理后台。原始需求见 `INTEND.md`（一期目标：完整 agent 能力、沙盒、终端渠道）。
 
@@ -25,7 +25,7 @@ bun run build:binary # build:web + 编译单二进制到 bin/bot（bun build --c
 
 ## 关键约束（改动前必读）
 
-1. **pi 框架依赖为纯 npm**：`@earendil-works/pi-durable`、`pi-ai`、`chord` 在 package.json 中锁定 npm 依赖（精确 `1.3.0`），`bun install` 后**完全独立运行**——构建/测试/typecheck 均不需要本地 `../pi`。重要事实（第八轮评审实证）：**Bun 运行时恒解析 node_modules 的 dist**，tsconfig paths 对 Bun 运行时无效（仅 tsc 遵循）——因此 tsconfig 已移除框架的 paths 映射，让 typecheck 与运行时同源（dist 1.3.0），消除"类型超前于运行时"的漂移。1.3.0 已导出 `BinaryReader`/`DirReader`/`WatchTarget`/`WatchChange`/`FileWatcher`，`execution-env.ts` 的读取/监控覆盖直接 `override` 基类并前置 PathGuard（不再需要 `@ts-ignore`）。工具返回值自 1.2.0 起为 `{ output, structuredOutput?, details? }`（旧的 `content` 字段会被忽略，必须写 `output`）；`bash` 非零退出改为带 `exit_code` 诊断的 error result。`../pi` 本地仓库仅作**源码阅读参考**（理解框架行为时对照 dist 与 src）；升级时同步提升三个包的精确版本并重跑 typecheck/tests。
+1. **pi 框架依赖为纯 npm**：`@earendil-works/pi-durable`、`pi-ai`、`chord` 在 package.json 中锁定 npm 依赖（精确 `1.4.0`），`bun install` 后**完全独立运行**——构建/测试/typecheck 均不需要本地 `../pi`。重要事实（第八轮评审实证）：**Bun 运行时恒解析 node_modules 的 dist**，tsconfig paths 对 Bun 运行时无效（仅 tsc 遵循）——因此 tsconfig 已移除框架的 paths 映射，让 typecheck 与运行时同源（dist 1.4.0），消除"类型超前于运行时"的漂移。1.3.0 起 `BinaryReader`/`DirReader`/`WatchTarget`/`WatchChange`/`FileWatcher` 已导出，`execution-env.ts` 直接 `override` 并前置 PathGuard（无 `@ts-ignore`）。工具返回值自 1.2.0 起为 `{ output, structuredOutput?, details? }`（旧的 `content` 会被忽略）。**1.4.0 关键约定**：① 首次打开 `conversations.sqlite` 自动迁移 task 表到 schema v2，**迁移后不能回退到 1.3.0**——升级前备份该文件；② `TaskInspection.state` 新增 `sleeping`/`blocked`，`durableBusyCount()` 必须排除两者（它们可跨进程存活，不应阻塞队列/drain）；③ `HarnessOptions.models`/`settings` 支持函数（热替换/热调，无需重开 Harness），`identity` 统一模型请求 UA/版本，`onReport(error, info)` 提供 `ReportInfo` 类型化失败归因；④ `settings.compaction.modelOverrides` 按 `provider/modelId` 设置压缩阈值。六期起业务库 migration v6 增加 `scheduled_tasks` durable 列 + run ledger + 通知 outbox（只增列/表，可被旧版本忽略）。`../pi` 本地仓库仅作**源码阅读参考**；升级时同步提升三个包的精确版本并重跑 typecheck/tests。
 2. **零配置文件原则**：会话、Agent、渠道、模型密钥等一切状态只存 SQLite（`<cwd>/.bot/bot.sqlite`），不引入任何配置文件。新增配置项走 `DatabaseStore.getConfig/setConfig` 或建新表（改 `src/database/migrations.ts`）。
 3. **cwd 自包含**：所有持久化数据落在 `<cwd>/.bot/` 下（`bot.sqlite`、`workspaces/<agent-id>/`、`logs/`、`skills/`），路径逻辑统一在 `src/config/env-paths.ts`，不要硬编码其他位置。
 4. **删除保护**：`agent-default` 和 `terminal-main` 是保留项，`DatabaseStore.deleteAgent/deleteChannel` 会拒绝删除；数据库 bootstrap（`migrations.ts` 里的种子数据）只在全新库执行一次（`bootstrapped` 标记），绝不恢复用户已删除的数据。
@@ -45,7 +45,16 @@ bun run build:binary # build:web + 编译单二进制到 bin/bot（bun build --c
    - **安全**：工作区读取走 `readVerifiedFile`（平台硬规则 + 包含性 + `O_NOFOLLOW` + `fstat`；平台规则不受 `sandbox.enabled` 影响）；新 Agent 默认工作区带代际后缀，删除 Agent 归档默认工作区；`workspaceDir` 必须唯一，变更时迁移 `allowWrite`。
    - **硬链接 DoS（实机发现）**：SQLite WAL 主库出现第二硬链接后持续 `disk I/O error`；`exec` 入口 `hardlinkBlocked` 阻断 `ln`/`link`/`cp -l`（独立于沙盒开关），`DatabaseManager` 在 IO 错误时自动 reopen。残余动态 `link(2)`（脚本内 `os.link` 等）需 OS 用户隔离，记 backlog。
    - **端点**：`GET/POST /api/agents/:id/workspace-skills[/reload]`；`/api/skills` 对文档技能返回 `scope`/`autoEnabled`/`spec`。
-   - **评审与残余**：herdr Codex 连续六轮实现评审终态 **NO BLOCKING ISSUES**（197 tests 全绿）；正文读取用 `bun:ffi` openat 逐级 O_NOFOLLOW 闭环。已知 MAJOR 残余：扫描枚举仍用字符串 `readdirSync`（条目名侧信道，正文不越权）、内部日志保留绝对路径、嵌套 wrapper 硬链接启发式可漏检、workspace_context 的 durable `pi.system` 重放顺序缺 harness 断言。
+   - **评审与残余**：herdr Codex 连续六轮实现评审终态 **NO BLOCKING ISSUES**（200 tests 全绿）；正文读取用 `bun:ffi` openat 逐级 O_NOFOLLOW 闭环。已知 MAJOR 残余：扫描枚举仍用字符串 `readdirSync`（条目名侧信道，正文不越权）、内部日志保留绝对路径、嵌套 wrapper 硬链接启发式可漏检、workspace_context 的 durable `pi.system` 重放顺序缺 harness 断言。
+
+11. **Durable 调度（六期，已实现）**：
+   - `1 scheduled_task ↔ 1 bot.scheduled-prompt durable task`；`wait` phase 用 `runtime.sleepUntil(next_run_at)` 精确唤醒，**不再依赖 1s 轮询**（polling 仅作 `scheduler_durable_enabled=0` 回滚路径，模式只在启动时决定）。
+   - 触发点身份 `runKey = schedule:<taskId>:<scheduleVersion>:<scheduledFor>` 必须先写 durable checkpoint 再进入 `run`；业务库 `scheduled_task_runs` 以 `(task_id, run_key)` 唯一，lease/fence 仲裁终态；`AgentManager.chat` 传 `requestId` 去重。
+   - 调度字段/enabled 变化才递增 `schedule_version` 并取消/重建；只改 name/prompt/notify 不重建。删除/禁用**先落业务库**（deleted_at/enabled），再 cancel/abort，reconcile 绝不复活。
+   - 取消是两阶段：cancelChat + abortTask → 并行等待 → inspect 精确谓词 + waitForIdle；连续 5 次失败标记 `conversation_poisoned=1`（fail-closed，只能人工 `reset-conversation`）。
+   - `AgentManager.init({resume:false})` → `await SchedulerManager.start()`（init/reconcile/markReady）→ `AgentManager.resume()`；启动失败不得 resume（supervised 下退出 78）。
+   - 通知走 `scheduled_task_notifications` outbox（runId 唯一 + claim_token + 退避）；`scheduler.completed` 仅作进程内唤醒。
+   - 业务库 migration v6 只增列/表；升级前仍需备份 `conversations.sqlite`（框架 schema v2 不可回退）。
 
 ## 架构
 
@@ -100,7 +109,10 @@ src/
 │   │                       (LRU 上限 100) 与恢复、**同会话串行锁**（withSessionLock）、
 │   │                       busySessions 追踪（isBusy/activeTurnCount——cancel/drain 用）、
 │   │                       onTurnEvent（流式 chunk 广播 → SessionHub）、abortSession
-│   │                       （显式取消；返回是否真的在生成）、reset/compact、shutdown()
+│   │                       （显式取消；返回是否真的在生成）、reset/compact、shutdown()；
+│   │                       1.4.0: models/settings 函数（原子热替换/按模型压缩阈值）、
+│   │                       identity、onReport→审计、durable 任务状态与 retryTask、
+│   │                       SessionFailed 后懒重建 Harness（复用 models/registry/cwd）
 │   ├── chat-orchestrator.ts (见上)
 │   └── model-factory.ts    BYOK 模型提供商：4 种协议（openai-completions/responses、
 │                           anthropic-messages、google）、/v1/models 远程发现、连通性测试
@@ -114,19 +126,25 @@ src/
 ├── scheduler/
 │   ├── schedule.ts         调度纯计算（无项目内依赖，独立成模块防循环依赖）：
 │   │                       computeNextRunAt（once/every/cron）+ cron 校验（croner）
-│   ├── index.ts            SchedulerManager：宿主进程 1s 轮询到期任务，触发 =
-│   │                       AgentManager.chat(agentId, `scheduler:<taskId>`, …)——
-│   │                       任务会话复用同一 conversation；先占坑再执行（防重复
-│   │                       触发）；重启 catch-up 补跑一次；once 跑完标记 done
+│   ├── index.ts            SchedulerManager：启动/停止门面。durable 模式
+│   │                       （默认）= SchedulerRuntime.init → reconcile → markReady；
+│   │                       polling 模式（scheduler_durable_enabled=0）保留 1s 轮询回滚路径
+│   ├── contracts.ts        调度器 ↔ AgentManager 契约（SchedulerNotReady /
+│   │                       ConversationPoisoned / ConversationMissing / LeaseLost /
+│   │                       RunFinalizeError / CancelChatResult）
+│   ├── durable-task.ts     ScheduledPromptTask 定义（wait sleepUntil → run checkpoint
+│   │                       → 宿主 runner），runKey = taskId+scheduleVersion+scheduledFor
+│   ├── durable-runtime.ts  SchedulerRuntime：owner conversation、per-task 锁、
+│   │                       ensure/cancel/reconcile/reset、reserve+lease+fence、
+│   │                       requestId 幂等 chat、outbox 终态、drain/status
+│   ├── system-extension.ts 系统扩展 "system-scheduler"（任务定义注册，不进技能列表）
 │   └── tools.ts            系统级工具组技能 "scheduler"（schedule_create/list/
-│                           update/delete）；归属经 conversationId 反查（fail-closed，
-│                           模型不可伪造），update/delete 只作用于本 Agent 的任务；
-│                           创建时记录通知目标（来源渠道+peer，渠道层寻址）
+│                           update/delete）；创建/编辑/删除经 SchedulerRuntime 生命周期
 ├── notifications/
-│   └── dispatcher.ts       NotificationDispatcher：订阅 EventBus 的
-│                           scheduler.completed 事件 → 寻址推送（任务记录的
-│                           通知渠道优先，fallback 到 Agent 绑定的启用渠道）；
-│                           新渠道实现 sendMessage 后自动接入通知
+│   └── dispatcher.ts       NotificationDispatcher：durable 模式消费
+│                           scheduled_task_notifications outbox（claim_token + 退避；
+│                           EventBus 仅快速唤醒）；polling 回滚模式仍按事件直投。
+│                           寻址：任务通知目标 → Agent 绑定终端类渠道兜底
 ├── skills/
 │   ├── registry.ts         SkillRegistry 单例：三类统一技能（kind: extension/skill/mcp）+
 │   │                       per-agent workspace 分区；内置技能 coding-tools/web-search/
@@ -251,13 +269,13 @@ QQ=msg_id+msg_seq（群 5min/单聊 60min）、微信=context_token、企微=原
 
 ### 数据模型（双文件分库）
 
-- **业务库 `<cwd>/.bot/bot.sqlite`**：`DatabaseManager`（`node:sqlite`）管理，表：`system_config`、`model_providers`、`agents`、`channel_instances`、`channel_sessions`（主键 channel_instance_id+peer_id）、`mcp_servers`、`scheduled_tasks`（逻辑删除：deleted_at）、`audit_logs`。schema 由 `migrations.ts` 建。
+- **业务库 `<cwd>/.bot/bot.sqlite`**：`DatabaseManager`（`node:sqlite`）管理，表：`system_config`、`model_providers`、`agents`、`channel_instances`、`channel_sessions`（主键 channel_instance_id+peer_id）、`mcp_servers`、`scheduled_tasks`（逻辑删除：deleted_at；六期新增 durable 生命周期列）、`scheduled_task_runs`（run ledger：runKey 唯一 + lease/fence）、`scheduled_task_notifications`（通知 outbox）、`audit_logs`。schema 由 `migrations.ts` 建（当前 v6）。
 - **会话库 `<cwd>/.bot/conversations.sqlite`**：pi-durable 状态机专用（`openNodeSqliteStorage` 自建自管：`conversations`、`entries`、`tasks`、`submissions`、`documents`、`durable_*` 等表与 `durable_schema` 版本迁移）。**业务代码不得触碰**——升级框架时由它自己的 schema 迁移负责；要重置全部会话直接删此文件即可。
 - 两库仅通过业务库 `channel_sessions.conversation_id` 软引用关联（无外键）。
 
 ### 管理后台 API（server.ts）
 
-`/api/status`、`/api/bootstrap`（token 下发，豁免鉴权）、`/api/config`（GET/POST）、`/api/providers`（GET/POST/DELETE）、`/api/providers/fetch-models`、`/api/providers/test`、`/api/agents`（GET/POST/DELETE）、`/api/channels`（GET/POST/DELETE）、`/api/channels/:id/health`（adapter 健康检查）、`/api/channels/:id/qr-login` + `/qr-status`（微信 iLink 扫码, confirmed 自动并入凭据并热重启 adapter）、`/api/skills`、`/api/agents/:id/workspace-skills`（GET 受保护扫描 + POST `/reload` 强制重扫；返回技能/诊断/记忆元数据，不返回记忆正文）、`/api/mcp-servers`（GET/POST/DELETE；headers/env 脱敏语义同渠道凭据）、`/api/mcp-servers/test`（连接试测，不落库）、`/api/scheduled-tasks`（GET / POST 创建与编辑(五模式人话编辑器) / DELETE 逻辑删除）、`/api/scheduled-tasks/trigger`（手动触发，异步执行结果回填任务记录）、`/api/audit-logs`（支持 event/agentId/since/until/limit/offset 过滤分页，返回 {items,total}）、`/api/sessions`（channel_sessions 列表）+ `/api/sessions/search?q=` + `/api/sessions/:conversationId/history`（conversations.sqlite 只读时间线）、`/api/chat`（POST，Accept: text/event-stream 时走 SSE 流式；经 ChatOrchestrator——slash 命令先行，未识别命令不送 LLM）、`/api/chat/reset`、`/api/chat/cancel`（显式取消生成）、`/api/gateway/events`（EventBus → SSE 事件流）、WS `/api/gateway/ws?token=`（SessionHub 第二传输）。
+`/api/status`、`/api/bootstrap`（token 下发，豁免鉴权）、`/api/config`（GET/POST）、`/api/providers`（GET/POST/DELETE）、`/api/providers/fetch-models`、`/api/providers/test`、`/api/agents`（GET/POST/DELETE）、`/api/channels`（GET/POST/DELETE）、`/api/channels/:id/health`（adapter 健康检查）、`/api/channels/:id/qr-login` + `/qr-status`（微信 iLink 扫码, confirmed 自动并入凭据并热重启 adapter）、`/api/skills`、`/api/agents/:id/workspace-skills`（GET 受保护扫描 + POST `/reload` 强制重扫；返回技能/诊断/记忆元数据，不返回记忆正文）、`/api/mcp-servers`（GET/POST/DELETE；headers/env 脱敏语义同渠道凭据）、`/api/mcp-servers/test`（连接试测，不落库）、`/api/scheduled-tasks`（GET / POST 创建与编辑(五模式人话编辑器) / DELETE 逻辑删除）、`/api/scheduled-tasks/:id/runs`（run ledger 分页）、`/api/scheduled-tasks/:id/reset-conversation`（poisoned 人工恢复）、`/api/scheduled-tasks/trigger`（手动触发，统一走 reserve/lease/ledger/outbox）、`/api/durable-tasks`（GET 1.4.0 durable 任务状态：running/ready/waiting/sleeping/completing/blocked）、`/api/durable-tasks/retry`（POST `{taskId}` 仅重跑 `restart_limit` blocked 任务）、`/api/audit-logs`（支持 event/agentId/since/until/limit/offset 过滤分页，返回 {items,total}）、`/api/sessions`（channel_sessions 列表）+ `/api/sessions/search?q=` + `/api/sessions/:conversationId/history`（conversations.sqlite 只读时间线）、`/api/chat`（POST，Accept: text/event-stream 时走 SSE 流式；经 ChatOrchestrator——slash 命令先行，未识别命令不送 LLM）、`/api/chat/reset`、`/api/chat/cancel`（显式取消生成）、`/api/gateway/events`（EventBus → SSE 事件流）、WS `/api/gateway/ws?token=`（SessionHub 第二传输）。
 
 保存 provider/agent 后需调用 `AgentManager.reloadModels()` 热刷新 pi-ai 模型注册（server.ts 中已这样处理）。
 
@@ -272,5 +290,5 @@ QQ=msg_id+msg_seq（群 5min/单聊 60min）、微信=context_token、企微=原
   - **定时任务**（内置技能 `scheduler`）：`schedule_create/list/update/delete` 四工具；任务归属创建它的 Agent（经 `api.conversationId` → `AgentManager.getAgentIdForConversation` 反查，fail-closed）；触发由 `SchedulerManager`（cli 启动）执行，会话 key `scheduler:<taskId>` 天然复用同一 conversation；interval 最小 60s（防高频烧 token）；删除为逻辑删除。**触发结果经事件机制推送渠道**：SchedulerManager publish `scheduler.completed` → NotificationDispatcher 按"任务记录的通知目标（来源渠道+peer）→ Agent 绑定渠道兜底"投递——渠道层寻址与会话无关，会话重置不影响；通知目标依赖真实渠道映射行（`chat` 的 `origin` 参数写入，`getSessionByConversation` 优先非哨兵行）。
   - skills-catalog 本身**不注册进 SkillRegistry**（避免出现在选配列表），但必须在 `AgentManager.init` 显式 `registry.install`——会话按名字解析，缺注册物会被静默丢弃。
 - **新渠道**：实现 `ChannelAdapter` 接口（出站可选声明 `sendReply`/`maxMessageBytes`/`markdownMode`/`sendTyping`/`healthCheck`），在 `factory.ts` 的 `CHANNEL_TYPES` 注册一行；入站走 `InboundPipeline`（渠道运行时自动获得去重/防抖/媒体/防自循环），终点为 `ChannelManager.dispatchAndReply`；渠道实例与 Agent 的绑定关系存 `channel_instances.bound_agent_id`；管理台凭据表单在 `ChannelsView` 的 `CHANNEL_FORM_SCHEMAS` 加声明（secret 字段沿用掩码还原语义）。
-- **测试**：`test/` 下 14 个套件（paths/database/sandbox/skills/server/phase2/scheduler/notifications/phase3/phase4-m0/phase4-m12/phase4-m3/phase5-workspace 等），基于 `bun:test`，多为真实文件系统 + 真实 HTTP 端口的集成测试；server 测试已隔离到临时目录（测试顶部显式 `DatabaseManager.getInstance(临时路径)` + `logger.init(临时目录)`，新增测试套件须沿用此模式，勿写真实 cwd 的 `.bot/`）；**单例被全部套件共享（首个 getInstance 绑定生效），任何套件不得 rmSync 单例库文件所在目录**，否则并行套件会 disk I/O error。
+- **测试**：`test/` 下 16 个套件（paths/database/sandbox/skills/server/phase2/scheduler/notifications/phase3/phase4-m0/phase4-m12/phase4-m3/phase5-workspace/durable-tasks/phase6-scheduler 等，216 tests），基于 `bun:test`，多为真实文件系统 + 真实 HTTP 端口的集成测试；server 测试已隔离到临时目录（测试顶部显式 `DatabaseManager.getInstance(临时路径)` + `logger.init(临时目录)`，新增测试套件须沿用此模式，勿写真实 cwd 的 `.bot/`）；**单例被全部套件共享（首个 getInstance 绑定生效），任何套件不得 rmSync 单例库文件所在目录**，否则并行套件会 disk I/O error。
 - 代码中的中文注释/命名（如技能名称、终端 banner）是刻意为之，保持一致。

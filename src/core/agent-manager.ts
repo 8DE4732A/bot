@@ -5,10 +5,23 @@ import {
   Harness,
   watchEvents,
 } from "@earendil-works/pi-durable";
-import type { AgentEventStream, Conversation, ConversationId, Extension, Harness as HarnessType } from "@earendil-works/pi-durable";
+import type {
+  AgentEventStream,
+  CompactionPolicy,
+  Conversation,
+  ConversationId,
+  Extension,
+  Harness as HarnessType,
+  HarnessSettings,
+  ReportInfo,
+  TaskId,
+  TaskInspection,
+} from "@earendil-works/pi-durable";
 import type { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { DatabaseStore, type AgentDefinition } from "../config/database-store.ts";
+import type { CancelChatResult } from "../scheduler/contracts.ts";
+import { ConversationMissing, ConversationPoisoned } from "../scheduler/contracts.ts";
 import { getBotPaths } from "../config/env-paths.ts";
 import { detectWorkspaceConflicts } from "../config/workspace-conflicts.ts";
 import { EventBus } from "./event-bus.ts";
@@ -20,6 +33,8 @@ import { purgeWorkspaceSkills } from "../skills/workspace.ts";
 import { SkillRegistry } from "../skills/registry.ts";
 import { logger } from "../utils/logger.ts";
 import { ModelFactory } from "./model-factory.ts";
+import { BOT_VERSION } from "../version.ts";
+import { SchedulerSystemExtension } from "../scheduler/system-extension.ts";
 
 import type { MutableModels } from "@earendil-works/pi-ai/models";
 
@@ -95,6 +110,39 @@ interface ConvCache {
   configFp: string;
 }
 
+/** 六期：chat() 的稳定在飞登记（取消不依赖 busyTurns 的会话键） */
+interface ActiveChat {
+  key: string;
+  agentId: string;
+  sessionId: string;
+  controller: AbortController;
+  /** chatLocked 完成（成功/失败/取消）时 settle */
+  done: Promise<void>;
+  resolveDone: () => void;
+  conv?: Conversation;
+  submissionId?: string;
+  /** 调度 run 身份：取消时区分同一 task 的不同 run */
+  runKey?: string;
+  /** 调度 lease fence：与 runKey 一起构成 run 实例身份 */
+  leaseFence?: number;
+  /** 调度 lease owner：取消时绑定具体执行实例 */
+  owner?: string;
+}
+
+/** chat() 可选参数（六期：scheduler requestId / conversation 绑定） */
+export interface ChatOptions {
+  requestId?: string;
+  conversationId?: string;
+  /** 调度触发：activeChats 使用稳定 taskId 作为取消键 */
+  schedulerTaskId?: string;
+  /** 调度 runKey：取消时避免误伤同一 task 的其他 run */
+  runKey?: string;
+  /** 调度 lease fence：与 runKey 一起构成 run 实例身份 */
+  leaseFence?: number;
+  /** 调度 lease owner：取消时绑定具体执行实例 */
+  owner?: string;
+}
+
 const configFingerprint = (a: AgentDefinition) =>
   [
     a.model.provider,
@@ -104,6 +152,61 @@ const configFingerprint = (a: AgentDefinition) =>
     a.workspaceDir,
     [...a.skills].sort().join(","),
   ].join("|");
+
+/** durable 任务是否应阻塞队列投递/drain；sleeping/blocked 可跨进程存活，不阻塞。 */
+export function isDurableTaskPending(task: TaskInspection): boolean {
+  return task.state.kind !== "sleeping" && task.state.kind !== "blocked";
+}
+
+/**
+ * 六期：全局 durable busy 判定（设计 §5.5）。
+ * 调度任务本身与调度 conversation 下的 generation/tool 都属于 scheduler 工作面，
+ * 不能阻塞普通 WS 队列/drain。
+ */
+export function countsTowardGlobalDurableBusy(
+  task: TaskInspection,
+  schedulerConversations: Set<string>,
+): boolean {
+  if (task.record.background) return false;
+  if (schedulerConversations.has(String(task.record.conversationId))) return false;
+  return isDurableTaskPending(task);
+}
+
+export interface DurableTaskStateInfo {
+  kind: "running" | "ready" | "waiting" | "sleeping" | "completing" | "blocked";
+  migrates?: boolean;
+  on?: string[];
+  until?: number;
+  reason?: string;
+}
+
+export interface DurableTaskInfo {
+  id: string;
+  kind: string;
+  conversationId: string;
+  agentId?: string;
+  state: DurableTaskStateInfo;
+  restarts: number;
+  startedAt?: number;
+}
+
+/** 管理台展示用的稳定状态摘要（不把框架内部字段直接透出）。 */
+export function describeDurableState(state: TaskInspection["state"]): DurableTaskStateInfo {
+  switch (state.kind) {
+    case "running":
+      return { kind: "running" };
+    case "ready":
+      return { kind: "ready", migrates: state.migrates };
+    case "waiting":
+      return { kind: "waiting", on: state.on.map(String) };
+    case "sleeping":
+      return { kind: "sleeping", until: state.until };
+    case "completing":
+      return { kind: "completing" };
+    case "blocked":
+      return { kind: "blocked", reason: state.reason };
+  }
+}
 
 export class AgentManager {
   private static instance?: AgentManager;
@@ -119,6 +222,8 @@ export class AgentManager {
   /** 正在生成中的会话 → conversation 引用 (busy 判定 / cancel / drain 用;
    *  存引用而非二次查缓存——会话被 LRU 逐出后 cancel 仍可中止, R1 评审 M10) */
   private busyTurns = new Map<string, Conversation>();
+  /** 六期：进入 chat 即注册的取消登记（含 chatLocked 之前/之后两个阶段） */
+  private activeChats = new Map<string, ActiveChat>();
   /** turn 事件监听 (SessionHub / 未来订阅方) */
   private turnListeners = new Set<TurnListener>();
   /** 会话 usage 快照 (跨轮累计, /status 与订阅方读取) */
@@ -134,6 +239,12 @@ export class AgentManager {
   private recovery?: Promise<void>;
   /** 持久故障的重试冷却，避免每条消息/队列轮询都同步重建 */
   private recoveryRetryAt = 0;
+  /** settings 派生缓存：models 原子替换后自动失效 */
+  private settingsFor?: { models: MutableModels; value: HarnessSettings };
+  /** init({resume:false}) 时为 false：等 SchedulerManager.start 完成后再 resume */
+  private autoResume = true;
+  /** 当前 harness 是否已 resume（避免重复调用/观测） */
+  private resumed = false;
 
   constructor(store?: DatabaseStore) {
     this.store = store ?? new DatabaseStore();
@@ -148,17 +259,14 @@ export class AgentManager {
 
   public reloadModels(): void {
     if (!this.models) return;
-this.models.clearProviders();
-    const providers = this.store.listModelProviders();
-    for (const p of providers) {
-      try {
-        const providerInstance = ModelFactory.buildProviderInstance(p);
-        this.models.setProvider(providerInstance);
-        logger.info("AgentManager", `Reloaded BYOK provider: ${p.id} (${p.models.length} models)`);
-      } catch (err) {
-        logger.warn("AgentManager", `Failed to reload provider ${p.id}: ${err}`);
-      }
-    }
+    // 1.4.0: HarnessOptions.models 支持函数。构建完整的新目录后原子替换，
+    // in-flight 请求不会看到 clearProviders() 的中间态。
+    this.models = ModelFactory.createConfiguredModels();
+    this.settingsFor = undefined;
+    logger.info(
+      "AgentManager",
+      `Reloaded BYOK model catalog (${this.models.getProviders().length} provider(s))`,
+    );
   }
 
   /**
@@ -227,9 +335,10 @@ this.models.clearProviders();
     this.pendingPurge.delete(agentId);
   }
 
-  public async init(cwd: string = process.cwd()): Promise<void> {
+  public async init(cwd: string = process.cwd(), options?: { resume?: boolean }): Promise<void> {
     if (this.harness) return;
     this.cwd = cwd;
+    this.autoResume = options?.resume !== false;
 
     const paths = getBotPaths(cwd);
     logger.info("AgentManager", `Initializing Agent Harness with conversations DB at ${paths.conversationsDbFile}`);
@@ -251,11 +360,34 @@ this.models.clearProviders();
       // 但必须 install: 会话按名字解析扩展, 选配数组里没有同名注册物会被丢弃
       registry.install(SkillsCatalog);
       registry.install(WorkspaceContext);
+      // 六期：durable 模式安装调度任务定义；polling 回滚模式不安装，
+      // 遗留 bot.scheduled-prompt 会以 missing_task 停在 blocked，不会执行
+      if (this.store.getConfig("scheduler_durable_enabled", "1") !== "0") {
+        registry.install(SchedulerSystemExtension);
+      }
     }
 
     await this.openHarness();
     this.initialized = true;
-    logger.info("AgentManager", "Agent Harness successfully initialized and resumed");
+    logger.info(
+      "AgentManager",
+      this.resumed
+        ? "Agent Harness successfully initialized and resumed"
+        : "Agent Harness initialized (resume deferred to scheduler gate)",
+    );
+  }
+
+  /** 启动 gate 开启后恢复 durable 调度（六期启动顺序：init→scheduler.start→resume）。 */
+  public resume(): void {
+    if (!this.harness || this.resumed) return;
+    this.harness.resume();
+    this.resumed = true;
+    this.autoResume = true; // 故障重建后的新 Harness 直接恢复
+    logger.info("AgentManager", "Agent Harness resumed");
+  }
+
+  public getHarness(): HarnessType | undefined {
+    return this.harness;
   }
 
   /** 打开 conversations 存储与 Harness（首次启动与会话故障重建共用）。 */
@@ -269,7 +401,14 @@ this.models.clearProviders();
       harness = await Harness.open(
         storage,
         {
-          models: this.models,
+          // 函数形态: reloadModels() 原子替换 this.models 后，下一次使用即生效
+          models: () => this.models!,
+          // 统一模型请求的 UA/版本 (pi-ai 1.4.0 ClientIdentity)
+          identity: { userAgent: "detailed", version: BOT_VERSION },
+          // 函数形态: 压缩阈值按模型窗口派生，配置热更新无需重开 Harness
+          settings: () => this.buildHarnessSettings(),
+          // 1.4.0 ReportInfo: Session/任务/扩展/host/listener 失败统一归因
+          onReport: (err, info) => this.handleReport(err, info),
           registry: this.registry,
           env: (target) => {
             const convId = String(target.conversationId);
@@ -303,13 +442,76 @@ this.models.clearProviders();
     // 先挂监听再 resume：open/resume 期间失败同样能被观察到
     this.watchSessionFailure(harness);
     try {
-      harness.resume();
+      if (this.autoResume) {
+        harness.resume();
+        this.resumed = true;
+      }
     } catch (err) {
       await storage.close(BACKGROUND_CONTEXT).catch(() => {});
       throw err;
     }
     this.storage = storage;
     this.harness = harness;
+  }
+
+  /** 1.4.0 settings 函数：按当前模型目录派生压缩阈值；models 替换后缓存失效。 */
+  private buildHarnessSettings(): HarnessSettings {
+    if (this.models && this.settingsFor?.models === this.models) {
+      return this.settingsFor.value;
+    }
+    const overrides: Record<string, Partial<CompactionPolicy>> = {};
+    for (const model of this.models?.getModels() ?? []) {
+      const window = model.contextWindow;
+      if (!window || window <= 0) continue;
+      overrides[`${model.provider}/${model.id}`] = {
+        // 给回答留 ~10%，保留最近 ~20% 原文；按窗口缩放，避免小窗口被固定默认值压死
+        reserveTokens: Math.min(16_384, Math.max(512, Math.floor(window * 0.1))),
+        keepRecentTokens: Math.min(32_768, Math.max(1_024, Math.floor(window * 0.2))),
+        backgroundTokens: Math.min(16_384, Math.floor(window * 0.1)),
+      };
+    }
+    const value: HarnessSettings = { compaction: { modelOverrides: overrides } };
+    if (this.models) this.settingsFor = { models: this.models, value };
+    return value;
+  }
+
+  /** 1.4.0 ReportInfo：Session/任务/扩展/host/listener 失败统一记录审计。 */
+  private handleReport(error: unknown, info: ReportInfo): void {
+    const conversationId =
+      "task" in info && info.task
+        ? String(info.task.conversationId)
+        : "conversationId" in info && info.conversationId
+          ? String(info.conversationId)
+          : undefined;
+    let agentId: string | undefined;
+    if (conversationId) {
+      try {
+        agentId = this.getAgentIdForConversation(conversationId);
+      } catch {
+        /* 归属不明时只记全局审计 */
+      }
+    }
+    const detail: Record<string, unknown> = { type: info.type };
+    if ("extension" in info && info.extension) detail.extension = info.extension;
+    if ("task" in info && info.task) {
+      detail.taskId = String(info.task.id);
+      detail.taskKind = info.task.kind;
+    }
+    if (info.type === "task_faulted") detail.reason = info.reason;
+    if (info.type === "host_error") detail.callback = info.callback;
+    try {
+      this.store.recordAudit("agent.report", detail, agentId);
+    } catch (auditErr) {
+      logger.warn("AgentManager", `Failed to record durable report: ${auditErr}`);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    const severe =
+      info.type === "session_failed" ||
+      info.type === "task_faulted" ||
+      info.type === "task_parked" ||
+      info.type === "migration_failed";
+    if (severe) logger.error("AgentManager", `durable report ${info.type}: ${message}`);
+    else logger.warn("AgentManager", `durable report ${info.type}: ${message}`);
   }
 
   /**
@@ -382,6 +584,8 @@ this.models.clearProviders();
     } finally {
       this.storage = undefined;
       this.harness = undefined;
+      this.resumed = false;
+      this.activeChats.clear();
     }
   }
 
@@ -543,15 +747,386 @@ this.models.clearProviders();
     return conv;
   }
 
+  /** 会话扩展集合（skills-catalog / workspace-context 常驻） */
+  private extensionsFor(agent: AgentDefinition): any[] {
+    return [
+      ...SkillRegistry.getInstance().resolveExtensions(agent.skills),
+      SkillsCatalog,
+      WorkspaceContext,
+    ];
+  }
+
+  /**
+   * 六期：调度会话绑定。调度路径**不得**调用会自动重建的 getOrCreateConversation：
+   * - 任务已有 conversation_id / mapping：exact 打开，缺失 fail-closed；
+   * - 两者不一致 fail-closed；
+   * - 都没有时才允许创建一次并写回 mapping + task.conversation_id。
+   */
+  public async openSchedulerConversation(
+    agentId: string,
+    taskId: string,
+    conversationId?: string,
+  ): Promise<Conversation> {
+    let harness = this.harness;
+    if (!harness) {
+      await this.ensureHarness();
+      harness = this.harness;
+    }
+    if (!harness) throw new Error("AgentManager is not initialized");
+
+    const task = this.store.getScheduledTaskRaw(taskId);
+    if (!task || task.deletedAt) {
+      throw new ConversationMissing(`Scheduled task '${taskId}' no longer exists`);
+    }
+    if (task.conversationPoisoned) {
+      throw new ConversationPoisoned(`Scheduled task '${taskId}' conversation is poisoned`);
+    }
+
+    const peerId = `scheduler:${taskId}`;
+    const mapping = this.store.getSession(MAPPING_CHANNEL, peerId);
+    if (conversationId && mapping && mapping.conversationId !== conversationId) {
+      throw new ConversationMissing(
+        `Session mapping for '${taskId}' points at ${mapping.conversationId}, not ${conversationId}`,
+      );
+    }
+    if (conversationId && task.conversationId && task.conversationId !== conversationId) {
+      throw new ConversationMissing(
+        `Task '${taskId}' is bound to ${task.conversationId}, not ${conversationId}`,
+      );
+    }
+    if (mapping && task.conversationId && mapping.conversationId !== task.conversationId) {
+      throw new ConversationMissing(
+        `Task '${taskId}' conversation binding mismatch (task=${task.conversationId}, mapping=${mapping.conversationId})`,
+      );
+    }
+
+    const agent = this.store.getAgent(agentId);
+    if (!agent) throw new Error(`Agent not found: ${agentId}`);
+    const agentSkills = this.extensionsFor(agent);
+    const cacheKey = sessionKey(agentId, `scheduler:${taskId}`);
+
+    let conv: Conversation | undefined;
+    const effective = conversationId ?? task.conversationId ?? mapping?.conversationId;
+    if (effective && this.store.isRetiredSchedulerConversation(effective)) {
+      throw new ConversationMissing(
+        `Scheduled conversation ${effective} for '${taskId}' is retired; reset the conversation`,
+      );
+    }
+    if (effective) {
+      conv = await harness.conversation(Number(effective) as ConversationId, BACKGROUND_CONTEXT);
+      if (!conv) {
+        throw new ConversationMissing(
+          `Scheduled conversation ${effective} for '${taskId}' no longer exists; refusing to recreate automatically`,
+        );
+      }
+      if (!mapping || task.conversationId !== effective) {
+        // backfill：conversation 存在时补齐 mapping/task 字段（不是新建）
+        this.store.bindSchedulerConversation(taskId, effective, agentId);
+      }
+    } else {
+      conv = await this.createNewConversation(agent, agentSkills);
+      this.store.bindSchedulerConversation(taskId, String(conv.id), agentId);
+    }
+
+    const cached = this.conversations.get(cacheKey);
+    const fp = configFingerprint(agent);
+    if (!cached || cached.conv.id !== conv.id) {
+      this.cacheConversation(cacheKey, conv, fp);
+    }
+    if (!cached || cached.conv.id !== conv.id || cached.configFp !== fp) {
+      await conv.configure(
+        {
+          model: {
+            provider: agent.model.provider as any,
+            modelId: agent.model.modelId,
+          },
+          thinkingLevel: agent.model.thinkingLevel,
+          instructions: agent.instructions,
+          cwd: agent.workspaceDir,
+          extensions: agentSkills,
+        },
+        BACKGROUND_CONTEXT,
+      );
+      this.conversations.set(cacheKey, { conv, configFp: fp });
+    }
+    this.conversationToAgent.set(String(conv.id), agentId);
+    return conv;
+  }
+
+  /** reset-conversation 用：创建新会话但不写 mapping（由 runtime 在同一业务事务绑定） */
+  public async createFreshSchedulerConversation(agentId: string, taskId: string): Promise<Conversation> {
+    let harness = this.harness;
+    if (!harness) {
+      await this.ensureHarness();
+      harness = this.harness;
+    }
+    if (!harness) throw new Error("AgentManager is not initialized");
+    const agent = this.store.getAgent(agentId);
+    if (!agent) throw new Error(`Agent not found: ${agentId}`);
+    const conv = await this.createNewConversation(agent, this.extensionsFor(agent));
+    this.cacheConversation(
+      sessionKey(agentId, `scheduler:${taskId}`),
+      conv,
+      configFingerprint(agent),
+    );
+    return conv;
+  }
+
+  /** reset-conversation：清掉该任务的会话缓存/归属/busy/activeChats 旧项 */
+  public forgetSchedulerConversation(taskId: string, conversationId?: string): void {
+    const suffix = `:scheduler:${taskId}`;
+    for (const key of [...this.conversations.keys()]) {
+      if (key.endsWith(suffix)) this.conversations.delete(key);
+    }
+    for (const key of [...this.busyTurns.keys()]) {
+      if (key.endsWith(suffix)) this.busyTurns.delete(key);
+    }
+    for (const key of [...this.usageStats.keys()]) {
+      if (key.endsWith(suffix)) this.usageStats.delete(key);
+    }
+    if (conversationId) this.conversationToAgent.delete(conversationId);
+    const active = this.activeChats.get(`task:${taskId}`);
+    if (active) {
+      active.controller.abort();
+      this.activeChats.delete(`task:${taskId}`);
+    }
+  }
+
+  public async openConversationById(id: string): Promise<Conversation | undefined> {
+    if (!this.harness) return undefined;
+    return this.harness.conversation(Number(id) as ConversationId, BACKGROUND_CONTEXT);
+  }
+
+  /** 该 conversation 是否仍有调度生成/工具任务或未结算 submission（R7-M4 精确谓词） */
+  public async conversationIdle(conversationId: string): Promise<boolean> {
+    if (!this.harness) return true;
+    const inspection = await this.harness.inspect(BACKGROUND_CONTEXT);
+    const busyTask = inspection.tasks.some((t) => {
+      if (String(t.record.conversationId) !== conversationId) return false;
+      if (t.record.kind !== "pi.generation" && t.record.kind !== "pi.tool") return false;
+      return isDurableTaskPending(t);
+    });
+    const busySubmission = inspection.submissions.some(
+      (s) => String(s.conversationId) === conversationId && (s.status === "queued" || s.status === "placed"),
+    );
+    return !busyTask && !busySubmission;
+  }
+
+  /** 等待 activeChats 中的调度 run 结束（不发起取消） */
+  public async waitForChat(taskId: string, timeoutMs: number): Promise<boolean> {
+    const entry = this.activeChats.get(`task:${taskId}`);
+    if (!entry) return true;
+    return raceTimeout(entry.done.then(() => true), timeoutMs, false);
+  }
+
+  /**
+   * 六期：取消调度 run 的聊天生成（可重入）。
+   * - `submission.abort` 只对 queued 有效；placed 返回 already_placed，必须走
+   *   `conv.abort({background:true})` + waitForIdle；
+   * - 没有内存登记时（崩溃恢复）按任务绑定的 conversation 做同样的 abort。
+   */
+  public async cancelChatForTask(
+    taskId: string,
+    timeoutMs: number,
+    expectedRunKey?: string | string[],
+    options?: {
+      expectedLeaseFence?: number;
+      expectedOwner?: string;
+      /** 仅启动 reconcile：允许在“所有 running run 都属于旧 owner”时做一次受控 conversation abort */
+      allowConversationAbortForStaleOwner?: string;
+    },
+  ): Promise<CancelChatResult> {
+    const entry = this.activeChats.get(`task:${taskId}`);
+    const expectedKeys =
+      expectedRunKey === undefined
+        ? undefined
+        : new Set(Array.isArray(expectedRunKey) ? expectedRunKey : [expectedRunKey]);
+    if (expectedKeys && entry) {
+      // 调度 chat 必须带 runKey；不匹配/缺失一律 fail-closed，绝不按 taskId 误取消
+      if (!entry.runKey || !expectedKeys.has(entry.runKey)) {
+        return { chatExited: false, idle: false, reason: "run_mismatch" };
+      }
+      if (
+        options?.expectedLeaseFence !== undefined &&
+        entry.leaseFence !== options.expectedLeaseFence
+      ) {
+        return { chatExited: false, idle: false, reason: "run_mismatch" };
+      }
+      if (
+        options?.expectedOwner !== undefined &&
+        entry.owner !== options.expectedOwner
+      ) {
+        return { chatExited: false, idle: false, reason: "run_mismatch" };
+      }
+    }
+    let conversation: Conversation | undefined = entry?.conv;
+    let submissionId = entry?.submissionId;
+    let reason: CancelChatResult["reason"] = "no_active_chat";
+    const harness = this.harness;
+    let conversationMissing = false;
+    let taskConversationId: string | undefined;
+
+    if (entry) {
+      reason = "aborted";
+      entry.controller.abort();
+      submissionId = entry.submissionId;
+    }
+
+    if (!conversation) {
+      const task = this.store.getScheduledTaskRaw(taskId);
+      taskConversationId = task?.conversationId;
+      if (taskConversationId && harness) {
+        conversation = await harness
+          .conversation(Number(taskConversationId) as ConversationId, BACKGROUND_CONTEXT)
+          .catch(() => undefined);
+        // 会话记录不存在不能直接当作 idle（R9-B2）：必须在下面用 inspect
+        // 精确确认该 conversation 没有 generation/tool 或 queued/placed submission
+        if (!conversation) conversationMissing = true;
+      }
+    }
+
+    // 无 active entry 但带 run 归属：无法把 conversation 残留精确归属到该 run，
+    // 一律 fail-closed，绝不做 conversation 级 abort（R17-B1）。
+    if (expectedKeys && !entry) {
+      const target = conversation ? String(conversation.id) : taskConversationId;
+      if (target) {
+        const idleNow = await this.conversationIdle(target).catch(() => false);
+        if (idleNow) return { chatExited: true, idle: true, reason: "no_active_chat" };
+        // 停机后恢复：old generation 没有 active entry。只有“本任务所有 running
+        // run 都是旧 owner 且全部在 expectedKeys 内”时才允许一次受控
+        // conversation.abort（新 run 必然带当前 instance owner，会被拒绝）。
+        const running = this.store
+          .listRunningScheduledRuns()
+          .filter((r) => r.taskId === taskId);
+        const currentOwner = options?.allowConversationAbortForStaleOwner;
+        const staleOnly =
+          currentOwner !== undefined &&
+          running.length > 0 &&
+          running.every(
+            (r) => r.leaseOwner !== currentOwner && expectedKeys.has(r.runKey),
+          );
+        if (!staleOnly) {
+          return { chatExited: false, idle: false, reason: "run_mismatch" };
+        }
+      }
+    }
+
+    if (conversation && harness) {
+      if (submissionId) {
+        const abortResult = await harness
+          .abortSubmission(Number(submissionId) as any, BACKGROUND_CONTEXT, conversation.id)
+          .catch(() => "not_found" as const);
+        if (abortResult === "already_placed") {
+          reason = "already_placed";
+          const completed = await raceTimeout(
+            conversation.abort(BACKGROUND_CONTEXT, { background: true }).then(() => true).catch(() => false),
+            timeoutMs,
+            false,
+          );
+          if (!completed) {
+            logger.warn("AgentManager", `Conversation abort timed out for scheduler task ${taskId}`);
+            reason = "timeout";
+          }
+        }
+      } else {
+        const completed = await raceTimeout(
+          conversation.abort(BACKGROUND_CONTEXT, { background: true }).then(() => true).catch(() => false),
+          timeoutMs,
+          false,
+        );
+        if (!completed) {
+          logger.warn("AgentManager", `Conversation abort timed out for scheduler task ${taskId}`);
+          reason = "timeout";
+        }
+      }
+    }
+
+    const chatExited = entry ? await this.waitForChat(taskId, timeoutMs) : true;
+    let idle = true;
+    const idleConversationId = conversation ? String(conversation.id) : conversationMissing ? taskConversationId : undefined;
+    if (idleConversationId) {
+      const deadline = Date.now() + Math.min(timeoutMs, 5_000);
+      idle = false;
+      while (Date.now() < deadline) {
+        if (await this.conversationIdle(idleConversationId).catch(() => false)) {
+          idle = true;
+          break;
+        }
+        await sleep(250);
+      }
+      if (!idle) {
+        logger.warn("AgentManager", `Scheduler conversation ${idleConversationId} did not become idle`);
+      }
+    }
+    if (conversationMissing) reason = "conversation_missing";
+    if (!chatExited) reason = "timeout";
+    return { chatExited, idle, reason };
+  }
+
+  /** 六期：按 id 查询 durable task 的 live inspection（不存在返回 undefined） */
+  public async inspectDurableTask(id: string): Promise<TaskInspection | undefined> {
+    if (!this.harness) return undefined;
+    const inspection = await this.harness.inspect(BACKGROUND_CONTEXT);
+    return inspection.tasks.find((t) => String(t.record.id) === id);
+  }
+
+  public async abortDurableTask(id: string): Promise<"marked" | "terminal" | "missing"> {
+    if (!this.harness) return "missing";
+    const task = await this.inspectDurableTask(id);
+    if (!task) return "missing";
+    return this.harness.abortTask(Number(id) as TaskId, BACKGROUND_CONTEXT);
+  }
+
+  public async waitForDurableTask(id: string, timeoutMs: number): Promise<boolean> {
+    if (!this.harness) return true;
+    const task = await this.inspectDurableTask(id);
+    if (!task) return true;
+    return raceTimeout(
+      this.harness.waitForTask(Number(id) as TaskId, BACKGROUND_CONTEXT).then(() => true),
+      timeoutMs,
+      false,
+    );
+  }
+
+
   public async chat(
     agentId: string,
     sessionId: string,
     userMessage: string,
     onChunk?: (chunk: ChatChunk) => void,
+    options?: ChatOptions,
   ): Promise<string> {
-    return this.withSessionLock(`${agentId}:${sessionId}`, () =>
-      this.chatLocked(agentId, sessionId, userMessage, onChunk),
+    const activeKey = options?.schedulerTaskId ? `task:${options.schedulerTaskId}` : `${agentId}:${sessionId}`;
+    let resolveDone!: () => void;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    const entry: ActiveChat = {
+      key: activeKey,
+      agentId,
+      sessionId,
+      controller: new AbortController(),
+      done,
+      resolveDone,
+      runKey: options?.runKey,
+      leaseFence: options?.leaseFence,
+      owner: options?.owner,
+    };
+    this.activeChats.set(activeKey, entry);
+
+    if (entry.controller.signal.aborted) {
+      entry.resolveDone();
+      this.activeChats.delete(activeKey);
+      throw new Error("Chat cancelled before start");
+    }
+
+    const run = this.withSessionLock(`${agentId}:${sessionId}`, () =>
+      this.chatLocked(agentId, sessionId, userMessage, onChunk, options, entry),
     );
+    return run.finally(() => {
+      entry.resolveDone();
+      if (this.activeChats.get(activeKey) === entry) this.activeChats.delete(activeKey);
+    });
   }
 
   /** 会话是否正在生成 (TUI busy 提示 / cancel / 命令 busyPolicy 判定) */
@@ -611,12 +1186,48 @@ this.models.clearProviders();
    */
   public async durableBusyCount(): Promise<number> {
     if (!this.harness) return 0;
-    // inspect 的 tasks 即全部 live work (R5 评审 B1: 只统计 running/ready
-    // 会漏 waiting/completing——等待中/收尾中的任务同样是"不能截断的工作");
-    // 失败抛错 (fail-closed, R5 评审 B1: 静默返回 0 会让 drain 在不知
-    // durable 状态时直接放行)——调用方决定保守语义
+    // inspect 的 tasks 即全部 live work；1.4.0 新增 sleeping/blocked：
+    // 两者都能跨进程存活（sleeping 到点续跑、blocked 等手动 retry），
+    // 不应阻塞队列投递或 drain。
+    // 六期：调度 durable task 与调度 conversation 下的 generation/tool 属于
+    // scheduler 工作面，不得全局阻塞 WS 队列（设计 §5.5）。
     const inspection = await this.harness.inspect(BACKGROUND_CONTEXT);
-    return inspection.tasks.length;
+    const schedulerConversations = this.store.listSchedulerConversationIds();
+    return inspection.tasks.filter((task) =>
+      countsTowardGlobalDurableBusy(task, schedulerConversations),
+    ).length;
+  }
+
+  /** 管理台：当前 durable 任务及 blocked/sleeping 诊断。 */
+  public async listDurableTasks(): Promise<DurableTaskInfo[]> {
+    if (!this.harness) return [];
+    const inspection = await this.harness.inspect(BACKGROUND_CONTEXT);
+    return inspection.tasks.map((task) => {
+      const conversationId = String(task.record.conversationId);
+      let agentId: string | undefined;
+      try {
+        agentId = this.getAgentIdForConversation(conversationId);
+      } catch {
+        /* 归属不明时仍展示任务 */
+      }
+      return {
+        id: String(task.record.id),
+        kind: task.record.kind,
+        conversationId,
+        agentId,
+        state: describeDurableState(task.state),
+        restarts: task.record.restarts ?? 0,
+        startedAt: task.record.startedAt,
+      };
+    });
+  }
+
+  /** 重跑被 crash-loop guard park 的任务（1.4.0 Harness.retryTask）。 */
+  public async retryDurableTask(id: string): Promise<boolean> {
+    const task = await this.inspectDurableTask(id);
+    if (!task) return false;
+    await this.harness!.retryTask(task.record.id, BACKGROUND_CONTEXT);
+    return true;
   }
 
   /** 订阅全进程 turn 事件 (SessionHub); 返回退订函数 */
@@ -633,11 +1244,13 @@ this.models.clearProviders();
     sessionId: string,
     userMessage: string,
     onChunk?: (chunk: ChatChunk) => void,
+    options?: ChatOptions,
+    activeChat?: ActiveChat,
   ): Promise<string> {
     const turnStartedAt = Date.now();
     EventBus.getInstance().publish({ type: "chat.turn", agentId, sessionId, phase: "start" });
     try {
-      const answer = await this.chatTurn(agentId, sessionId, userMessage, onChunk);
+      const answer = await this.chatTurn(agentId, sessionId, userMessage, onChunk, options, activeChat);
       EventBus.getInstance().publish({
         type: "chat.turn",
         agentId,
@@ -670,8 +1283,22 @@ this.models.clearProviders();
     sessionId: string,
     userMessage: string,
     onChunk?: (chunk: ChatChunk) => void,
+    options?: ChatOptions,
+    activeChat?: ActiveChat,
   ): Promise<string> {
-    const conv = await this.getOrCreateConversation(agentId, sessionId);
+    const conv = options?.schedulerTaskId
+      ? await this.openSchedulerConversation(
+          agentId,
+          options.schedulerTaskId,
+          options.conversationId,
+        )
+      : await this.getOrCreateConversation(agentId, sessionId);
+    if (activeChat) {
+      activeChat.conv = conv;
+      if (activeChat.controller.signal.aborted) {
+        throw new Error("Chat cancelled before submission");
+      }
+    }
     // busy 登记在拿到 conv 之后 (存引用: LRU 逐出后 cancel 仍可中止)
     this.busyTurns.set(`${agentId}:${sessionId}`, conv);
     const context = BACKGROUND_CONTEXT;
@@ -773,9 +1400,19 @@ this.models.clearProviders();
 
     try {
       const submission = await conv.submit(
-        { type: "input", content: userMessage },
+        { type: "input", content: userMessage, requestId: options?.requestId },
         context,
       );
+      if (activeChat) {
+        activeChat.submissionId = String(submission.id);
+        if (activeChat.controller.signal.aborted) {
+          const aborted = await submission.abort(context).catch(() => "settled" as const);
+          if (aborted === "already_placed") {
+            await conv.abort(context, { background: true }).catch(() => {});
+          }
+          throw new Error("Chat cancelled before submission settled");
+        }
+      }
 
       const settled = await submission.wait(context);
 
@@ -907,5 +1544,23 @@ this.models.clearProviders();
       await conv.compact(instructions, BACKGROUND_CONTEXT);
       logger.info("AgentManager", `Compacted session for ${agentId}:${sessionId}`);
     });
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function raceTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), Math.max(1, timeoutMs));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }

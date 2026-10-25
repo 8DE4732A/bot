@@ -224,6 +224,7 @@ export function makeControlHandlers(opts: {
       const manager = AgentManager.getInstance();
       const scheduler = SchedulerManager.getInstance();
       const store = new DatabaseStore();
+      const schedulerStatus = await scheduler.status();
       return {
         version: GATEWAY_VERSION,
         cwd: opts.cwd,
@@ -231,7 +232,15 @@ export function makeControlHandlers(opts: {
         uptime: Math.floor(process.uptime()),
         draining: opts.isDraining(),
         activeTurns: manager.activeTurnCount(),
-        scheduler: { started: scheduler.isStarted, inFlight: scheduler.inFlightCount },
+        scheduler: {
+          mode: schedulerStatus.mode,
+          started: schedulerStatus.started,
+          ready: schedulerStatus.ready,
+          inFlight: schedulerStatus.inFlight,
+          nextWakeAt: schedulerStatus.nextWakeAt ?? null,
+          tasksActive: schedulerStatus.tasksActive,
+          tasksBlocked: schedulerStatus.tasksBlocked,
+        },
         channels: opts.listChannels(),
         webPort: store.getConfig("web_port", "3000"),
       };

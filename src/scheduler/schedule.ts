@@ -50,3 +50,15 @@ export function validateCronExpr(expr: string): string | undefined {
     return err instanceof Error ? err.message : String(err);
   }
 }
+
+/** 触发消息统一模板（durable / polling / 手动触发共用，保证模型侧格式一致） */
+export function buildTriggerMessage(input: {
+  name: string;
+  prompt: string;
+  scheduledFor: number;
+  runNumber?: number;
+  manual?: boolean;
+}): string {
+  const label = input.manual ? "手动触发" : `第 ${input.runNumber} 次触发`;
+  return `[定时任务「${input.name}」${label} · ${new Date(input.scheduledFor).toISOString()}]\n\n${input.prompt}`;
+}

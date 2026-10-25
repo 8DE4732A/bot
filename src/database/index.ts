@@ -164,6 +164,26 @@ export class DatabaseManager {
     return this.recoverOnce(() => this.prepare(sql).run(...params));
   }
 
+  /**
+   * 显式写事务 (BEGIN IMMEDIATE): 六期 run ledger / 通知 outbox 的跨语句原子性。
+   * 事务中的 IO 错误只回滚并重开，绝不透明重试语句（避免半程提交）。
+   */
+  public transaction<T>(fn: () => T): T {
+    this.exec("BEGIN IMMEDIATE");
+    try {
+      const result = fn();
+      this.exec("COMMIT");
+      return result;
+    } catch (err) {
+      try {
+        this.exec("ROLLBACK");
+      } catch {
+        /* 连接已失效时回滚失败可忽略 */
+      }
+      throw err;
+    }
+  }
+
   public close() {
     this.stmtCache.clear();
     this.db.close();

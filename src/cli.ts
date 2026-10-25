@@ -226,18 +226,30 @@ async function runPlatform(
   // 2b. 统一命令路由接线 (四期 M0): IM 管道 slash fast path + Web/TUI 统一入口
   initCommandRouting();
 
-  // 3. Initialize Agent Harness
-  await AgentManager.getInstance().init(cwd);
+  // 3. Initialize Agent Harness（六期：先 open，不 resume；等调度 gate 就绪后再恢复）
+  await AgentManager.getInstance().init(cwd, { resume: false });
 
   // 3b. Bridge configured MCP servers into the registry (连接失败不阻塞启动;
   //     失败的 server 由低频重试循环自动恢复)
   await McpBridge.getInstance().sync(store);
   McpBridge.getInstance().startRetryLoop(store);
 
-  // 3c. Start the scheduler (due 任务的 catch-up 由轮询天然覆盖)
-  SchedulerManager.getInstance().start();
+  // 3c. Start the scheduler：durable 模式 init → reconcile → ready gate。
+  //     失败按配置错误处理（不 resume，避免 due task 在无 gate 时进入 chat）。
+  try {
+    await SchedulerManager.getInstance().start();
+  } catch (err) {
+    logger.error("CLI", "Scheduler failed to start; refusing to resume durable work:", err);
+    // 幂等收尾：framework scheduler 尚未 resume，不需要 abortAll
+    await AgentManager.getInstance().shutdown().catch(() => {});
+    if (opts.supervised) writeFileSync(instance.configErrorMarker, new Date().toISOString());
+    await cleanup(opts.supervised ? EXIT_CONFIG_ERROR : 1);
+    return;
+  }
+  // 3d. 调度 gate 已开：恢复 sleeping/running durable 任务
+  AgentManager.getInstance().resume();
 
-  // 3d. Subscribe platform events → channel notifications (定时任务结果推送等)
+  // 3e. Subscribe platform events → channel notifications (定时任务结果推送等)
   NotificationDispatcher.getInstance().init();
 
   // 3e. Gateway 控制套接字 (§3.3): 可连接 + 合法 identify 应答 = liveness

@@ -2,7 +2,12 @@ import { useEffect, useState } from "react";
 
 import { api, isGatewayEvent } from "../api";
 import { ConfirmButton, Empty, Field, Icon, Modal, fmtTime, useAsync, useToast } from "../components/ui";
-import type { Agent, ScheduledTask } from "../types";
+import type {
+  Agent,
+  DurableTaskInfo,
+  DurableTaskStateInfo,
+  ScheduledTask,
+} from "../types";
 
 /**
  * 定时任务 2.0 (四期 §6.2 #5): 人话编辑器 (五模式平级, 模式切换保留已填
@@ -278,18 +283,110 @@ const STATUS_BADGE: Record<string, string> = {
   ok: "badge badge--live",
   done: "badge badge--live",
   error: "badge badge--warn",
+  aborted: "badge badge--warn",
 };
+
+function taskDurableLabel(t: ScheduledTask): string {
+  if (t.conversationPoisoned) return "poisoned (需人工 reset)";
+  if (t.liveState) return durableStateLabel(t.liveState);
+  switch (t.durableState) {
+    case "pending":
+      return "未激活 (等待对账)";
+    case "failed":
+      return "未激活 (创建失败)";
+    case "done":
+      return "done";
+    case "deleted":
+      return "deleted";
+    case "disabled":
+      return "disabled";
+    case "aborting":
+      return "aborting";
+    case "blocked":
+      return "blocked";
+    default:
+      return t.durableState;
+  }
+}
+
+function RunHistoryModal({ task, onClose }: { task: ScheduledTask; onClose: () => void }) {
+  const runsQ = useAsync(() => api.listScheduledRuns(task.id, 100, 0), [task.id]);
+  const rows = runsQ.data?.items ?? [];
+  const total = runsQ.data?.total ?? 0;
+
+  return (
+    <Modal
+      title={`运行历史 · ${task.name}`}
+      onClose={onClose}
+      foot={<button className="btn btn--secondary" onClick={onClose}>关闭</button>}
+    >
+      <div className="field__hint" style={{ marginBottom: 8 }}>
+        run ledger 共 {total} 条（最多展示最近 100 条）；lease/fence 用于多 owner 仲裁。
+      </div>
+      {runsQ.loading ? (
+        <div className="field__hint">加载中…</div>
+      ) : runsQ.error ? (
+        <div className="field__hint" style={{ color: "var(--risk)" }}>{runsQ.error}</div>
+      ) : rows.length === 0 ? (
+        <Empty mark="NO RUNS" title="尚无运行记录" desc="任务触发后会在此留下 run ledger。" />
+      ) : (
+        <div className="meta-list">
+          {rows.map((r) => (
+            <div key={r.id} className="meta-row">
+              <span className="meta-label mono mono--plain">#{r.runNumber}</span>
+              <span className="meta-val">
+                <span className={`badge ${STATUS_BADGE[r.status] ?? "badge"}`}>{r.status}</span>
+                <span className="mono mono--plain">{fmtTime(r.startedAt)}</span>
+                <span className="field__hint">
+                  {r.endedAt ? `${Math.max(0, r.endedAt - r.startedAt)}ms` : "running"} · fence {r.leaseFence} ·
+                  attempt {r.attemptCount}
+                </span>
+                {r.error ? (
+                  <span className="mono mono--plain" style={{ color: "var(--risk)" }}>{r.error}</span>
+                ) : r.result ? (
+                  <span className="mono mono--plain" title={r.result}>
+                    {r.result.slice(0, 160)}
+                  </span>
+                ) : null}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function durableStateLabel(state: DurableTaskStateInfo): string {
+  switch (state.kind) {
+    case "sleeping":
+      return state.until ? `sleeping → ${fmtTime(state.until)}` : "sleeping";
+    case "blocked":
+      return `blocked (${state.reason ?? "unknown"})`;
+    case "waiting":
+      return `waiting (${state.on?.length ?? 0})`;
+    case "ready":
+      return state.migrates ? "ready (migrate)" : "ready";
+    default:
+      return state.kind;
+  }
+}
 
 export function ScheduledTasksView() {
   const tasksQ = useAsync(() => api.listScheduledTasks(), []);
   const agentsQ = useAsync(() => api.listAgents(), []);
+  const durableQ = useAsync(() => api.listDurableTasks(), []);
   const toast = useToast();
   const countdown = useCountdown();
   const [editing, setEditing] = useState<TaskForm | null>(null);
+  const [historyTask, setHistoryTask] = useState<ScheduledTask | null>(null);
   const [triggering, setTriggering] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState<string | null>(null);
+  const [resetting, setResetting] = useState<string | null>(null);
 
   const tasks = tasksQ.data ?? [];
   const agents = agentsQ.data ?? [];
+  const durableTasks = durableQ.data?.tasks ?? [];
 
   useEffect(() => {
     const onEvent = (e: Event) => {
@@ -321,6 +418,34 @@ export function ScheduledTasksView() {
       toast(`触发失败: ${(e as Error).message}`, "risk");
     } finally {
       setTriggering(null);
+    }
+  };
+
+  const retryDurable = async (t: DurableTaskInfo) => {
+    if (retrying) return;
+    setRetrying(t.id);
+    try {
+      await api.retryDurableTask(t.id);
+      toast(`已重试 durable 任务 ${t.kind}`);
+      durableQ.reload();
+    } catch (e) {
+      toast(`重试失败: ${(e as Error).message}`, "risk");
+    } finally {
+      setRetrying(null);
+    }
+  };
+
+  const resetConversation = async (t: ScheduledTask) => {
+    if (resetting) return;
+    setResetting(t.id);
+    try {
+      await api.resetScheduledConversation(t.id);
+      toast(`已重置「${t.name}」的调度会话`);
+      tasksQ.reload();
+    } catch (e) {
+      toast(`重置失败: ${(e as Error).message}`, "risk");
+    } finally {
+      setResetting(null);
     }
   };
 
@@ -364,6 +489,72 @@ export function ScheduledTasksView() {
           </button>
         </div>
       </div>
+
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 8 }}>
+        <div>
+          <div className="section-title">Durable 任务 · {durableTasks.length}</div>
+          <div className="field__hint">
+            pi-durable 内部任务；sleeping 到点自动续跑，blocked 表示 crash-loop 已 park，可手动重试。
+          </div>
+        </div>
+        <button className="btn btn--secondary" onClick={durableQ.reload} disabled={durableQ.loading}>
+          <Icon name="refresh" /> 刷新
+        </button>
+      </div>
+      {durableTasks.length > 0 ? (
+        <div className="grid" style={{ marginBottom: 20 }}>
+          {durableTasks.map((t) => (
+            <div key={t.id} className={`card card--rail ${t.state.kind === "blocked" ? "warn" : "live"}`}>
+              <div className="card__head">
+                <div className="card__ident mono mono--plain">T</div>
+                <div className="card__title-wrap">
+                  <div className="card__title">
+                    {t.kind}
+                    <span className="mono mono--plain">{t.id}</span>
+                  </div>
+                  <div className="card__sub">
+                    Agent <span className="mono mono--plain">{t.agentId ?? "—"}</span> · conversation{" "}
+                    <span className="mono mono--plain">{t.conversationId}</span>
+                  </div>
+                </div>
+              </div>
+              <div className="meta-list">
+                <div className="meta-row">
+                  <span className="meta-label">状态</span>
+                  <span className="meta-val mono mono--plain">{durableStateLabel(t.state)}</span>
+                </div>
+                <div className="meta-row">
+                  <span className="meta-label">重启</span>
+                  <span className="meta-val mono mono--plain">{t.restarts}</span>
+                </div>
+                {t.startedAt ? (
+                  <div className="meta-row">
+                    <span className="meta-label">开始</span>
+                    <span className="meta-val mono mono--plain">{fmtTime(t.startedAt)}</span>
+                  </div>
+                ) : null}
+              </div>
+              {t.state.kind === "blocked" ? (
+                <div className="card__foot">
+                  {t.state.reason === "restart_limit" ? (
+                    <button className="btn btn--secondary" disabled={!!retrying} onClick={() => void retryDurable(t)}>
+                      重试任务
+                    </button>
+                  ) : (
+                    <span className="field__hint">
+                      blocked: {t.state.reason ?? "unknown"} · 需编辑/重建或人工处理
+                    </span>
+                  )}
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="field__hint" style={{ marginBottom: 20 }}>
+          当前没有 durable 任务。
+        </div>
+      )}
 
       {tasksQ.error ? (
         <Empty mark="ERROR" title="加载失败" desc={tasksQ.error} />
@@ -435,6 +626,18 @@ export function ScheduledTasksView() {
                   </div>
                 ) : null}
                 <div className="meta-row">
+                  <span className="meta-label">Durable</span>
+                  <span className="meta-val">
+                    <span className={`badge ${t.conversationPoisoned || ["aborting", "blocked", "failed", "pending"].includes(t.durableState) ? "badge--warn" : "badge--live"}`}>
+                      {taskDurableLabel(t)}
+                    </span>
+                    <span className="field__hint">v{t.scheduleVersion}</span>
+                    {t.conversationId ? (
+                      <span className="mono mono--plain">conv {t.conversationId}</span>
+                    ) : null}
+                  </span>
+                </div>
+                <div className="meta-row">
                   <span className="meta-label">通知</span>
                   <span className="meta-val">
                     {t.notifyEnabled && t.notifyChannelInstanceId ? (
@@ -452,14 +655,34 @@ export function ScheduledTasksView() {
 
               <div className="card__foot">
                 <div className="chips">
-                  <button className="btn btn--secondary btn--sm" onClick={() => void trigger(t)} disabled={triggering === t.id}>
+                  <button className="btn btn--secondary btn--sm" onClick={() => void trigger(t)} disabled={triggering === t.id || !t.enabled}>
                     {triggering === t.id ? "触发中…" : "立即运行"}
                   </button>
-                  <button className="btn btn--secondary btn--sm" onClick={() => setEditing(formFromTask(t))}>
+                  <button
+                    className="btn btn--secondary btn--sm"
+                    onClick={() => setEditing(formFromTask(t))}
+                    disabled={t.durableState === "aborting" || t.conversationPoisoned}
+                  >
                     <Icon name="pencil" size={11} /> 编辑
                   </button>
+                  <button className="btn btn--secondary btn--sm" onClick={() => setHistoryTask(t)}>
+                    运行历史
+                  </button>
+                  {t.conversationPoisoned ? (
+                    <button
+                      className="btn btn--secondary btn--sm"
+                      onClick={() => void resetConversation(t)}
+                      disabled={resetting === t.id}
+                    >
+                      {resetting === t.id ? "重置中…" : "重置会话"}
+                    </button>
+                  ) : null}
                 </div>
-                <ConfirmButton onConfirm={() => remove(t)} />
+                {t.durableState !== "aborting" ? (
+                  <ConfirmButton onConfirm={() => remove(t)} />
+                ) : (
+                  <span className="field__hint">正在停止旧任务…</span>
+                )}
               </div>
             </div>
           ))}
@@ -474,6 +697,7 @@ export function ScheduledTasksView() {
           onSaved={() => tasksQ.reload()}
         />
       )}
+      {historyTask && <RunHistoryModal task={historyTask} onClose={() => setHistoryTask(null)} />}
     </div>
   );
 }

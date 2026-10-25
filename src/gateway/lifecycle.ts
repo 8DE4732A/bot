@@ -586,29 +586,31 @@ async function doDrain(): Promise<void> {
   const agentManager = AgentManager.getInstance();
   const scheduler = SchedulerManager.getInstance();
   const deadline = Date.now() + 50_000;
-  const pending = async (): Promise<{ turns: number; durable: number }> => ({
+  const pending = async (): Promise<{ turns: number; durable: number; scheduler: number }> => ({
     turns: agentManager.activeTurnCount(),
     // inspect 失败 fail-closed (R5 评审 B1): 按"仍有 durable 工作"继续等
     durable: await agentManager.durableBusyCount().catch(() => 1),
+    // stop() 后不再有新 run，但仍等待 in-flight；启动 gate 未 ready 时保守计 1
+    scheduler: scheduler.drainPendingCount,
   });
   // 等待面 = 在飞 chat turn + 调度器在飞任务 + durable 恢复任务 (R4 评审 B2:
   // harness.resume() 重放的 running/ready 任务不在 busyTurns, 不计入会截断)
   let last = await pending();
   while (
-    (last.turns > 0 || last.durable > 0 || scheduler.inFlightCount > 0) &&
+    (last.turns > 0 || last.durable > 0 || last.scheduler > 0) &&
     Date.now() < deadline
   ) {
     logger.debug(
       "Gateway",
-      `Drain: waiting for ${last.turns} turn(s), ${last.durable} durable task(s), ${scheduler.inFlightCount} scheduler task(s)…`,
+      `Drain: waiting for ${last.turns} turn(s), ${last.durable} durable task(s), ${last.scheduler} scheduler task(s)…`,
     );
     await sleep(300);
     last = await pending();
   }
-  if (last.turns > 0 || last.durable > 0 || scheduler.inFlightCount > 0) {
+  if (last.turns > 0 || last.durable > 0 || last.scheduler > 0) {
     logger.warn(
       "Gateway",
-      `Drain deadline reached with ${last.turns} turn(s), ${last.durable} durable task(s), ${scheduler.inFlightCount} task(s); proceeding to exit`,
+      `Drain deadline reached with ${last.turns} turn(s), ${last.durable} durable task(s), ${last.scheduler} task(s); proceeding to exit`,
     );
   } else {
     logger.info("Gateway", "Drain complete: all in-flight work delivered");

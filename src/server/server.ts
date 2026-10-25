@@ -32,7 +32,21 @@ import { EMBEDDED_UI } from "./ui/generated.ts";
 import type { WebSocketServer } from "ws";
 import { isTrustedHostname } from "../utils/trusted-hosts.ts";
 import { readConversationHistory, searchConversations } from "./session-history.ts";
-import { computeNextRunAt, validateCronExpr, MIN_INTERVAL_SECONDS } from "../scheduler/schedule.ts";
+import {
+  buildTriggerMessage,
+  computeNextRunAt,
+  LAST_RESULT_MAX_CHARS,
+  validateCronExpr,
+  MIN_INTERVAL_SECONDS,
+} from "../scheduler/schedule.ts";
+import { SchedulerRuntime } from "../scheduler/durable-runtime.ts";
+import { SchedulerManager } from "../scheduler/index.ts";
+import {
+  ConversationMissing,
+  ConversationPoisoned,
+  RunBusy,
+  SchedulerNotReady,
+} from "../scheduler/contracts.ts";
 
 /** Web Playground 的默认会话标识, 与 /api/chat 与 /api/chat/reset 共用 */
 const playgroundSession = (agentId: string) => `web-playground:${agentId}`;
@@ -483,6 +497,7 @@ export class AdminWebServer {
             auditCount: auditLogs.length,
           },
           memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+          scheduler: await SchedulerManager.getInstance().status(),
         });
         return;
       }
@@ -707,6 +722,8 @@ export class AdminWebServer {
           }
           const archived = archiveDefaultWorkspace(agent);
           try {
+            // 六期：先批量标记 + 取消该 Agent 的调度 durable task，再软删业务行
+            await SchedulerRuntime.getInstance().abortForAgent(id);
             this.store.deleteAgent(id);
           } catch (err) {
             // DB 删除失败 → 回滚归档
@@ -1090,10 +1107,19 @@ export class AdminWebServer {
       }
 
       // 10. Scheduled Tasks API (管理台视角: 全部 Agent 的任务; 删除为逻辑删除;
-      //     四期新增手动创建/编辑与手动触发——人话编辑器 + 防连点)
+      //     六期: schedule_version 代际 + durable task 生命周期 + run ledger)
       if (pathname === "/api/scheduled-tasks") {
         if (method === "GET") {
-          this.sendJson(res, this.store.listScheduledTasks());
+          const tasks = this.store.listScheduledTasks();
+          const live = await AgentManager.getInstance().listDurableTasks();
+          const byId = new Map(live.map((t) => [t.id, t]));
+          this.sendJson(
+            res,
+            tasks.map((t) => ({
+              ...t,
+              liveState: t.durableTaskId ? byId.get(t.durableTaskId)?.state ?? null : null,
+            })),
+          );
           return;
         }
         if (method === "POST") {
@@ -1103,37 +1129,178 @@ export class AdminWebServer {
             this.sendError(res, 400, error);
             return;
           }
-          const previous = body.id ? this.store.getScheduledTask(body.id) : undefined;
-          const task = {
+          const previous = body.id ? this.store.getScheduledTaskRaw(body.id) : undefined;
+          if (previous?.deletedAt) {
+            this.sendError(res, 404, "task not found");
+            return;
+          }
+          const now = Date.now();
+          const scheduleType = body.scheduleType;
+          const task: any = {
             ...(previous ?? {}),
-            id: body.id || `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+            id: body.id || `task-${now.toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
             agentId: body.agentId,
             name: body.name,
             prompt: body.prompt,
-            scheduleType: body.scheduleType,
-            ...(body.scheduleType === "once" ? { runAt: Number(body.runAt) } : {}),
-            ...(body.scheduleType === "every" ? { intervalSeconds: Number(body.intervalSeconds) } : {}),
-            ...(body.scheduleType === "cron" ? { cronExpr: String(body.cronExpr) } : {}),
-            enabled: body.enabled !== false,
+            scheduleType,
+            runAt: scheduleType === "once" ? Number(body.runAt) : undefined,
+            intervalSeconds: scheduleType === "every" ? Number(body.intervalSeconds) : undefined,
+            cronExpr: scheduleType === "cron" ? String(body.cronExpr) : undefined,
+            enabled: body.enabled ?? previous?.enabled ?? true,
+            notifyEnabled: body.notifyEnabled ?? previous?.notifyEnabled ?? true,
             runCount: previous?.runCount ?? 0,
-            nextRunAt: computeNextRunAt({ ...body, scheduleType: body.scheduleType } as any, Date.now()),
-            updatedAt: Date.now(),
-          } as any;
-          this.store.saveScheduledTask(task);
-          this.store.recordAudit("scheduler.task_saved", { taskId: task.id, via: "admin", agentId: task.agentId });
-          EventBus.getInstance().publish({ type: "task.updated", taskId: task.id, agentId: task.agentId });
-          this.sendJson(res, { success: true, id: task.id, nextRunAt: task.nextRunAt });
-          return;
-        }
-        if (method === "DELETE" && this.handleDelete(url, res, (id) => {
-          this.store.softDeleteScheduledTask(id);
-          this.store.recordAudit("scheduler.task_deleted", { taskId: id, via: "admin" });
-        })) {
+            durableState: previous?.durableState ?? "pending",
+            scheduleVersion: previous?.scheduleVersion ?? 0,
+            createdAt: previous?.createdAt ?? now,
+            updatedAt: now,
+          };
+          task.nextRunAt = computeNextRunAt(task, now);
+          const scheduleChanged =
+            !previous ||
+            previous.scheduleType !== task.scheduleType ||
+            previous.runAt !== task.runAt ||
+            previous.intervalSeconds !== task.intervalSeconds ||
+            previous.cronExpr !== task.cronExpr;
+          const enabledChanged = !previous || previous.enabled !== task.enabled;
+          const durableActive = SchedulerRuntime.isDurableActive();
+          if (!durableActive) {
+            // polling 回滚模式（或测试进程未初始化 Harness）：保留旧行为，不创建 durable task
+            this.store.saveScheduledTask(task);
+            this.store.recordAudit("scheduler.task_saved", {
+              taskId: task.id,
+              via: "admin",
+              agentId: task.agentId,
+            });
+            EventBus.getInstance().publish({
+              type: "task.updated",
+              taskId: task.id,
+              agentId: task.agentId,
+            });
+            this.sendJson(res, {
+              success: true,
+              id: task.id,
+              nextRunAt: task.nextRunAt,
+              durableState: task.durableState,
+              scheduleVersion: task.scheduleVersion,
+            });
+            return;
+          }
+          try {
+            if (!SchedulerRuntime.getInstance().isReady()) {
+              this.sendError(res, 503, "durable scheduler is not ready (draining/starting)");
+              return;
+            }
+            const saved = await SchedulerRuntime.getInstance().saveTaskDefinition(task, {
+              scheduleChanged,
+              enabledChanged,
+            });
+            this.store.recordAudit("scheduler.task_saved", {
+              taskId: saved.task.id,
+              via: "admin",
+              agentId: saved.task.agentId,
+            });
+            EventBus.getInstance().publish({
+              type: "task.updated",
+              taskId: saved.task.id,
+              agentId: saved.task.agentId,
+            });
+            this.sendJson(
+              res,
+              {
+                success: true,
+                id: saved.task.id,
+                nextRunAt: saved.task.nextRunAt,
+                durableState: saved.task.durableState,
+                scheduleVersion: saved.task.scheduleVersion,
+                ...(saved.aborting ? { status: "aborting" } : {}),
+              },
+              saved.aborting ? 202 : 200,
+            );
+          } catch (err) {
+            this.sendError(res, err instanceof ConversationPoisoned ? 409 : 500, (err as Error).message);
+          }
           return;
         }
       }
 
-      // 10b. 手动触发 (编辑器"立即运行"按钮; 前端防连点 + 审计留痕)
+      // 10a. run ledger / reset-conversation（先于通配 DELETE 匹配）
+      const runsMatch = pathname.match(/^\/api\/scheduled-tasks\/([^/]+)\/runs$/);
+      if (runsMatch && method === "GET") {
+        const taskId = decodeURIComponent(runsMatch[1]);
+        const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get("limit") || "50", 10) || 50));
+        const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+        this.sendJson(res, {
+          items: this.store.listScheduledRuns(taskId, limit, offset),
+          total: this.store.countScheduledRuns(taskId),
+        });
+        return;
+      }
+      const resetMatch = pathname.match(/^\/api\/scheduled-tasks\/([^/]+)\/reset-conversation$/);
+      if (resetMatch && method === "POST") {
+        if (isDraining()) {
+          this.sendError(res, 503, "gateway 正在重启 (draining)");
+          return;
+        }
+        const taskId = decodeURIComponent(resetMatch[1]);
+        if (!SchedulerRuntime.isDurableActive()) {
+          this.sendError(res, 409, "durable scheduler is not active");
+          return;
+        }
+        if (!SchedulerRuntime.getInstance().isReady()) {
+          this.sendError(res, 503, "durable scheduler is not ready (draining/starting)");
+          return;
+        }
+        try {
+          const result = await SchedulerRuntime.getInstance().resetConversation(taskId);
+          EventBus.getInstance().publish({
+            type: "task.updated",
+            taskId,
+            agentId: this.store.getScheduledTaskRaw(taskId)?.agentId ?? "",
+          });
+          this.sendJson(res, { success: true, ...result });
+        } catch (err) {
+          this.sendError(res, 409, (err as Error).message);
+        }
+        return;
+      }
+
+      if (pathname === "/api/scheduled-tasks" && method === "DELETE") {
+        const id = url.searchParams.get("id");
+        if (!id) {
+          this.sendError(res, 400, "id is required");
+          return;
+        }
+        const raw = this.store.getScheduledTaskRaw(id);
+        if (!raw || raw.deletedAt) {
+          this.sendError(res, 404, "task not found");
+          return;
+        }
+        if (!SchedulerRuntime.isDurableActive()) {
+          this.store.softDeleteScheduledTask(id);
+        } else {
+          if (!SchedulerRuntime.getInstance().isReady()) {
+            this.sendError(res, 503, "durable scheduler is not ready (draining/starting)");
+            return;
+          }
+          try {
+            const result = await SchedulerRuntime.getInstance().deleteTask(id);
+            if (result.aborting) logger.warn("Server", `Task '${id}' delete is still aborting`);
+          } catch (err) {
+            this.sendError(res, 500, (err as Error).message);
+            return;
+          }
+        }
+        this.store.recordAudit("scheduler.task_deleted", { taskId: id, via: "admin" });
+        EventBus.getInstance().publish({
+          type: "task.updated",
+          taskId: id,
+          agentId: raw.agentId,
+        });
+        this.sendJson(res, { success: true });
+        return;
+      }
+
+      // 10b. 手动触发 (编辑器"立即运行"按钮; 统一走 reserve/lease/ledger/outbox)
       if (pathname === "/api/scheduled-tasks/trigger" && method === "POST") {
         const body = await this.readJsonBody(req);
         // drain 闸 body 后二次校验 (R4 评审 M-3, 与 cancel/reset 同款)
@@ -1141,47 +1308,130 @@ export class AdminWebServer {
           this.sendError(res, 503, "gateway 正在重启 (draining), 暂不接受手动触发");
           return;
         }
-        const task = this.store.getScheduledTask(String(body.id ?? ""));
-        if (!task || task.deletedAt) {
-          this.sendError(res, 404, "task not found");
+        const taskId = String(body.id ?? "");
+        const durableActive = SchedulerRuntime.isDurableActive();
+        if (!durableActive) {
+          // polling 回滚模式：旧的手动触发路径（无 ledger/outbox）
+          const task = this.store.getScheduledTask(taskId);
+          if (!task || task.deletedAt) {
+            this.sendError(res, 404, "task not found");
+            return;
+          }
+          const runNumber = this.store.incrementScheduledTaskRun(task.id);
+          this.store.recordAudit("scheduler.task_triggered", {
+            taskId: task.id,
+            via: "admin",
+            runNumber,
+          });
+          void AgentManager.getInstance()
+            .chat(
+              task.agentId,
+              `scheduler:${task.id}`,
+              buildTriggerMessage({
+                name: task.name,
+                prompt: task.prompt,
+                scheduledFor: Date.now(),
+                manual: true,
+              }),
+            )
+            .then((answer) => {
+              const fresh = this.store.getScheduledTask(task.id);
+              if (fresh) {
+                this.store.saveScheduledTask({
+                  ...fresh,
+                  lastRunAt: Date.now(),
+                  lastStatus: "ok",
+                  lastResult: answer.slice(0, LAST_RESULT_MAX_CHARS),
+                  runCount: fresh.runCount,
+                  updatedAt: Date.now(),
+                });
+              }
+              EventBus.getInstance().publish({
+                type: "scheduler.completed",
+                taskId: task.id,
+                taskName: task.name,
+                agentId: task.agentId,
+                status: "ok",
+                runNumber,
+                result: answer,
+              });
+            })
+            .catch((err) => {
+              this.store.recordAudit("scheduler.error", {
+                taskId: task.id,
+                error: String(err),
+              });
+            });
+          this.sendJson(res, { success: true, runNumber });
           return;
         }
-        // runCount 原子递增 (R1 评审 B18: 与到点调度并发时不再读-改-写覆盖)
-        const runNumber = this.store.incrementScheduledTaskRun(task.id);
-        this.store.recordAudit("scheduler.task_triggered", { taskId: task.id, via: "admin", runNumber });
-        // 异步执行: 响应立即返回 (前端经任务列表 lastStatus/事件流观察结果)
-        void AgentManager.getInstance()
-          .chat(
-            task.agentId,
-            `scheduler:${task.id}`,
-            `[定时任务「${task.name}」手动触发 · ${new Date().toISOString()}]\n\n${task.prompt}`,
-          )
-          .then((answer) => {
-            const fresh = this.store.getScheduledTask(task.id);
-            if (fresh) {
-              this.store.saveScheduledTask({
-                ...fresh,
-                lastRunAt: Date.now(),
-                lastStatus: "ok",
-                lastResult: answer.slice(0, 800),
-                runCount: fresh.runCount, // 不回写本地快照 (原子递增已计入)
-                updatedAt: Date.now(),
-              });
-            }
-            EventBus.getInstance().publish({
-              type: "scheduler.completed",
-              taskId: task.id,
-              taskName: task.name,
-              agentId: task.agentId,
-              status: "ok",
-              runNumber,
-              result: answer,
-            });
-          })
-          .catch((err) => {
-            this.store.recordAudit("scheduler.error", { taskId: task.id, error: String(err) });
+        try {
+          if (!SchedulerRuntime.getInstance().isReady()) {
+            this.sendError(res, 503, "durable scheduler is not ready (draining/starting)");
+            return;
+          }
+          const run = await SchedulerRuntime.getInstance().triggerManual(taskId);
+          this.store.recordAudit("scheduler.task_triggered", {
+            taskId,
+            via: "admin",
+            runNumber: run.runNumber,
+            runId: run.runId,
           });
-        this.sendJson(res, { success: true, runNumber });
+          this.sendJson(res, { success: true, status: "running", ...run });
+        } catch (err) {
+          if (
+            err instanceof RunBusy ||
+            err instanceof ConversationPoisoned ||
+            err instanceof ConversationMissing
+          ) {
+            this.sendError(res, 409, err.message);
+          } else if (err instanceof SchedulerNotReady) {
+            this.sendError(res, 503, "scheduler is not ready");
+          } else {
+            const message = (err as Error).message;
+            this.sendError(res, /not found/i.test(message) ? 404 : 400, message);
+          }
+        }
+        return;
+      }
+
+      // 10c. Durable Tasks API (1.4.0: sleeping/blocked 诊断 + parked 任务重试)
+      if (pathname === "/api/durable-tasks" && method === "GET") {
+        this.sendJson(res, { tasks: await AgentManager.getInstance().listDurableTasks() });
+        return;
+      }
+      if (pathname === "/api/durable-tasks/retry" && method === "POST") {
+        if (isDraining()) {
+          this.sendError(res, 503, "gateway 正在重启 (draining), 暂不接受任务重试");
+          return;
+        }
+        const body = await this.readJsonBody(req);
+        const taskId = typeof body.taskId === "string" ? body.taskId : "";
+        if (!taskId) {
+          this.sendError(res, 400, "taskId is required");
+          return;
+        }
+        const live = await AgentManager.getInstance().listDurableTasks();
+        const target = live.find((t) => t.id === taskId);
+        if (!target) {
+          this.sendError(res, 404, `durable task '${taskId}' not found`);
+          return;
+        }
+        if (target.state.kind !== "blocked" || target.state.reason !== "restart_limit") {
+          this.sendError(res, 409, `durable task '${taskId}' is not restart-limit blocked`);
+          return;
+        }
+        try {
+          const retried = await AgentManager.getInstance().retryDurableTask(taskId);
+          if (!retried) {
+            this.sendError(res, 404, `durable task '${taskId}' not found`);
+            return;
+          }
+          this.store.recordAudit("durable.task_retried", { taskId });
+          this.sendJson(res, { success: true });
+        } catch (err) {
+          this.sendError(res, 500, (err as Error).message);
+        }
         return;
       }
 
@@ -1535,8 +1785,8 @@ export class AdminWebServer {
     });
   }
 
-  private sendJson(res: ServerResponse, data: unknown): void {
-    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+  private sendJson(res: ServerResponse, data: unknown, status = 200): void {
+    res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify(data));
   }
 

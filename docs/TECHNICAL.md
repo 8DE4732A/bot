@@ -88,9 +88,9 @@ pi-durable **没有专门的 skill 概念**——它的原语是 Extension（工
 
 ### 2.6 实验性框架的使用姿势
 
-pi-durable 已进入 1.3.x（1.2.0 有工具结果与存储错误语义的破坏性变更）。本项目的策略：
+pi-durable 已进入 1.4.x（1.2.0 有工具结果与存储错误语义的破坏性变更；1.4.0 有会话库 schema v2 迁移与 durable sleeping/blocked 状态）。本项目的策略：
 
-1. **纯 npm 依赖**：npm 精确 `1.3.0`，`bun install` 后完全独立（构建/测试/typecheck 均不需要本地 `../pi`）。**关键事实**：Bun 运行时恒解析 node_modules 的 dist，tsconfig paths 对运行时无效（仅 tsc 遵循）——若保留 paths 会出现"类型超前于运行时"的漂移（typecheck 绿但 dist 里没有该 API），因此 tsconfig 已移除框架 paths 映射，typecheck 与运行时同源；1.0.3 起 `watch`/`openBinaryReader`/`openDirReader` 均为基类正式 API，`execution-env.ts` 直接类型化 override 并前置 PathGuard。工具返回值使用 `output`（1.2.0 起，`content` 已移除）。升级 = 提升三个包的精确版本并重跑 typecheck/tests。`../pi` 仅作源码阅读参考。
+1. **纯 npm 依赖**：npm 精确 `1.4.0`，`bun install` 后完全独立（构建/测试/typecheck 均不需要本地 `../pi`）。**关键事实**：Bun 运行时恒解析 node_modules 的 dist，tsconfig paths 对运行时无效（仅 tsc 遵循）——若保留 paths 会出现"类型超前于运行时"的漂移（typecheck 绿但 dist 里没有该 API），因此 tsconfig 已移除框架 paths 映射，typecheck 与运行时同源；1.0.3 起 `watch`/`openBinaryReader`/`openDirReader` 均为基类正式 API，`execution-env.ts` 直接类型化 override 并前置 PathGuard。工具返回值使用 `output`（1.2.0 起，`content` 已移除）。1.4.0 起 `conversations.sqlite` 首次打开自动迁移到 schema v2，**迁移后不能回退到 1.3.0**，升级前备份；`durableBusyCount()` 排除 `sleeping`/`blocked` 任务（可跨进程存活，不阻塞队列/drain）。升级 = 提升三个包的精确版本并重跑 typecheck/tests。`../pi` 仅作源码阅读参考。
 2. **只用公开导出**：`Harness`/`watchEvents`/`AssistantEntry`/`defineTool` 均从主入口 import；凡是需要 `as any` 读框架内部的地方都是升级雷区，一律换成类型化 API 或封装适配层。
 3. **对框架行为做实证**：不信任文档记忆，关键契约（undefined 语义、env 重建时机、configure 提交成本、close 链）都在框架源码中核实过（见 `../pi/packages/durable/src/`），部分写入了 `test/` 固化。
 
@@ -135,6 +135,18 @@ SandboxedExecutionEnv   pi-durable env 的安全实现 (每个工具轮次由框
 - **会话串行锁**：`withSessionLock(key)` 是 per-session Promise 链（前序失败不阻塞后续）。Web/渠道并发到达同一会话时严格排队，杜绝 Conversation 双重创建与 watch 互踩。
 - **配置指纹去重**：configure 是事务提交，指纹（含 skills）不变则跳过——每条消息零额外写。
 - **Web 管理台**：React 19 + Vite 源码在 `web/`，构建产物经 `scripts/embed-web.ts` 转成 `src/server/ui/generated.ts` 内嵌二进制（woff 回退字体已剔除）。开发用 `bun run dev:web`（Vite HMR，`/api` 代理）。前端经 vite alias `@bot-core` 共享后端**无 node 依赖的纯数据模块**（如沙盒默认值），防止前后端漂移。
+
+### 3.4 六期：durable 调度（方案 B）
+
+`1 scheduled_task ↔ 1 bot.scheduled-prompt durable task`（`src/scheduler/durable-task.ts`）：
+
+- **精确唤醒**：`wait` phase 按业务行 `next_run_at` 调 `runtime.sleepUntil()`；没有 1s 轮询。每次唤醒重读业务库，name/prompt/通知目标编辑无需重建。
+- **触发点身份**：`runKey = schedule:<taskId>:<scheduleVersion>:<scheduledFor>`，先写入 durable checkpoint，再进入 `run` phase 调宿主 runner——双库半提交时以 checkpoint 为真相重建 ledger。
+- **生命周期**：`SchedulerRuntime`（`durable-runtime.ts`）负责 ownerless `scheduler-owner` conversation、per-task 串行锁、创建/重建/取消、启动 reconcile、ready gate。`schedule_version` 只在调度字段/enabled 变化时递增；旧 task 醒来发现代际变化会 terminal `superseded`。
+- **幂等执行**：`reserveScheduledRun` 事务写唯一 run ledger（`task_id+run_key`），lease/fence 仲裁终态；`AgentManager.chat({requestId, schedulerTaskId, conversationId})` 用框架 requestId 去重；assistant entry 由 generation task 单次写入。
+- **取消**：`activeChats` 进入 chat 即注册 AbortController；外部 `cancelRun` 先 cancelChat + abortTask，再并行等待 task terminal/chat 退出，最后用 inspect 精确谓词（无 pi.generation/pi.tool、无 queued/placed submission）+ waitForIdle 确认。连续 5 次失败把 conversation 标记 `poisoned`（fail-closed，只能人工 reset）。
+- **通知**：run 终态事务内写 `scheduled_task_notifications` outbox（runId 唯一、claim_token 原子 claim、失败指数退避）；EventBus 只做快速唤醒。
+- **启动顺序**：`AgentManager.init({resume:false})` → `SchedulerManager.start()`（init/reconcile/markReady）→ `AgentManager.resume()`；启动失败不 resume，按配置错误退出（supervised 下 78）。回滚路径 `system_config.scheduler_durable_enabled=0`（polling），模式只在启动时决定。
 
 ---
 

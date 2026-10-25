@@ -157,6 +157,41 @@ export interface McpServer {
 
 export type ScheduleType = "once" | "every" | "cron";
 
+export type ScheduledTaskDurableState =
+  | "pending"
+  | "active"
+  | "aborting"
+  | "blocked"
+  | "disabled"
+  | "done"
+  | "deleted"
+  | "failed"
+  | "poisoned";
+
+export type ScheduledRunStatus = "running" | "ok" | "error" | "done" | "aborted";
+
+export interface ScheduledTaskRun {
+  id: string;
+  taskId: string;
+  runKey: string;
+  scheduledFor: number;
+  runNumber: number;
+  scheduleVersion: number;
+  requestId: string;
+  status: ScheduledRunStatus;
+  startedAt: number;
+  endedAt?: number;
+  conversationId?: string;
+  durableTaskId?: string;
+  attemptCount: number;
+  leaseOwner?: string;
+  leaseUntil?: number;
+  leaseFence: number;
+  result?: string;
+  error?: string;
+  createdAt: number;
+}
+
 export interface ScheduledTask {
   id: string;
   agentId: string;
@@ -177,6 +212,16 @@ export interface ScheduledTask {
   notifyChannelInstanceId?: string;
   notifyPeerId?: string;
   notifyEnabled: boolean;
+  /* ---------------- 六期 durable 生命周期 ---------------- */
+  durableTaskId?: string;
+  durableState: ScheduledTaskDurableState;
+  scheduleVersion: number;
+  conversationId?: string;
+  conversationPoisoned?: boolean;
+  poisonRunKey?: string;
+  poisonFence?: number;
+  /** harness.inspect 的 live 状态（null = 无 live durable task） */
+  liveState?: DurableTaskStateInfo | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -201,6 +246,15 @@ export interface SystemStatus {
     auditCount: number;
   };
   memoryMb: number;
+  scheduler?: {
+    mode?: "durable" | "polling";
+    started: boolean;
+    ready: boolean;
+    inFlight: number;
+    nextWakeAt?: number | null;
+    tasksActive: number;
+    tasksBlocked: number;
+  };
 }
 
 /** SSE 流式对话的 chunk（对应后端 AgentManager.ChatChunk） */
@@ -261,4 +315,24 @@ export interface SessionSearchHit {
 export interface AuditPage {
   items: AuditLog[];
   total: number;
+}
+
+/* ---------------- Durable 任务（1.4.0） ---------------- */
+
+export interface DurableTaskStateInfo {
+  kind: "running" | "ready" | "waiting" | "sleeping" | "completing" | "blocked";
+  migrates?: boolean;
+  on?: string[];
+  until?: number;
+  reason?: string;
+}
+
+export interface DurableTaskInfo {
+  id: string;
+  kind: string;
+  conversationId: string;
+  agentId?: string;
+  state: DurableTaskStateInfo;
+  restarts: number;
+  startedAt?: number;
 }

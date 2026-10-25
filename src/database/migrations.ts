@@ -143,6 +143,70 @@ const MIGRATIONS: ((db: DatabaseSync) => void)[] = [
         ON gateway_queued_prompts (agent_id, session_id);
     `);
   },
+  // v6: 六期——durable 调度 (每任务一个 durable task) + run ledger + 通知 outbox
+  // (docs/PHASE6-DESIGN.md §5.6; 只增列/表, 旧版本可忽略)
+  (db) => {
+    db.exec(`
+      ALTER TABLE scheduled_tasks ADD COLUMN durable_task_id TEXT;
+      ALTER TABLE scheduled_tasks ADD COLUMN durable_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (durable_state IN ('pending','active','aborting','blocked','disabled','done','deleted','failed','poisoned'));
+      ALTER TABLE scheduled_tasks ADD COLUMN schedule_version INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE scheduled_tasks ADD COLUMN conversation_id TEXT;
+      ALTER TABLE scheduled_tasks ADD COLUMN conversation_poisoned INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE scheduled_tasks ADD COLUMN poison_run_key TEXT;
+      ALTER TABLE scheduled_tasks ADD COLUMN poison_fence INTEGER;
+
+      CREATE TABLE IF NOT EXISTS scheduled_task_runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        run_key TEXT NOT NULL,
+        scheduled_for INTEGER NOT NULL,
+        run_number INTEGER NOT NULL,
+        schedule_version INTEGER NOT NULL,
+        request_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('running','ok','error','done','aborted')),
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        conversation_id TEXT,
+        durable_task_id TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 1,
+        lease_owner TEXT,
+        lease_until INTEGER,
+        lease_fence INTEGER NOT NULL DEFAULT 0,
+        result TEXT,
+        error TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_task_runs_key
+        ON scheduled_task_runs (task_id, run_key);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_task_runs_number
+        ON scheduled_task_runs (task_id, run_number);
+      CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_task
+        ON scheduled_task_runs (task_id, scheduled_for DESC);
+      CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_lease
+        ON scheduled_task_runs (status, lease_until);
+
+      CREATE TABLE IF NOT EXISTS scheduled_task_notifications (
+        run_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        payload TEXT NOT NULL CHECK (json_valid(payload) AND length(CAST(payload AS BLOB)) <= 65536),
+        status TEXT NOT NULL CHECK (status IN ('pending','sending','delivered','failed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER,
+        last_error TEXT,
+        claimed_by TEXT,
+        claim_token TEXT,
+        claimed_at INTEGER,
+        claimed_until INTEGER,
+        delivered_at INTEGER,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_scheduled_task_notifications_due
+        ON scheduled_task_notifications (status, next_attempt_at);
+      CREATE INDEX IF NOT EXISTS idx_scheduled_task_notifications_claim
+        ON scheduled_task_notifications (status, claimed_until);
+    `);
+  },
 ];
 
 export function runMigrations(db: DatabaseSync) {
