@@ -1456,7 +1456,7 @@ export class AdminWebServer {
       }
 
       // 11a. 会话浏览 (四期 §6.2 #1): channel_sessions 列表 / 会话时间线 /
-      //      全文搜索——conversations.sqlite 只读 (框架无查询 API, 边界即"仅读")
+      //      全文搜索——内容经 pi-durable Conversation API 只读，不触碰私有表。
       if (pathname === "/api/sessions" && method === "GET") {
         this.sendJson(res, this.store.listSessions());
         return;
@@ -1479,7 +1479,11 @@ export class AdminWebServer {
       }
       if (pathname === "/api/sessions/search" && method === "GET") {
         const q = url.searchParams.get("q") || "";
-        this.sendJson(res, searchConversations(q));
+        const conversationIds = this.store.listSessions().map((s) => Number(s.conversationId));
+        this.sendJson(
+          res,
+          await searchConversations(q, AgentManager.getInstance().getHarness(), conversationIds),
+        );
         return;
       }
       if (/^\/api\/sessions\/[^/]+\/history$/.test(pathname) && method === "GET") {
@@ -1488,7 +1492,10 @@ export class AdminWebServer {
           this.sendError(res, 400, "invalid conversation id");
           return;
         }
-        this.sendJson(res, readConversationHistory(conversationId));
+        this.sendJson(
+          res,
+          await readConversationHistory(conversationId, AgentManager.getInstance().getHarness()),
+        );
         return;
       }
 

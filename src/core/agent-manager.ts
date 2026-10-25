@@ -241,7 +241,7 @@ export class AgentManager {
   private recoveryRetryAt = 0;
   /** settings 派生缓存：models 原子替换后自动失效 */
   private settingsFor?: { models: MutableModels; value: HarnessSettings };
-  /** init({resume:false}) 时为 false：等 SchedulerManager.start 完成后再 resume */
+  /** 宿主是否已放行 resume；故障重建的新 Harness 沿用该意图 */
   private autoResume = true;
   /** 当前 harness 是否已 resume（避免重复调用/观测） */
   private resumed = false;
@@ -379,10 +379,12 @@ export class AgentManager {
 
   /** 启动 gate 开启后恢复 durable 调度（六期启动顺序：init→scheduler.start→resume）。 */
   public resume(): void {
+    // 先记录宿主动作：即使此刻 harness 正在故障重建，新实例也必须恢复，
+    // 不能把启动期的 resume=false 永久沿用到重建后的 Harness。
+    this.autoResume = true;
     if (!this.harness || this.resumed) return;
     this.harness.resume();
     this.resumed = true;
-    this.autoResume = true; // 故障重建后的新 Harness 直接恢复
     logger.info("AgentManager", "Agent Harness resumed");
   }
 
@@ -439,6 +441,8 @@ export class AgentManager {
       await storage.close(BACKGROUND_CONTEXT).catch(() => {});
       throw err;
     }
+    // 新 Harness 尚未 resume；旧实例的 resumed 状态不能泄漏到这一代。
+    this.resumed = false;
     // 先挂监听再 resume：open/resume 期间失败同样能被观察到
     this.watchSessionFailure(harness);
     try {
@@ -538,6 +542,7 @@ export class AgentManager {
     // Conversation 句柄绑定在已失败的 Session 上，不能继续复用；
     // conversationToAgent 来自业务库，跨 Session 重建仍然有效。
     this.harness = undefined;
+    this.resumed = false;
     this.conversations.clear();
   }
 
@@ -585,6 +590,7 @@ export class AgentManager {
       this.storage = undefined;
       this.harness = undefined;
       this.resumed = false;
+      this.autoResume = false;
       this.activeChats.clear();
     }
   }

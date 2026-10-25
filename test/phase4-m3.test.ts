@@ -2,6 +2,17 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdirSync } from "node:fs";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import {
+  createModels,
+  type AssistantMessage,
+  type UserMessage,
+} from "@earendil-works/pi-ai";
+import {
+  createRegistry,
+  Harness,
+  MemoryStorage,
+} from "@earendil-works/pi-durable";
 
 import { readConversationHistory, searchConversations } from "../src/server/session-history.ts";
 import { DatabaseManager } from "../src/database/index.ts";
@@ -37,13 +48,65 @@ describe("phase4: 审计过滤 + 分页", () => {
 });
 
 describe("phase4: 会话历史只读读取", () => {
-  test("库不存在时返回空历史 (不抛错)", () => {
-    // getBotPaths 读 process.cwd() 的 .bot/conversations.sqlite; 测试 cwd
-    // 无该文件 → 空结果而非异常 (浏览页不阻断语义)
-    const hist = readConversationHistory(99999);
+  test("Harness 不存在时返回空历史 (不抛错)", async () => {
+    const hist = await readConversationHistory(99999);
     expect(hist.messages).toEqual([]);
     expect(hist.truncated).toBe(false);
-    expect(searchConversations("不存在的内容xyz")).toEqual([]);
+    expect(await searchConversations("不存在的内容xyz")).toEqual([]);
+  });
+
+  test("经 Conversation API 读取当前活动 transcript 并搜索", async () => {
+    const storage = new MemoryStorage();
+    const harness = await Harness.open(
+      storage,
+      { models: createModels(), registry: createRegistry() },
+      BACKGROUND_CONTEXT,
+    );
+    try {
+      const root = await harness.root(BACKGROUND_CONTEXT);
+      const user: UserMessage = {
+        role: "user",
+        content: "alpha question",
+        timestamp: Date.now(),
+      };
+      const assistant: AssistantMessage = {
+        role: "assistant",
+        content: [{ type: "text", text: "beta answer" }],
+        api: "openai-completions",
+        provider: "test",
+        model: "test-model",
+        usage: {
+          input: 1,
+          output: 1,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 2,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      };
+      await root.commit(
+        (tx) => tx.appendEntry(root.id, { kind: "message", model: [user] }),
+        BACKGROUND_CONTEXT,
+      );
+      await root.commit(
+        (tx) => tx.appendEntry(root.id, { kind: "message", model: [assistant] }),
+        BACKGROUND_CONTEXT,
+      );
+      await root.reset("fresh context", BACKGROUND_CONTEXT);
+
+      const history = await readConversationHistory(Number(root.id), harness);
+      expect(history.messages.map((m) => m.text)).toEqual(["fresh context"]);
+      expect(history.messages.some((m) => m.text === "alpha question")).toBe(false);
+
+      const hits = await searchConversations("fresh", harness, [Number(root.id)]);
+      expect(hits).toEqual([
+        { conversationId: Number(root.id), snippet: "fresh context" },
+      ]);
+    } finally {
+      await harness.close(BACKGROUND_CONTEXT);
+    }
   });
 });
 
