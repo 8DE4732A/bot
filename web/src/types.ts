@@ -51,7 +51,8 @@ export interface Agent {
 
 export interface Channel {
   id: string;
-  type: "terminal" | "wecom" | "weixin" | "qq" | "feishu" | "telegram";
+  /** 渠道类型（由后端 /api/channel-types 注册表定义，前端不再枚举） */
+  type: string;
   name: string;
   enabled: boolean;
   boundAgentId: string;
@@ -59,15 +60,65 @@ export interface Channel {
   updatedAt: number;
 }
 
+export type ChannelFieldType = "string" | "secret" | "boolean" | "list" | "select";
+
+export interface ChannelFieldDescriptor {
+  key: string;
+  label: string;
+  type: ChannelFieldType;
+  required?: boolean;
+  section?: "basic" | "access" | "advanced";
+  options?: { value: string; label: string }[];
+  placeholder?: string;
+  hint?: string;
+  maxItems?: number;
+  defaultValue?: string | boolean | string[];
+}
+
+export interface ChannelTypeDescriptor {
+  type: string;
+  label: string;
+  description: string;
+  managedBy: "manager" | "cli";
+  creatable: boolean;
+  deletable: boolean;
+  credentialHint?: string;
+  credentials: ChannelFieldDescriptor[];
+  capabilities: {
+    groupChat: boolean;
+    mediaInbound: string[];
+    mediaOutbound: string[];
+    passiveReply: boolean;
+    typing: boolean;
+    streaming: boolean;
+    markdown: "full" | "limited" | "plain";
+    maxMessageBytes: number;
+  };
+  auth: {
+    kind: "qr";
+    label: string;
+    pollIntervalMs: number;
+    hint?: string;
+    readyFields?: string[];
+  } | null;
+}
+
 export interface ChannelHealth {
   ok: boolean;
   detail?: string;
+  lastInboundAt?: number;
+  lastSendAt?: number;
 }
 
-export interface WeixinQrLogin {
+export interface ChannelAuthStart {
   qrcode: string;
-  qrcodeImgContent: string;
+  qrcodeImgContent?: string;
   dataUrl?: string;
+}
+
+export interface ChannelAuthPoll {
+  status: string;
+  redirectHost?: string;
 }
 
 export type SkillKind = "extension" | "skill" | "mcp";

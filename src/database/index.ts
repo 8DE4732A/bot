@@ -15,6 +15,11 @@ export class DatabaseManager {
   /** 显式事务进行中：IO 错误时只回滚/重开，绝不透明重试语句 */
   private inTransaction = false;
 
+  /** 业务库文件路径（数据目录 = dirname；渠道持久化状态与数据库同源，测试天然隔离） */
+  public get dbPath(): string {
+    return this.path;
+  }
+
   constructor(dbPath?: string) {
     const path = dbPath || getBotPaths().dbFile;
     this.path = path;

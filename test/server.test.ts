@@ -5,6 +5,8 @@ import { AdminWebServer } from "../src/server/server.ts";
 import { DatabaseManager } from "../src/database/index.ts";
 import { DatabaseStore } from "../src/config/database-store.ts";
 import { logger } from "../src/utils/logger.ts";
+import { registerChannelType } from "../src/channels/registry.ts";
+import type { ChannelTypeDescriptor } from "../src/channels/descriptor.ts";
 
 const testPort = 3199;
 // 隔离: 单例指向临时目录, 避免测试写进真实 cwd 的 .bot/
@@ -342,10 +344,9 @@ describe("AdminWebServer API & BYOK", () => {
 describe("AdminWebServer 渠道生命周期 (POST 热替换 / DELETE 回收)", () => {
   const testPort = 3199; // 复用上一个 describe 的 AdminWebServer 实例 (已 start)
 
-  it("weixin 渠道无凭据保存 → start 失败返回 500 且不留僵尸注册", async () => {
-    // weixin.start() 无凭据必然抛错 (确定性离线路径): POST 必须如实 500,
-    // 且 adapter 已从 manager 注销 (B-R5-1 回归守护: epoch set 丢失会让
-    // restartChannel 无限重启, 该请求永不响应——超时即失败)
+  it("weixin 渠道无凭据保存 → 待扫码状态 (200)，健康检查提示扫码", async () => {
+    // 未扫码不是配置错误：保存成功，渠道进入 pendingAuth；前端可立即拉起二维码。
+    // 扫码确认后 ChannelManager 用新凭据热重启（不再出现「saved but start failed」）。
     const res = await fetch(`http://127.0.0.1:${testPort}/api/channels`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -358,7 +359,13 @@ describe("AdminWebServer 渠道生命周期 (POST 热替换 / DELETE 回收)", (
         credentials: {},
       }),
     }).then((r) => r.status);
-    expect(res).toBe(500);
+    expect(res).toBe(200);
+
+    const health = await (
+      await fetch(`http://127.0.0.1:${testPort}/api/channels/lifecycle-weixin/health`)
+    ).json();
+    expect(health.ok).toBe(false);
+    expect(String(health.detail)).toContain("扫码");
   });
 
   it("terminal-main 编辑放行 (禁新建但可改绑定), DELETE 受保留项保护", async () => {
@@ -399,8 +406,186 @@ describe("AdminWebServer 渠道生命周期 (POST 热替换 / DELETE 回收)", (
     expect(del.status).toBe(200);
     const list = await (await fetch(`http://127.0.0.1:${testPort}/api/channels`)).json();
     expect(list.find((c: any) => c.id === "lifecycle-weixin")).toBeUndefined();
+  });
 
-    // 全部 API 测试结束: 只 stop server。
+  it("GET /api/channel-types 返回白名单元数据（无函数/凭据）", async () => {
+    const res = await fetch(`http://127.0.0.1:${testPort}/api/channel-types`);
+    expect(res.status).toBe(200);
+    const types = await res.json();
+    const weixin = types.find((t: any) => t.type === "weixin");
+    expect(weixin.auth?.kind).toBe("qr");
+    expect(weixin.auth?.start).toBeUndefined();
+    expect(weixin.create).toBeUndefined();
+    const terminal = types.find((t: any) => t.type === "terminal");
+    expect(terminal.managedBy).toBe("cli");
+    expect(terminal.creatable).toBe(false);
+  });
+
+  it("未知渠道类型 400；凭据脱敏与掩码保旧值", async () => {
+    const bad = await fetch(`http://127.0.0.1:${testPort}/api/channels`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: "unknown-type",
+        name: "x",
+        type: "not-a-channel",
+        boundAgentId: "agent-default",
+        credentials: {},
+      }),
+    });
+    expect(bad.status).toBe(400);
+
+    const create = await fetch(`http://127.0.0.1:${testPort}/api/channels`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: "secret-weixin",
+        name: "secret test",
+        type: "weixin",
+        boundAgentId: "agent-default",
+        enabled: false,
+        credentials: { token: "tok-secret", allowFrom: ["u1"] },
+      }),
+    });
+    expect(create.status).toBe(200);
+
+    const listed = await (await fetch(`http://127.0.0.1:${testPort}/api/channels`)).json();
+    const masked = listed.find((c: any) => c.id === "secret-weixin");
+    expect(masked.credentials.token).toBe("••••");
+    expect(masked.credentials.allowFrom).toEqual(["u1"]);
+
+    const resave = await fetch(`http://127.0.0.1:${testPort}/api/channels`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: "secret-weixin",
+        name: "secret test",
+        type: "weixin",
+        boundAgentId: "agent-default",
+        enabled: false,
+        credentials: { token: "••••", allowFrom: ["u2"] },
+      }),
+    });
+    expect(resave.status).toBe(200);
+    const stored = new DatabaseStore().getChannel("secret-weixin")!;
+    expect(stored.credentials.token).toBe("tok-secret");
+    expect(stored.credentials.allowFrom).toEqual(["u2"]);
+
+    await fetch(`http://127.0.0.1:${testPort}/api/channels?id=secret-weixin`, { method: "DELETE" });
+  });
+
+  it("旧 QR 路由别名保留：未知渠道 404、停用渠道 400", async () => {
+    const missing = await fetch(`http://127.0.0.1:${testPort}/api/channels/no-such/qr-login`, {
+      method: "POST",
+    });
+    expect(missing.status).toBe(404);
+
+    const create = await fetch(`http://127.0.0.1:${testPort}/api/channels`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: "qr-disabled",
+        name: "qr disabled",
+        type: "weixin",
+        boundAgentId: "agent-default",
+        enabled: false,
+        credentials: {},
+      }),
+    });
+    expect(create.status).toBe(200);
+    const disabled = await fetch(`http://127.0.0.1:${testPort}/api/channels/qr-disabled/qr-login`, {
+      method: "POST",
+    });
+    expect(disabled.status).toBe(400);
+    await fetch(`http://127.0.0.1:${testPort}/api/channels?id=qr-disabled`, { method: "DELETE" });
+  });
+
+  it("QR 认证会话绑定发起时配置：编辑后旧二维码确认返回 409", async () => {
+    let qrSeq = 0;
+    const dispose = registerChannelType({
+      type: "fake-auth",
+      label: "Fake auth",
+      description: "test",
+      managedBy: "manager",
+      creatable: true,
+      deletable: true,
+      credentials: [],
+      capabilities: {
+        groupChat: false,
+        mediaInbound: [],
+        mediaOutbound: [],
+        passiveReply: false,
+        typing: false,
+        streaming: false,
+        markdown: "plain",
+        maxMessageBytes: 1000,
+      },
+      create: (config) => ({
+        id: config.id,
+        type: config.type,
+        name: config.name,
+        start: async () => {},
+        stop: async () => {},
+        sendMessage: async () => {},
+      }),
+      auth: {
+        kind: "qr",
+        label: "test QR",
+        pollIntervalMs: 1000,
+        start: async () => ({ qrcode: `fake-qr-${++qrSeq}` }),
+        poll: async () => ({ status: "confirmed", credentials: { token: "new-token" } }),
+      },
+    } as ChannelTypeDescriptor);
+
+    try {
+      const save = (name: string) =>
+        fetch(`http://127.0.0.1:${testPort}/api/channels`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: "fake-auth-ch",
+            name,
+            type: "fake-auth",
+            boundAgentId: "agent-default",
+            enabled: true,
+            credentials: {},
+          }),
+        });
+      expect((await save("first")).status).toBe(200);
+
+      const start = await (
+        await fetch(`http://127.0.0.1:${testPort}/api/channels/fake-auth-ch/auth/start`, {
+          method: "POST",
+        })
+      ).json();
+      expect(start.qrcode).toBe("fake-qr-1");
+
+      await new Promise((r) => setTimeout(r, 5));
+      expect((await save("edited")).status).toBe(200);
+      const stale = await fetch(
+        `http://127.0.0.1:${testPort}/api/channels/fake-auth-ch/auth/poll?qrcode=fake-qr-1`,
+      );
+      expect(stale.status).toBe(409);
+
+      const start2 = await (
+        await fetch(`http://127.0.0.1:${testPort}/api/channels/fake-auth-ch/auth/start`, {
+          method: "POST",
+        })
+      ).json();
+      const ok = await (
+        await fetch(
+          `http://127.0.0.1:${testPort}/api/channels/fake-auth-ch/auth/poll?qrcode=${start2.qrcode}`,
+        )
+      ).json();
+      expect(ok.status).toBe("confirmed");
+      expect(new DatabaseStore().getChannel("fake-auth-ch")?.credentials.token).toBe("new-token");
+      await fetch(`http://127.0.0.1:${testPort}/api/channels?id=fake-auth-ch`, { method: "DELETE" });
+    } finally {
+      dispose();
+    }
+  });
+
+  it("所有 API 测试结束：停止 server", async () => {
     // 不要删除 testHome：DatabaseManager 单例可能绑定到这里的 bot.sqlite，
     // 其他测试套件仍在共享它（CLAUDE.md 测试纪律；删除会导致确定性 disk I/O error）。
     await server.stop();

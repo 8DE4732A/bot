@@ -51,7 +51,8 @@ export interface AgentDefinition {
 
 export interface ChannelInstanceConfig {
   id: string;
-  type: "terminal" | "wecom" | "weixin" | "qq" | "feishu" | "telegram";
+  /** 渠道类型（注册表 key；合法性由 ChannelRegistry 在 API 边界校验） */
+  type: string;
   name: string;
   enabled: boolean;
   boundAgentId: string;

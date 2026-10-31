@@ -135,6 +135,7 @@ export class NotificationDispatcher {
           payload.target.channelInstanceId,
           payload.target.peerId,
           content,
+          { agentId: payload.agentId },
         );
         if (delivered) return { delivered: true, channel: payload.target.channelInstanceId };
       } catch (err) {

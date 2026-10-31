@@ -1,8 +1,7 @@
 import { logger } from "../../utils/logger.ts";
 import type { ChannelAdapter, InboundMessage, MediaAttachment } from "../base.ts";
-import { InboundPipeline } from "../runtime/dispatch.ts";
-import { ChannelManager } from "../manager.ts";
-import { startTypingHeartbeat } from "../runtime/typing.ts";
+import type { ChannelAdapterDeps } from "../descriptor.ts";
+import { createChannelInboundPipeline, createTypingController } from "../runtime/dispatch.ts";
 
 export interface TelegramCredentials {
   botToken?: string;
@@ -31,17 +30,25 @@ export class TelegramChannelAdapter implements ChannelAdapter {
   markdownMode = "plain" as const;
 
   private credentials: TelegramCredentials;
+  private deps: ChannelAdapterDeps;
   private botUsername = "";
   private botUserId = "";
-  private pipeline?: InboundPipeline;
+  private pipeline?: ReturnType<typeof createChannelInboundPipeline>;
   private pollAbort?: AbortController;
   private pollLoop?: Promise<void>;
-  private typingPeers = new Map<string, () => void>();
+  private lastInboundAt?: number;
+  private lastSendAt?: number;
 
-  constructor(id: string, name: string, credentials: TelegramCredentials) {
+  constructor(
+    id: string,
+    name: string,
+    credentials: TelegramCredentials,
+    deps: ChannelAdapterDeps,
+  ) {
     this.id = id;
     this.name = name;
     this.credentials = credentials;
+    this.deps = deps;
   }
 
   public async start(): Promise<void> {
@@ -53,19 +60,10 @@ export class TelegramChannelAdapter implements ChannelAdapter {
     this.botUsername = String(me.username ?? "");
     this.botUserId = String(me.id ?? "");
 
-    this.pipeline = new InboundPipeline({
+    this.pipeline = createChannelInboundPipeline({
       channelId: this.id,
-      dispatch: (msg) => ChannelManager.getInstance().dispatchAndReply(msg),
-      startTyping: (peerId) => {
-        const existing = this.typingPeers.get(peerId);
-        if (existing) return existing;
-        const stop = startTypingHeartbeat(() => this.sendChatAction(peerId));
-        this.typingPeers.set(peerId, stop);
-        return () => {
-          this.typingPeers.delete(peerId);
-          stop();
-        };
-      },
+      runtime: this.deps.runtime,
+      startTyping: createTypingController((peerId) => this.sendChatAction(peerId)),
     });
 
     // 轮询循环常驻 (退出码经废弃实例 stop 中断); 记录在实例上供 stop 等待
@@ -91,14 +89,30 @@ export class TelegramChannelAdapter implements ChannelAdapter {
       text: content,
       // 不带 parse_mode: markdownMode=plain, 内容原样可达
     });
+    this.lastSendAt = Date.now();
   }
 
-  public async healthCheck(): Promise<{ ok: boolean; detail?: string }> {
+  public async healthCheck(): Promise<{
+    ok: boolean;
+    detail?: string;
+    lastInboundAt?: number;
+    lastSendAt?: number;
+  }> {
     try {
       const me = await this.callApi<Record<string, any>>("getMe");
-      return { ok: true, detail: `@${me.username ?? "?"}` };
+      return {
+        ok: true,
+        detail: `@${me.username ?? "?"}`,
+        lastInboundAt: this.lastInboundAt,
+        lastSendAt: this.lastSendAt,
+      };
     } catch (err) {
-      return { ok: false, detail: err instanceof Error ? err.message : String(err) };
+      return {
+        ok: false,
+        detail: err instanceof Error ? err.message : String(err),
+        lastInboundAt: this.lastInboundAt,
+        lastSendAt: this.lastSendAt,
+      };
     }
   }
 
@@ -190,12 +204,15 @@ export class TelegramChannelAdapter implements ChannelAdapter {
       channelInstanceId: this.id,
       peerId: chatId,
       senderName: msg.from?.first_name ?? msg.chat?.title,
+      senderId: msg.from?.id != null ? String(msg.from.id) : undefined,
       content: String(msg.text ?? msg.caption ?? ""),
       messageId: `${chatId}:${msg.message_id}`,
+      receivedAt: Date.now(),
       conversationType: msg.chat?.type === "group" || msg.chat?.type === "supergroup" ? "group" : "direct",
       ...(attachments.length > 0 ? { attachments } : {}),
       raw: msg,
     };
+    this.lastInboundAt = inbound.receivedAt;
     await this.pipeline?.submit(inbound);
   }
 

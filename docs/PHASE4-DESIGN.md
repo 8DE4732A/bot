@@ -245,7 +245,7 @@ interface CommandResult {
 
 ### 6.3 结构性约定
 
-- `CHANNEL_FORM_SCHEMAS` 泛化为全局 schema 驱动表单机制（schema 后端常量表 + @bot-core 前端共享，零配置文件原则不变）
+- `CHANNEL_FORM_SCHEMAS` 泛化为全局 schema 驱动表单机制（schema 后端常量表 + @bot-core 前端共享，零配置文件原则不变）——**已由渠道平台化落地**：见 `docs/CHANNEL-PLATFORM.md`（后端 `ChannelTypeDescriptor` + `GET /api/channel-types` 驱动前端）
 - `web/src/types.ts` 加 drift 检测测试（对照后端 API 定义），不做全量代码生成
 - 统一 PageHeader 插槽 + Modal 焦点还原（useModalBehavior）
 

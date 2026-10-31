@@ -1,10 +1,13 @@
 import { DatabaseStore } from "../../config/database-store.ts";
 import { logger } from "../../utils/logger.ts";
 import type { InboundMessage } from "../base.ts";
+import type { ChannelDispatchRuntime } from "../descriptor.ts";
+import { compileChannelAccess, type ChannelAccessCheck } from "../access-policy.ts";
 import { MessageDeduplicator } from "./dedupe.ts";
 import { downloadMedia } from "./media-cache.ts";
 import { LoopGuard } from "./loop-guard.ts";
 import { MessageCoalescer } from "./coalesce.ts";
+import { startTypingHeartbeat } from "./typing.ts";
 
 export interface InboundPipelineOptions {
   channelId: string;
@@ -45,13 +48,21 @@ export class InboundPipeline {
   private readonly dedupe = new MessageDeduplicator();
   private readonly loopGuard: LoopGuard;
   private readonly coalescer?: MessageCoalescer<string, InboundMessage>;
-  private readonly store = new DatabaseStore();
+  /** 凭据只在 adapter 重启时变化；pipeline 随 adapter 重建，故编译一次即可 */
+  private readonly accessCheck: ChannelAccessCheck;
   /** pre-coalesce 限流: 入站事件滑动窗 (per-peer)——防抖前的洪水第一道闸 */
   private inboundEvents = new Map<string, number[]>();
   private lastRateSweep = 0;
 
   constructor(private readonly options: InboundPipelineOptions) {
     this.loopGuard = new LoopGuard(options.loopGuard);
+    let credentials: Record<string, unknown> | undefined;
+    try {
+      credentials = new DatabaseStore().getChannel(options.channelId)?.credentials;
+    } catch {
+      // 配置读取失败不放大为吞消息 (终端等本地渠道无 credentials)
+    }
+    this.accessCheck = compileChannelAccess(credentials);
     if (options.enableCoalesce !== false) {
       this.coalescer = new MessageCoalescer<string, InboundMessage>(
         {
@@ -179,16 +190,16 @@ export class InboundPipeline {
    *   陌生人成本防护由 loop-guard 熔断兜底; 需要强隔离时配置 allowFrom。
    */
   private accessAllowed(message: InboundMessage): boolean {
-    let allowFrom: unknown;
-    try {
-      const config = this.store.getChannel(this.options.channelId);
-      allowFrom = config?.credentials?.allowFrom;
-    } catch {
-      return true; // 配置读取失败不放大为吞消息 (终端等本地渠道无 credentials)
-    }
-    if (Array.isArray(allowFrom) && allowFrom.length > 0) {
-      if (allowFrom.map((v) => String(v)).includes(message.peerId)) return true;
-      logger.debug("ChannelPipeline", `[${this.options.channelId}] Peer ${message.peerId} not in allowFrom; dropped`);
+    const verdict = this.accessCheck({
+      peerId: message.peerId,
+      conversationType: message.conversationType,
+      senderId: message.senderId,
+    });
+    if (!verdict.allowed) {
+      logger.debug(
+        "ChannelPipeline",
+        `[${this.options.channelId}] Dropped (${verdict.scope}): ${verdict.reason}`,
+      );
       return false;
     }
     return true;
@@ -228,3 +239,52 @@ export class InboundPipeline {
 }
 
 type MediaAttachmentResolved = InboundMessage["attachments"] extends (infer T)[] | undefined ? T : never;
+
+/**
+ * per-peer typing 心跳去重（同 peer 重复 start 复用同一个 stop 函数）。
+ * 统一放在运行时，避免每个 adapter 各写一份 typingPeers Map。
+ */
+export function createTypingController(
+  send: (peerId: string) => Promise<void>,
+  intervalMs = 5_000,
+  stop?: (peerId: string) => Promise<void>,
+): (peerId: string) => () => void {
+  const peers = new Map<string, () => void>();
+  return (peerId: string) => {
+    const existing = peers.get(peerId);
+    if (existing) return existing;
+    const stopHeartbeat = startTypingHeartbeat(() => send(peerId), intervalMs);
+    const stopAll = () => {
+      stopHeartbeat();
+      void stop?.(peerId).catch(() => {});
+    };
+    peers.set(peerId, stopAll);
+    return () => {
+      peers.delete(peerId);
+      stopAll();
+    };
+  };
+}
+
+/**
+ * 渠道 adapter 的统一入站管道装配（替代各 adapter 内重复的 new InboundPipeline）。
+ * dispatchOverride 用于流式定制（企微）：缺省走 runtime.dispatchAndReply。
+ */
+export function createChannelInboundPipeline(args: {
+  channelId: string;
+  runtime: ChannelDispatchRuntime;
+  startTyping?: (peerId: string) => () => void;
+  enableCoalesce?: boolean;
+  coalesceQuietMs?: number;
+  loopGuard?: { windowMs?: number; maxEvents?: number };
+  dispatchOverride?: (message: InboundMessage) => Promise<void>;
+}): InboundPipeline {
+  return new InboundPipeline({
+    channelId: args.channelId,
+    dispatch: args.dispatchOverride ?? ((msg) => args.runtime.dispatchAndReply(msg)),
+    startTyping: args.startTyping,
+    enableCoalesce: args.enableCoalesce,
+    coalesceQuietMs: args.coalesceQuietMs,
+    loopGuard: args.loopGuard,
+  });
+}

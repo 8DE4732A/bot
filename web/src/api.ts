@@ -4,7 +4,10 @@ import type {
   AuditPage,
   ChatChunk,
   Channel,
+  ChannelAuthPoll,
+  ChannelAuthStart,
   ChannelHealth,
+  ChannelTypeDescriptor,
   DurableTaskInfo,
   McpServer,
   ModelProvider,
@@ -16,7 +19,6 @@ import type {
   SessionSearchHit,
   Skill,
   SystemStatus,
-  WeixinQrLogin,
   WorkspaceSkillSnapshot,
 } from "./types";
 
@@ -72,10 +74,20 @@ function handle401(res: Response): void {
   window.location.reload();
 }
 
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     handle401(res);
-    throw new Error(await resErrorMessage(res));
+    throw new ApiError(await resErrorMessage(res), res.status);
   }
   return res.json() as Promise<T>;
 }
@@ -128,6 +140,7 @@ export const api = {
       body: JSON.stringify(req),
     }),
 
+  listChannelTypes: () => request<ChannelTypeDescriptor[]>("/api/channel-types"),
   listChannels: () => request<Channel[]>("/api/channels"),
   saveChannel: (c: Partial<Channel> & { id: string }) =>
     request<{ success: boolean }>("/api/channels", {
@@ -139,11 +152,11 @@ export const api = {
     request<{ success: boolean }>(`/api/channels?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
   channelHealth: (id: string) =>
     request<ChannelHealth>(`/api/channels/${encodeURIComponent(id)}/health`),
-  weixinQrLogin: (id: string) =>
-    request<WeixinQrLogin>(`/api/channels/${encodeURIComponent(id)}/qr-login`, { method: "POST" }),
-  weixinQrStatus: (id: string, qrcode: string, redirectHost?: string) =>
-    request<{ status: string; redirectHost?: string }>(
-      `/api/channels/${encodeURIComponent(id)}/qr-status?qrcode=${encodeURIComponent(qrcode)}${redirectHost ? `&redirect_host=${encodeURIComponent(redirectHost)}` : ""}`,
+  startChannelAuth: (id: string) =>
+    request<ChannelAuthStart>(`/api/channels/${encodeURIComponent(id)}/auth/start`, { method: "POST" }),
+  pollChannelAuth: (id: string, qrcode: string, redirectHost?: string) =>
+    request<ChannelAuthPoll>(
+      `/api/channels/${encodeURIComponent(id)}/auth/poll?qrcode=${encodeURIComponent(qrcode)}${redirectHost ? `&redirect_host=${encodeURIComponent(redirectHost)}` : ""}`,
     ),
 
   listSkills: () => request<Skill[]>("/api/skills"),

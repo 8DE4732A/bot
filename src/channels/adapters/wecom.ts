@@ -3,8 +3,8 @@ import { WSClient } from "@wecom/aibot-node-sdk";
 import type { WsFrameHeaders } from "@wecom/aibot-node-sdk";
 import { logger } from "../../utils/logger.ts";
 import type { ChannelAdapter, ChannelHealth, InboundMessage, MediaAttachment } from "../base.ts";
-import { InboundPipeline } from "../runtime/dispatch.ts";
-import { ChannelManager } from "../manager.ts";
+import type { ChannelAdapterDeps } from "../descriptor.ts";
+import { createChannelInboundPipeline } from "../runtime/dispatch.ts";
 import { storeMediaBytes, withDownloadSlot } from "../runtime/media-cache.ts";
 
 export interface WeComCredentials {
@@ -42,24 +42,34 @@ export class WeComChannelAdapter implements ChannelAdapter {
   markdownMode = "full" as const;
 
   private credentials: WeComCredentials;
-  private pipeline?: InboundPipeline;
+  private deps: ChannelAdapterDeps;
+  private pipeline?: ReturnType<typeof createChannelInboundPipeline>;
   private ws?: WSClient;
   private authenticated = false;
+  private lastInboundAt?: number;
+  private lastSendAt?: number;
 
-  constructor(id: string, name: string, credentials: WeComCredentials) {
+  constructor(
+    id: string,
+    name: string,
+    credentials: WeComCredentials,
+    deps: ChannelAdapterDeps,
+  ) {
     this.id = id;
     this.name = name;
     this.credentials = credentials;
+    this.deps = deps;
   }
 
   public async start(): Promise<void> {
     if (!this.credentials.botId || !this.credentials.secret) {
       throw new Error(`channel '${this.id}' is missing credentials.botId/secret`);
     }
-    this.pipeline = new InboundPipeline({
+    this.pipeline = createChannelInboundPipeline({
       channelId: this.id,
+      runtime: this.deps.runtime,
       // 企微走流式定制 dispatch (不走 dispatchAndReply 的整段投递)
-      dispatch: (msg) => this.dispatchWithStreaming(msg),
+      dispatchOverride: (msg) => this.dispatchWithStreaming(msg),
     });
 
     const ws = new WSClient({
@@ -120,13 +130,14 @@ export class WeComChannelAdapter implements ChannelAdapter {
   public async sendMessage(peerId: string, content: string): Promise<void> {
     this.requireWs();
     await this.ws!.sendMessage(peerId, { msgtype: "markdown", markdown: { content } });
+    this.lastSendAt = Date.now();
   }
 
   /**
    * 被动回复 (aibot_respond_msg, 需原帧 req_id): 以流式帧 finish 一次成文。
    * 失败 (5s 窗口过/队列丢帧) 返回 false → 网关回退主动推送。
    */
-  public async sendReply(peerId: string, content: string, replyContext: unknown): Promise<boolean> {
+  public async sendReply(_peerId: string, content: string, replyContext: unknown): Promise<boolean> {
     const ctx = replyContext as ReplyContext | undefined;
     if (!ctx?.frame || !this.ws) return false;
     try {
@@ -134,6 +145,7 @@ export class WeComChannelAdapter implements ChannelAdapter {
         msgtype: "stream",
         stream: { id: ctx.msgId, finish: true, content },
       });
+      this.lastSendAt = Date.now();
       return true;
     } catch (err) {
       logger.debug("WeComAdapter", `[${this.id}] Passive reply failed (fallback to active send): ${err}`);
@@ -143,8 +155,18 @@ export class WeComChannelAdapter implements ChannelAdapter {
 
   public async healthCheck(): Promise<ChannelHealth> {
     return this.authenticated
-      ? { ok: true, detail: "ws authenticated" }
-      : { ok: false, detail: this.ws ? "ws not authenticated" : "not started" };
+      ? {
+          ok: true,
+          detail: "ws authenticated",
+          lastInboundAt: this.lastInboundAt,
+          lastSendAt: this.lastSendAt,
+        }
+      : {
+          ok: false,
+          detail: this.ws ? "ws not authenticated" : "not started",
+          lastInboundAt: this.lastInboundAt,
+          lastSendAt: this.lastSendAt,
+        };
   }
 
   // ── 内部 ──
@@ -186,13 +208,16 @@ export class WeComChannelAdapter implements ChannelAdapter {
       channelInstanceId: this.id,
       peerId,
       senderName: String(body.from?.userid ?? ""),
+      senderId: body.from?.userid ? String(body.from.userid) : undefined,
       content: text,
       messageId: String(body.msgid ?? ""),
+      receivedAt: Date.now(),
       conversationType: isGroup ? "group" : "direct",
       replyContext: { frame: { headers: frame.headers }, msgId: String(body.msgid ?? ""), chattype: body.chattype },
       ...(attachments ? { attachments } : {}),
       raw: body,
     };
+    this.lastInboundAt = inbound.receivedAt;
     await this.pipeline?.submit(inbound);
   }
 
@@ -204,13 +229,13 @@ export class WeComChannelAdapter implements ChannelAdapter {
    * 最终帧经 splitMessage 分段 (首段随 finish 帧, 余下主动推送)。
    */
   private async dispatchWithStreaming(message: InboundMessage): Promise<void> {
-    const manager = ChannelManager.getInstance();
+    const runtime = this.deps.runtime;
     const ctx = message.replyContext as ReplyContext | undefined;
     const streamId = `botagent-${randomUUID()}`;
 
     // 依赖注入 fallback: 无 replyContext (理论不可达) 或 WS 未就绪 → 分段主动推送
     if (!ctx?.frame || !this.ws) {
-      const answer = await manager.dispatchInbound(message);
+      const answer = await runtime.dispatchInbound(message);
       if (answer) await this.deliverSegmented(message.peerId, answer);
       return;
     }
@@ -218,7 +243,7 @@ export class WeComChannelAdapter implements ChannelAdapter {
     let accumulated = "";
     let lastFlush = 0;
     let streamBroken = false;
-    const answer = await manager.dispatchInbound(message, (chunk) => {
+    const answer = await runtime.dispatchInbound(message, (chunk) => {
       if (streamBroken || !chunk.delta) return;
       accumulated += chunk.delta;
       // 中间刷新的内容超 20480 字节必然被平台拒: 停止流式, 完成后走分段主动推送
@@ -246,6 +271,7 @@ export class WeComChannelAdapter implements ChannelAdapter {
       // 最终帧: 内容在限额内随 finish 帧一次成文; 超限则 finish 帧发提示, 完整内容分段主动推送
       if (Buffer.byteLength(finalText, "utf8") <= STREAM_MAX_CONTENT_BYTES) {
         await this.ws!.replyStream(ctx.frame, streamId, finalText, true);
+        this.lastSendAt = Date.now();
         return;
       }
       await this.ws!.replyStream(ctx.frame, streamId, "回复较长，已分段发送 ↓", true);
@@ -258,8 +284,7 @@ export class WeComChannelAdapter implements ChannelAdapter {
 
   /** 分段主动推送 (复用网关的降级/分段管线, 无被动回复凭据) */
   private async deliverSegmented(peerId: string, content: string): Promise<void> {
-    const manager = ChannelManager.getInstance();
-    const ok = await manager.deliverOutbound(this.id, peerId, content);
+    const ok = await this.deps.runtime.deliverOutbound(this.id, peerId, content);
     if (!ok) throw new Error(`channel '${this.id}' adapter not available for outbound delivery`);
   }
 }

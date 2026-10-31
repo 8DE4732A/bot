@@ -74,6 +74,8 @@ export interface ChannelHealthEvent {
   channelId: string;
   ok: boolean;
   detail?: string;
+  lastInboundAt?: number;
+  lastSendAt?: number;
   checkedAt: number;
 }
 

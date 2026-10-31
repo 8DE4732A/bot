@@ -2,8 +2,8 @@ import * as lark from "@larksuiteoapi/node-sdk";
 import axios from "axios";
 import { logger } from "../../utils/logger.ts";
 import type { ChannelAdapter, ChannelHealth, InboundMessage, MediaAttachment } from "../base.ts";
-import { InboundPipeline } from "../runtime/dispatch.ts";
-import { ChannelManager } from "../manager.ts";
+import type { ChannelAdapterDeps } from "../descriptor.ts";
+import { createChannelInboundPipeline } from "../runtime/dispatch.ts";
 import { storeMediaStream, withDownloadSlot, type MediaDownloadResult } from "../runtime/media-cache.ts";
 
 export interface FeishuCredentials {
@@ -33,13 +33,22 @@ export class FeishuChannelAdapter implements ChannelAdapter {
 
   private client?: lark.Client;
   private wsClient?: lark.WSClient;
-  private pipeline?: InboundPipeline;
+  private pipeline?: ReturnType<typeof createChannelInboundPipeline>;
   private credentials: FeishuCredentials;
+  private deps: ChannelAdapterDeps;
+  private lastInboundAt?: number;
+  private lastSendAt?: number;
 
-  constructor(id: string, name: string, credentials: FeishuCredentials) {
+  constructor(
+    id: string,
+    name: string,
+    credentials: FeishuCredentials,
+    deps: ChannelAdapterDeps,
+  ) {
     this.id = id;
     this.name = name;
     this.credentials = credentials;
+    this.deps = deps;
   }
 
   public async start(): Promise<void> {
@@ -70,9 +79,9 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       httpInstance: httpInstance as unknown as lark.HttpInstance,
     });
 
-    this.pipeline = new InboundPipeline({
+    this.pipeline = createChannelInboundPipeline({
       channelId: this.id,
-      dispatch: (msg) => ChannelManager.getInstance().dispatchAndReply(msg),
+      runtime: this.deps.runtime,
     });
 
     const dispatcher = new lark.EventDispatcher({}).register({
@@ -114,10 +123,11 @@ export class FeishuChannelAdapter implements ChannelAdapter {
   /** 主动发送 (通知/被动回复超窗兜底): 文本发到 chat_id */
   public async sendMessage(peerId: string, content: string): Promise<void> {
     await this.sendMessageWithType(peerId, "text", JSON.stringify({ text: content }));
+    this.lastSendAt = Date.now();
   }
 
   /** 被动回复: 引用原消息 (群聊中语义更清晰); 失败返回 false 走主动发送 */
-  public async sendReply(peerId: string, content: string, replyContext: unknown): Promise<boolean> {
+  public async sendReply(_peerId: string, content: string, replyContext: unknown): Promise<boolean> {
     const messageId = typeof replyContext === "string" ? replyContext : (replyContext as any)?.messageId;
     if (!messageId || !this.client) return false;
     try {
@@ -125,6 +135,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
         path: { message_id: messageId },
         data: { content: JSON.stringify({ text: content }), msg_type: "text" },
       });
+      this.lastSendAt = Date.now();
       return true;
     } catch (err) {
       logger.debug("FeishuAdapter", `[${this.id}] Passive reply failed, fallback to active send: ${err}`);
@@ -141,10 +152,20 @@ export class FeishuChannelAdapter implements ChannelAdapter {
         data: { app_id: this.credentials.appId, app_secret: this.credentials.appSecret },
       });
       return res?.code === 0 || res?.data?.expire != null
-        ? { ok: true }
-        : { ok: false, detail: `token request failed: ${res?.msg ?? "unknown"}` };
+        ? { ok: true, lastInboundAt: this.lastInboundAt, lastSendAt: this.lastSendAt }
+        : {
+            ok: false,
+            detail: `token request failed: ${res?.msg ?? "unknown"}`,
+            lastInboundAt: this.lastInboundAt,
+            lastSendAt: this.lastSendAt,
+          };
     } catch (err) {
-      return { ok: false, detail: err instanceof Error ? err.message : String(err) };
+      return {
+        ok: false,
+        detail: err instanceof Error ? err.message : String(err),
+        lastInboundAt: this.lastInboundAt,
+        lastSendAt: this.lastSendAt,
+      };
     }
   }
 
@@ -172,14 +193,19 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       channelInstanceId: this.id,
       peerId: chatId,
       senderName: data?.sender?.sender_id?.open_id,
+      senderId: data?.sender?.sender_id?.open_id
+        ? String(data.sender.sender_id.open_id)
+        : undefined,
       content: text,
       messageId: String(message.message_id ?? ""),
+      receivedAt: Date.now(),
       conversationType: message.chat_type === "group" ? "group" : "direct",
       // 飞书被动回复窗口宽松, replyContext 带原消息 id 供 sendReply 引用回复
       replyContext: { messageId: String(message.message_id ?? "") },
       ...(attachments.length > 0 ? { attachments } : {}),
       raw: message,
     };
+    this.lastInboundAt = inbound.receivedAt;
     await this.pipeline?.submit(inbound);
   }
 

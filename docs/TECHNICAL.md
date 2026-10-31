@@ -179,19 +179,19 @@ SandboxedExecutionEnv   pi-durable env 的安全实现 (每个工具轮次由框
 
 ## 5. 二期实现思路
 
-### 5.1 渠道接入（企微 / 微信 / QQ）——核心工作
+### 5.1 渠道接入（渠道平台化）——核心工作
 
-现有扩展点已就绪：`ChannelAdapter.handleWebhook(pathname, query, body)`（管理台把 `GET/POST /api/channel-webhook/<id>` 前置转发，豁免管理台 Host 校验）、工厂注册表（`CHANNEL_TYPES` 加一行）、`dispatchInbound` 路由。企微回调模式的实现路径：
+渠道类型元数据已收敛为声明式注册表（详见 `docs/CHANNEL-PLATFORM.md`）：`src/channels/descriptors/` 每渠道一份 `ChannelTypeDescriptor`（label、凭据字段与 secret、能力位、auth、onDelete、create），`registry.ts` 聚合并由 `GET /api/channel-types` 驱动管理台表单；新增内置渠道只需 adapter + descriptor 一行注册，前后端零枚举改动。
 
-1. **验签**：`handleWebhook` 内做 signature/timestamp/nonce 校验与 AES 解密（凭据在 `channel_instances.credentials`，注意响应脱敏语义——掩码值提交自动还原）
-2. **消息 → Agent**：解析出 peer（用户/群 id）后调 `ChannelManager.dispatchInbound`，会话 key 即 `channelInstanceId:peerId`，串行锁与上下文恢复自动生效
-3. **回复语义**：企微被动回复有 5s 窗口——模型调用通常超时。采用"立即 200 空回 + 主动发送"：`sendMessage` 走企微 API（access_token 缓存在 adapter 实例内，过期刷新）
-4. **需要补的通用设施**（在 ChannelManager 或新 base 类）：
-   - 长**文本分段**：IM 单条消息长度上限，按段落切分排队发送
-   - **防抖合并**：用户连发多条时合并为一次 agent 调用（会话锁天然排队，可在此基础上做窗口合并）
-   - **per-peer 限流**与黑名单（防滥用烧 token）
-   - 媒体消息占位（图片/文件：先存 workspace 再以路径告知 agent）
-5. **部署前提**：webhook 需要公网可达——必须 TLS 反代（nginx/caddy）+ `web_host` 放开；管理台 Host 校验信任集已含本机网卡，反代透传 Host 需评估（建议反代后管理台仍走内网，仅 `/api/channel-webhook/` 暴露公网）
+**adapter 契约**：入站提交 `InboundPipeline`（去重/限流/防抖/媒体/loop-guard 自动获得）；出站实现 `sendMessage`，按需 `sendReply`（被动窗口，失败回退主动发送）、`sendMedia`（出站媒体）、`formatOutbound`（平台排版）、`sendTyping`、`healthCheck`。adapter 通过构造注入的 `ChannelAdapterDeps.runtime` 调 `dispatchInbound`/`dispatchAndReply`/`deliverOutbound`，禁止 import `ChannelManager`（消除循环依赖）。
+
+**生命周期**：`ChannelManager` 统一 start/stop/restart/delete/saveAndRestart + per-channel 锁 + getHealth；server 只做 HTTP 参数校验与审计；terminal 通过 `managedBy: "cli"` 由 CLI 管理。
+
+**出站媒体**：Agent 回复中的独占行 `MEDIA:<path>` 由 `deliverOutbound` 解析；路径必须 realpath 后位于 Agent workspace、禁止 `.bot` 非 workspaces 路径、普通文件、≤128MB、最多 8 个。adapter 负责平台上传：微信 `getuploadurl` + AES-128-ECB + CDN；QQ 内联/分块上传 + `msg_type=7`。
+
+**访问策略**：`dmPolicy`/`groupPolicy`（open/allowlist/disabled）+ `allowFrom`/`groupAllowFrom` 纯函数判定；未配置时保持旧 `allowFrom` 语义。
+
+**回调型渠道**：`ChannelAdapter.handleWebhook(pathname, query, body)` 仍由 `GET/POST /api/channel-webhook/<id>` 前置转发（豁免管理台 Host 校验），adapter 自行验签；适用于未来需要公网回调的老式渠道。
 
 ### 5.2 会话运营
 

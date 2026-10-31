@@ -172,7 +172,7 @@ export interface ChannelAdapter {
 
 ## 5. 管理台与配置
 
-- **渠道表单按 type 差异化**：`CHANNEL_FORM_SCHEMAS`（factory.ts 注册表扩展）声明凭据字段（label/secret 标志/placeholder），McpView 模式复用 `PairsField`；飞书=appId+appSecret、QQ=appId+clientSecret+sandbox、微信=无（扫码流程）、企微=corpId+corpSecret+agentId+token+encodingAESKey
+- **渠道表单按 type 差异化**：`CHANNEL_FORM_SCHEMAS`（factory.ts 注册表扩展）声明凭据字段（label/secret 标志/placeholder），McpView 模式复用 `PairsField`；飞书=appId+appSecret、QQ=appId+clientSecret+sandbox、微信=无（扫码流程）、企微=corpId+corpSecret+agentId+token+encodingAESKey（**已由渠道平台化取代**：后端 descriptor + `GET /api/channel-types`，见 `docs/CHANNEL-PLATFORM.md`）
 - **微信扫码流程**：渠道卡片"扫码登录"按钮 → 后端起 QR 会话 → 前端轮询状态（wait/scaned/confirmed/expired）→ 成功显示绑定账号
 - **连接健康**：渠道卡片显示 adapter `healthCheck()` 结果 + 最近一次入站时间（`channel_sessions.last_active_at` MAX）
 - **消息审计**：channel_instances 维度查看投递账本（成功/失败/重试，参照 hermes delivery_ledger 简化为 `channel_delivery` 表）

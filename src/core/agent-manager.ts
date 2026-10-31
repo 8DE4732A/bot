@@ -28,6 +28,7 @@ import { EventBus } from "./event-bus.ts";
 import { SandboxedExecutionEnv } from "../sandbox/execution-env.ts";
 import { SkillsCatalog } from "../skills/builtin/skills-catalog.ts";
 import { WorkspaceContext } from "../skills/builtin/workspace-context.ts";
+import { ChannelContext } from "../channels/prompt-context.ts";
 import { setAgentIdResolver } from "../skills/agent-scope.ts";
 import { purgeWorkspaceSkills } from "../skills/workspace.ts";
 import { SkillRegistry } from "../skills/registry.ts";
@@ -360,6 +361,7 @@ export class AgentManager {
       // 但必须 install: 会话按名字解析扩展, 选配数组里没有同名注册物会被丢弃
       registry.install(SkillsCatalog);
       registry.install(WorkspaceContext);
+      registry.install(ChannelContext);
       // 六期：durable 模式安装调度任务定义；polling 回滚模式不安装，
       // 遗留 bot.scheduled-prompt 会以 missing_task 停在 blocked，不会执行
       if (this.store.getConfig("scheduler_durable_enabled", "1") !== "0") {

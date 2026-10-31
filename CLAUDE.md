@@ -1,6 +1,6 @@
 # Bot Agent — 基于 pi-durable 的轻量级多 Agent 平台
 
-> 架构详解、pi-durable 框架理解见 **docs/TECHNICAL.md**；二期设计（SKILL/MCP/统一技能模型，已交付）见 **docs/PHASE2-DESIGN.md**；三期设计（多渠道：飞书/QQ/微信/企微，已交付）见 **docs/PHASE3-DESIGN.md**；四期（用户体验：gateway 服务化/TUI 分离/统一命令/管理台 2.0，**已交付**）见 **docs/PHASE4-DESIGN.md**（调研全文在 docs/PHASE4-research/）；五期（工作区技能/AGENTS.md 记忆，**已交付**）见 **docs/PHASE5-DESIGN.md**；六期（Durable 调度与任务生命周期，**已交付**）见 **docs/PHASE6-DESIGN.md**。
+> 架构详解、pi-durable 框架理解见 **docs/TECHNICAL.md**；渠道平台（声明式注册表/出站媒体/访问策略/weixin·qq 协议）见 **docs/CHANNEL-PLATFORM.md**；二期设计（SKILL/MCP/统一技能模型，已交付）见 **docs/PHASE2-DESIGN.md**；三期设计（多渠道：飞书/QQ/微信/企微，已交付）见 **docs/PHASE3-DESIGN.md**；四期（用户体验：gateway 服务化/TUI 分离/统一命令/管理台 2.0，**已交付**）见 **docs/PHASE4-DESIGN.md**（调研全文在 docs/PHASE4-research/）；五期（工作区技能/AGENTS.md 记忆，**已交付**）见 **docs/PHASE5-DESIGN.md**；六期（Durable 调度与任务生命周期，**已交付**）见 **docs/PHASE6-DESIGN.md**。
 
 基于 `@earendil-works/pi-durable` 的多 Agent 对话网关：零配置文件（一切存 SQLite）、双层安全沙盒、多渠道接入（终端 + 企微/微信/QQ 预留）、免密 Web 管理后台。原始需求见 `INTEND.md`（一期目标：完整 agent 能力、沙盒、终端渠道）。
 
@@ -57,6 +57,8 @@ bun run build:binary # build:web + 编译单二进制到 bin/bot（bun build --c
    - `AgentManager.init({resume:false})` → `await SchedulerManager.start()`（init/reconcile/markReady）→ `AgentManager.resume()`；启动失败不得 resume（supervised 下退出 78）。
    - 通知走 `scheduled_task_notifications` outbox（runId 唯一 + claim_token + 退避）；`scheduler.completed` 仅作进程内唤醒。
    - 业务库 migration v6 只增列/表；升级前仍需备份 `conversations.sqlite`（框架 schema v2 不可回退）。
+
+12. **渠道平台化（声明式注册表，2026-10 交付）**：渠道类型元数据只在 `src/channels/descriptors/` 声明一次（label/凭据字段/secret/能力/auth/onDelete/create），`registry.ts` 聚合，`GET /api/channel-types` 驱动管理台；`ChannelAdapter.type`/`ChannelInstanceConfig.type` 为 string，合法性由 registry 在 API 边界 fail-closed。生命周期（start/stop/restart/delete/saveAndRestart + per-channel 锁 + getHealth）统一在 `ChannelManager`，server 只做 HTTP 校验；adapter 通过 `ChannelAdapterDeps.runtime` 构造注入网关，禁止 import manager。出站媒体仅由 `deliverOutbound` 解析 `MEDIA:` 标记（realpath + workspace 包含 + `.bot` 非 workspaces 拒绝 + 128MB/8 个/总计 256MB 上限 + nlink>1 拒绝；校验后以 O_NOFOLLOW fd 读取并比对 dev/ino，adapter 发送内容快照而非路径），adapter 负责 getuploadurl→AES/分片→平台消息。**未做真机联调**：weixin/qq 新能力（出站媒体、群/DM 策略、引用/语音、健康/重连）只经本地模拟与 hermes 对照验证，真实账号协议差异仍是 backlog。
 
 ## 架构
 
@@ -168,21 +170,23 @@ src/
 │   └── loader.ts           扫描 <cwd>/.bot/skills/：SKILL.md → 文档型条目（id=目录名），
 │                           index.ts → 工具型 Extension（现状不变；同 id 冲突 extension 优先）
 ├── channels/
-│   ├── base.ts             ChannelAdapter 契约（id/type/start/stop/sendMessage +
-│   │                       sendReply?/maxMessageBytes?/markdownMode?/sendTyping?/
-│   │                       healthCheck?）+ InboundMessage（媒体附件/replyContext/
-│   │                       messageId 去重键/conversationType）
-│   ├── factory.ts          渠道工厂：CHANNEL_TYPES 注册表 (type → 构造器) 实例化
-│   │                       adapter；新渠道只需实现 ChannelAdapter 并登记一行；
-│   │                       terminal 不经工厂（由 CLI 特殊管理）
-│   ├── manager.ts          ChannelManager 单例：startAll 从数据库配置实例化并启动全部
-│   │                       已启用渠道；按 boundAgentId 路由分发；
-│   │                       dispatchAndReply/deliverOutbound（降级→分段→sendReply
-│   │                       优先、超窗回退 sendMessage）
+│   ├── base.ts             ChannelAdapter 契约（统一消息/媒体/被动回复/typing/
+│   │                       出站媒体 sendMedia/formatOutbound）+ ChannelHealth
+│   ├── descriptor.ts       ChannelTypeDescriptor：label/凭据字段/secret/能力/auth/
+│   │                       onDelete/create（渠道平台的单一真相源）
+│   ├── registry.ts         类型注册表：register/get/list/create；内置 descriptor 自注册
+│   ├── descriptors/        每渠道一份声明（feishu/wecom/qq/weixin/telegram/terminal）
+│   ├── credentials.ts      凭据掩码/归一化/必填校验（secret 空值保旧、list/boolean/select）
+│   ├── access-policy.ts    DM/群策略纯函数（dmPolicy/groupPolicy + allowFrom/groupAllowFrom）
+│   ├── prompt-context.ts   渠道上下文 section（平台排版能力 + MEDIA 出站媒体约定）
+│   ├── manager.ts          渠道生命周期与运行时：per-channel 锁、start/stop/restart/
+│   │                       delete/saveAndRestart/getHealth、dispatchInbound/AndReply、
+│   │                       deliverOutbound（降级→分段→被动回复→出站媒体）、通知寻址
 │   ├── runtime/            渠道运行时（全部渠道共用, 三期 M0）：dedupe（去重）、
 │   │                       coalesce（防抖合并）、segmenter（块级贪心分段, 围栏块
 │   │                       不可切）、markdown（降级）、typing（心跳）、media-cache
-│   │                       （媒体缓存）、loop-guard（防自循环）、dispatch（管道组装,
+│   │                       （媒体缓存）、media-outbound（MEDIA 标记解析 + workspace
+│   │                       路径安全）、loop-guard（防自循环）、dispatch（管道组装,
 │   │                       含四期 slash fast path——dedupe 后/媒体与防抖前, handler
 │   │                       经 setSlashFastPath 注入）
 │   ├── terminal/index.ts   本地 REPL 渠道（terminal-main）+ 斜杠命令；
@@ -194,7 +198,9 @@ src/
 │                           当前上下文 = 本轮 prompt 侧（累计值会虚高，勿改）
 │   └── adapters/           feishu/wecom/qq/weixin/telegram（三期真实实现：飞书/
 │                           企微/QQ 官方 SDK 或官方 API + 微信 iLink 协议自实现 +
-│                           Telegram 基准渠道；全部 WS 长连接/长轮询免公网）
+│                           Telegram 基准渠道；全部 WS 长连接/长轮询免公网）；
+│                           weixin-media.ts / qq-upload.ts 出站媒体上传，
+│                           weixin-protocol.ts / qq-protocol.ts 纯协议函数
 └── server/
     ├── server.ts           AdminWebServer：原生 node:http + REST API（providers/agents/
     │                       channels/skills/audit-logs(过滤+分页)/chat SSE 流式
@@ -255,11 +261,10 @@ QQ=msg_id+msg_seq（群 5min/单聊 60min）、微信=context_token、企微=原
 | 飞书 | `feishu` | appId+appSecret | `@larksuiteoapi/node-sdk` WSClient；媒体经 `im.v1.image/file.get` → storeMediaBytes |
 | 企微智能机器人 | `wecom` | botId+secret | `@wecom/aibot-node-sdk` WS 长连接；**全渠道唯一流式回复**（onChunk → replyStream 800ms 节流全量刷新，断流降级主动推送）；加密媒体 `ws.downloadFile(url, aeskey)` |
 | QQ | `qq` | appId+clientSecret（`sandbox` 可选） | 自实现薄 WS 客户端（token 单飞刷新 → gateway → Hello/Identify/Resume/心跳，语义移植自 hermes qqbot adapter）；REST `/v2/users|groups/{id}/messages` |
-| 微信个人号 | `weixin` | 无字段（**扫码登录**） | iLink Bot API 长轮询（协议移植自 hermes weixin.py）；context_token 落盘、-14 降级 tokenless 重发、AES-128-ECB 媒体；扫码端点 `POST /api/channels/:id/qr-login` |
+| 微信个人号 | `weixin` | 无字段（**扫码登录**） | iLink Bot API 长轮询（协议移植自 hermes weixin.py）；context_token 落盘、-14 降级 tokenless 重发、AES-128-ECB 媒体（入站下载 + 出站 getuploadurl 上传）、引用/语音兜底；通用扫码端点 `POST /api/channels/:id/auth/start`（旧 `/qr-login` 保留别名） |
 | Telegram | `telegram` | botToken | Bot API 长轮询（零依赖基准渠道，验收运行时设施） |
 
-渠道共性：adapter 声明 `maxMessageBytes`/`markdownMode`/`sendReply?`/`sendTyping?`/`healthCheck?`；
-管理台表单按 `CHANNEL_FORM_SCHEMAS`（ChannelsView）声明式渲染凭据字段；微信凭据文件落
+渠道共性：能力（`maxMessageBytes`/`markdownMode`/`sendReply`/`sendMedia`/`sendTyping`/`healthCheck`/流式）由 descriptor 的 `capabilities` 声明；管理台表单由 `GET /api/channel-types` 的凭据字段 schema 动态渲染（前端无渠道枚举）；微信凭据文件落
 `.bot/channels/weixin/<accountId>/`（0600）。**通知兜底只投终端类渠道**（IM peerId 不可跨渠道移植）。
 
 ### 双层沙盒
@@ -291,6 +296,6 @@ QQ=msg_id+msg_seq（群 5min/单聊 60min）、微信=context_token、企微=原
   - **MCP** (`kind: "mcp"`，id=`mcp__<serverId>`)：管理台「MCP 服务」页配置（stdio/HTTP），`McpBridge.sync()` 桥接为动态 Extension；pi-durable 会话按名字解析扩展，registry 同名 install 即刻生效（含既有会话）。
   - **定时任务**（内置技能 `scheduler`）：`schedule_create/list/update/delete` 四工具；任务归属创建它的 Agent（经 `api.conversationId` → `AgentManager.getAgentIdForConversation` 反查，fail-closed）；触发由 `SchedulerManager`（cli 启动）执行，会话 key `scheduler:<taskId>` 天然复用同一 conversation；interval 最小 60s（防高频烧 token）；删除为逻辑删除。**触发结果经事件机制推送渠道**：SchedulerManager publish `scheduler.completed` → NotificationDispatcher 按"任务记录的通知目标（来源渠道+peer）→ Agent 绑定渠道兜底"投递——渠道层寻址与会话无关，会话重置不影响；通知目标依赖真实渠道映射行（`chat` 的 `origin` 参数写入，`getSessionByConversation` 优先非哨兵行）。
   - skills-catalog 本身**不注册进 SkillRegistry**（避免出现在选配列表），但必须在 `AgentManager.init` 显式 `registry.install`——会话按名字解析，缺注册物会被静默丢弃。
-- **新渠道**：实现 `ChannelAdapter` 接口（出站可选声明 `sendReply`/`maxMessageBytes`/`markdownMode`/`sendTyping`/`healthCheck`），在 `factory.ts` 的 `CHANNEL_TYPES` 注册一行；入站走 `InboundPipeline`（渠道运行时自动获得去重/防抖/媒体/防自循环），终点为 `ChannelManager.dispatchAndReply`；渠道实例与 Agent 的绑定关系存 `channel_instances.bound_agent_id`；管理台凭据表单在 `ChannelsView` 的 `CHANNEL_FORM_SCHEMAS` 加声明（secret 字段沿用掩码还原语义）。
-- **测试**：`test/` 下 16 个套件（paths/database/sandbox/skills/server/phase2/scheduler/notifications/phase3/phase4-m0/phase4-m12/phase4-m3/phase5-workspace/durable-tasks/phase6-scheduler 等，216 tests），基于 `bun:test`，多为真实文件系统 + 真实 HTTP 端口的集成测试；server 测试已隔离到临时目录（测试顶部显式 `DatabaseManager.getInstance(临时路径)` + `logger.init(临时目录)`，新增测试套件须沿用此模式，勿写真实 cwd 的 `.bot/`）；**单例被全部套件共享（首个 getInstance 绑定生效），任何套件不得 rmSync 单例库文件所在目录**，否则并行套件会 disk I/O error。
+- **新渠道（渠道平台化）**：实现 `ChannelAdapter`（入站提交 `InboundPipeline`；出站可选 `sendReply`/`sendMedia`/`formatOutbound`/`sendTyping`/`healthCheck`），并在 `src/channels/descriptors/<type>.ts` 声明 `ChannelTypeDescriptor`（label、凭据字段与 secret、能力位、auth、onDelete、`create`），再加进 `descriptors/index.ts`。管理台不再需要改代码：类型下拉、凭据表单、扫码入口、能力提示全部由 `GET /api/channel-types` 驱动。adapter 通过构造注入的 `ChannelAdapterDeps.runtime` 调网关（禁止 import `ChannelManager`）；渠道实例与 Agent 的绑定关系存 `channel_instances.bound_agent_id`。出站媒体约定：Agent 回复中独占一行的 `MEDIA:<workspace 内路径>` 由 `ChannelManager.deliverOutbound` 解析并校验（realpath + workspace 包含 + 禁止 `.bot` 非 workspaces 路径 + 大小/数量上限）。
+- **测试**：`test/` 下 24 个套件（paths/database/sandbox/skills/server/phase2/scheduler/notifications/phase3/phase4-m0/phase4-m12/phase4-m3/phase5-workspace/durable-tasks/phase6-scheduler/channel-registry/channel-access-policy/channel-media/channel-protocol/channel-lifecycle/weixin-adapter/qq-adapter 等，277 tests），基于 `bun:test`，多为真实文件系统 + 真实 HTTP 端口的集成测试；server 测试已隔离到临时目录（测试顶部显式 `DatabaseManager.getInstance(临时路径)` + `logger.init(临时目录)`，新增测试套件须沿用此模式，勿写真实 cwd 的 `.bot/`）；**单例被全部套件共享（首个 getInstance 绑定生效），任何套件不得 rmSync 单例库文件所在目录**，否则并行套件会 disk I/O error。渠道协议测试用 `Bun.serve`/本地 WS 模拟 iLink/QQ，并通过 `ChannelAdapterDeps` 注入 `dotBotDir`/`mediaFetch`/`qq`/`wsFactory`/`tuning`，绝不走生产旁路。
 - 代码中的中文注释/命名（如技能名称、终端 banner）是刻意为之，保持一致。

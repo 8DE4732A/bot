@@ -23,7 +23,11 @@ export interface InboundMessage {
   peerId: string;
   peerName?: string;
   senderName?: string;
+  /** 真实发送者的不可变 id（群聊时与 peerId 不同；访问策略/审计用） */
+  senderId?: string;
   content: string;
+  /** 平台事件时间（毫秒）；缺省由管道收到时补 Date.now() */
+  receivedAt?: number;
   /** 平台消息 id (入站去重键) */
   messageId?: string;
   conversationType?: "direct" | "group";
@@ -42,6 +46,17 @@ export interface OutboundMessage {
   content: string;
 }
 
+/** 出站媒体（路径已由 ChannelManager 做 workspace/realpath/大小校验） */
+export interface OutboundMedia {
+  kind: MediaKind;
+  localPath: string;
+  filename: string;
+  mimeType?: string;
+  sizeBytes: number;
+  /** 校验时从受控 fd 读出的内容快照；adapter 必须发送这份数据，避免路径 TOCTOU */
+  data: Buffer;
+}
+
 export interface ChannelWebhookResult {
   status: number;
   body: string;
@@ -51,13 +66,19 @@ export interface ChannelWebhookResult {
 export interface ChannelHealth {
   ok: boolean;
   detail?: string;
+  lastInboundAt?: number;
+  lastSendAt?: number;
+  lastConnectedAt?: number;
+  reconnectAttempts?: number;
+  nextRetryAt?: number;
 }
 
 export type MarkdownMode = "full" | "limited" | "plain";
 
 export interface ChannelAdapter {
   readonly id: string;
-  readonly type: "terminal" | "wecom" | "weixin" | "qq" | "feishu" | "telegram";
+  /** 渠道类型（注册表 key；string 以便扩展，API 边界由 registry 校验） */
+  readonly type: string;
   readonly name: string;
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -67,12 +88,17 @@ export interface ChannelAdapter {
    * 返回 false——网关回退 sendMessage (主动发送)。平台窗口差异留在 adapter 内。
    */
   sendReply?(peerId: string, content: string, replyContext: unknown): Promise<boolean>;
+  /**
+   * 出站媒体（图片/文件/语音/视频）。路径已由网关校验为 Agent 工作区内普通文件。
+   * 返回 false = 平台拒绝/不支持（调用方降级为文本提示）。
+   */
+  sendMedia?(peerId: string, media: OutboundMedia, replyContext?: unknown): Promise<boolean>;
+  /** 出站文本平台化排版（在 markdown 降级之前调用） */
+  formatOutbound?(content: string): string;
   /** 平台单条消息长度上限 (字节, UTF-8); 缺省不分段 */
   maxMessageBytes?: number;
   /** 平台 markdown 能力: 分段前先按此降级转换 (缺省 full) */
   markdownMode?: MarkdownMode;
-  /** 处理中 typing 心跳 (每 5s 调用, 回复落地即停); 平台不支持则忽略 */
-  sendTyping?(peerId: string): Promise<void>;
   /** 连接健康检查 (管理台渠道卡片展示); 缺省视为健康 */
   healthCheck?(): Promise<ChannelHealth>;
   /**
