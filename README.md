@@ -2,6 +2,8 @@
 
 一个基于 `@earendil-works/pi-durable` 与 Bun / Node.js 打造的现代化、轻量级、安全沙盒化、单二进制分发、零配置文件的多 Agent 对话网关与执行平台。
 
+![Bot Agent 海报：单二进制、SQLite、安全沙盒与多渠道多 Agent 网关](docs/assets/bot-agent-poster.jpg)
+
 ---
 
 ## 🌟 核心特性

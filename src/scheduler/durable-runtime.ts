@@ -780,6 +780,7 @@ export class SchedulerRuntime {
           leaseFence: run.leaseFence,
           owner: this.instanceId,
           conversationId: fresh.conversationId,
+          messageTime: run.scheduledFor,
         },
       );
       if (leaseLost) {

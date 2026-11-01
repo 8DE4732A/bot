@@ -197,11 +197,14 @@ export function Modal({
   onClose,
   foot,
   children,
+  wide = false,
 }: {
   title: string;
   onClose: () => void;
   foot: ReactNode;
   children: ReactNode;
+  /** 数据密集的表单/参数面板使用更宽的弹窗 */
+  wide?: boolean;
 }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -218,7 +221,7 @@ export function Modal({
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="modal" role="dialog" aria-modal="true" aria-label={title}>
+      <div className={`modal${wide ? " modal--wide" : ""}`} role="dialog" aria-modal="true" aria-label={title}>
         <div className="modal__head">
           <div className="modal__title">{title}</div>
           <button className="btn btn--ghost btn--sm" onClick={onClose} aria-label="关闭">

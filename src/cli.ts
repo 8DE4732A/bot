@@ -5,6 +5,9 @@ import { ChannelManager } from "./channels/manager.ts";
 import { TerminalChannel } from "./channels/terminal/index.ts";
 import { AgentManager } from "./core/agent-manager.ts";
 import { ModelFactory } from "./core/model-factory.ts";
+import { loadContextPolicy } from "./core/context-policy.ts";
+import { effectiveMetadataFingerprint } from "./core/model-metadata.ts";
+import { refreshIfStale } from "./core/models-dev.ts";
 import { initCommandRouting } from "./core/chat-orchestrator.ts";
 import { loadOrCreateGatewayToken } from "./core/gateway-token.ts";
 import { DatabaseManager } from "./database/index.ts";
@@ -228,6 +231,42 @@ async function runPlatform(
 
   // 3. Initialize Agent Harness（六期：先 open，不 resume；等调度 gate 就绪后再恢复）
   await AgentManager.getInstance().init(cwd, { resume: false });
+
+  // 3a. 七期：上下文观测收尾与目录刷新（后台执行，失败不影响启动）
+  try {
+    store.markRunningTurnsInterrupted();
+    const policy = loadContextPolicy(store);
+    const now = Date.now();
+    store.cleanupContextMetrics({
+      turnCutoff: now - policy.retentionDays * 86_400_000,
+      detailCutoff: now - policy.detailRetentionDays * 86_400_000,
+    });
+    const cleanupTimer = setInterval(() => {
+      try {
+        const current = loadContextPolicy(store);
+        const ts = Date.now();
+        store.cleanupContextMetrics({
+          turnCutoff: ts - current.retentionDays * 86_400_000,
+          detailCutoff: ts - current.detailRetentionDays * 86_400_000,
+        });
+      } catch (err) {
+        logger.warn("CLI", `Context metrics cleanup failed: ${err}`);
+      }
+    }, 24 * 60 * 60 * 1000);
+    cleanupTimer.unref?.();
+
+    const fingerprintBefore = effectiveMetadataFingerprint(store);
+    void refreshIfStale(store)
+      .then((stats) => {
+        if (stats && effectiveMetadataFingerprint(store) !== fingerprintBefore) {
+          AgentManager.getInstance().reloadModels();
+          logger.info("CLI", "Model metadata refreshed; model catalog reloaded");
+        }
+      })
+      .catch((err) => logger.debug("CLI", `Model metadata refresh skipped: ${err}`));
+  } catch (err) {
+    logger.warn("CLI", `Context maintenance init failed (non-fatal): ${err}`);
+  }
 
   // 3b. Bridge configured MCP servers into the registry (连接失败不阻塞启动;
   //     失败的 server 由低频重试循环自动恢复)

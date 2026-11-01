@@ -207,6 +207,167 @@ const MIGRATIONS: ((db: DatabaseSync) => void)[] = [
         ON scheduled_task_notifications (status, claimed_until);
     `);
   },
+  // v7: 七期——上下文管理与可观测性（docs/CONTEXT-OBSERVABILITY.md）
+  // 只增表/索引；模型元数据、turn 聚合、请求/工具明细、压缩事件
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS model_catalog_cache (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        payload_gz BLOB NOT NULL,
+        etag TEXT,
+        last_modified TEXT,
+        fetched_at INTEGER NOT NULL,
+        last_checked_at INTEGER NOT NULL,
+        provider_count INTEGER NOT NULL DEFAULT 0,
+        model_count INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE TABLE IF NOT EXISTS model_metadata (
+        provider_id TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        auto_json TEXT,
+        auto_source TEXT,
+        manual_json TEXT,
+        matched_provider TEXT,
+        matched_model TEXT,
+        refreshed_at INTEGER,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (provider_id, model_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS llm_turns (
+        turn_id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        session_kind TEXT NOT NULL,
+        scheduler_task_id TEXT,
+        provider TEXT,
+        model_id TEXT,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        duration_ms INTEGER,
+        first_chunk_ms INTEGER,
+        ttft_ms INTEGER,
+        llm_ms INTEGER,
+        tool_ms INTEGER,
+        request_count INTEGER NOT NULL DEFAULT 0,
+        tool_count INTEGER NOT NULL DEFAULT 0,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read INTEGER NOT NULL DEFAULT 0,
+        cache_write INTEGER NOT NULL DEFAULT 0,
+        reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd REAL NOT NULL DEFAULT 0,
+        priced INTEGER NOT NULL DEFAULT 0,
+        usage_json TEXT,
+        context_tokens INTEGER,
+        context_estimate_tokens INTEGER,
+        context_window INTEGER,
+        compacted_before INTEGER NOT NULL DEFAULT 0,
+        compaction_ms INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        error TEXT,
+        request_id TEXT,
+        run_key TEXT,
+        trace_id TEXT,
+        submission_id TEXT,
+        detail_truncated INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_llm_turns_conv ON llm_turns(conversation_id, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_llm_turns_agent ON llm_turns(agent_id, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_llm_turns_started ON llm_turns(started_at);
+
+      CREATE TABLE IF NOT EXISTS llm_requests (
+        span_id TEXT PRIMARY KEY,
+        turn_id TEXT,
+        conversation_id TEXT,
+        trace_id TEXT,
+        parent_span_id TEXT,
+        task_id TEXT,
+        kind TEXT NOT NULL,
+        task_kind TEXT,
+        compaction_id TEXT,
+        provider TEXT,
+        model_id TEXT,
+        api TEXT,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        duration_ms INTEGER,
+        first_chunk_ms INTEGER,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read INTEGER NOT NULL DEFAULT 0,
+        cache_write INTEGER NOT NULL DEFAULT 0,
+        reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd REAL NOT NULL DEFAULT 0,
+        stop_reason TEXT,
+        status TEXT NOT NULL,
+        error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_llm_requests_turn ON llm_requests(turn_id, started_at);
+      CREATE INDEX IF NOT EXISTS idx_llm_requests_conv ON llm_requests(conversation_id, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_llm_requests_started ON llm_requests(started_at);
+      CREATE INDEX IF NOT EXISTS idx_llm_requests_task ON llm_requests(task_id);
+
+      CREATE TABLE IF NOT EXISTS tool_invocations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        turn_id TEXT,
+        conversation_id TEXT,
+        trace_id TEXT,
+        task_id TEXT,
+        tool_call_id TEXT,
+        tool_name TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        duration_ms INTEGER,
+        status TEXT NOT NULL,
+        error TEXT,
+        UNIQUE(trace_id, tool_call_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_tool_inv_turn ON tool_invocations(turn_id, started_at);
+      CREATE INDEX IF NOT EXISTS idx_tool_inv_started ON tool_invocations(started_at);
+
+      CREATE TABLE IF NOT EXISTS compaction_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL,
+        agent_id TEXT,
+        session_id TEXT,
+        turn_id TEXT,
+        task_id TEXT,
+        trace_id TEXT,
+        compaction_id TEXT,
+        profile TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        threshold_tokens INTEGER,
+        keep_recent_tokens INTEGER,
+        before_tokens INTEGER,
+        after_tokens INTEGER,
+        before_estimate_tokens INTEGER,
+        after_estimate_tokens INTEGER,
+        before_entries INTEGER,
+        after_entries INTEGER,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        duration_ms INTEGER,
+        cost_usd REAL,
+        cost_in_turn INTEGER NOT NULL DEFAULT 0,
+        request_count INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        fail_open INTEGER NOT NULL DEFAULT 0,
+        error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_compaction_conv ON compaction_events(conversation_id, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_compaction_turn ON compaction_events(turn_id);
+      CREATE INDEX IF NOT EXISTS idx_compaction_started ON compaction_events(started_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_compaction_turn_task
+        ON compaction_events(turn_id, task_id)
+        WHERE turn_id IS NOT NULL AND task_id IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_conversation ON scheduled_tasks(conversation_id);
+      CREATE INDEX IF NOT EXISTS idx_channel_sessions_conversation ON channel_sessions(conversation_id);
+    `);
+  },
 ];
 
 export function runMigrations(db: DatabaseSync) {
@@ -231,7 +392,38 @@ export function runMigrations(db: DatabaseSync) {
       throw err;
     }
   }
+  // 版本号可能领先于当前源码（切回旧分支、手工改过 user_version、或新版本
+  // 曾写入更高的 PRAGMA）。此时上面的循环会静默跳过，最新迁移的表可能缺失，
+  // 启动后第一条 SELECT 就会报 "no such table"。最新迁移必须保持幂等
+  // （CREATE TABLE/INDEX IF NOT EXISTS），在此安全重放一次。
+  const { user_version: versionAfter } = db.prepare("PRAGMA user_version").get() as { user_version: number };
+  if (versionAfter >= MIGRATIONS.length) repairLatestSchema(db);
   bootstrapDefaults(db);
+}
+
+function repairLatestSchema(db: DatabaseSync): void {
+  const latest = MIGRATIONS[MIGRATIONS.length - 1];
+  const sentinel = "model_metadata";
+  const present = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(sentinel);
+  if (present) return;
+  logger.warn(
+    "Database",
+    `Schema version is ahead of this build but '${sentinel}' is missing; replaying the latest idempotent migration`,
+  );
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    latest(db);
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
 }
 
 function bootstrapDefaults(db: DatabaseSync) {

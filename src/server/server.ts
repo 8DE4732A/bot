@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import QRCode from "qrcode";
-import { DatabaseStore, type ChannelInstanceConfig } from "../config/database-store.ts";
+import { DatabaseStore, type ChannelInstanceConfig, type ModelMetadataValues } from "../config/database-store.ts";
 import {
   createAgentWorkspaceDir,
   getWorkspaceArchiveDir,
@@ -18,6 +18,23 @@ import { handleChatInbound } from "../core/chat-orchestrator.ts";
 import { attachWsGateway } from "../gateway/ws-gateway.ts";
 import { isDraining } from "../gateway/lifecycle.ts";
 import { ModelFactory } from "../core/model-factory.ts";
+import {
+  catalogFetchedAt,
+  listCatalogCandidates,
+  loadCatalogFromCache,
+  modelsDevEntryToValues,
+  modelsForProvider,
+  refreshModelsDevCatalog,
+  rematchProviderFromCache,
+} from "../core/models-dev.ts";
+import { hasPricing, resolveModelMetadata } from "../core/model-metadata.ts";
+import {
+  loadContextPolicy,
+  resolveContextThresholds,
+  parseContextPolicy,
+  saveContextPolicy,
+  validateContextPolicy,
+} from "../core/context-policy.ts";
 import { ChannelManager } from "../channels/manager.ts";
 import {
   listPublicChannelTypes,
@@ -235,6 +252,68 @@ function binaryFor(pathname: string, bodyB64: string): Buffer {
     binaryCache.set(pathname, buf);
   }
   return buf;
+}
+
+/** 七期：模型参数手动覆盖的校验/归一化（只接受已知字段，拒绝负价格/非法模态）。 */
+function normalizeMetadataOverrides(input: unknown): { value?: Partial<ModelMetadataValues>; error?: string } {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return { error: "overrides must be an object" };
+  const raw = input as Record<string, unknown>;
+  const value: Partial<ModelMetadataValues> = {};
+  if (raw.displayName !== undefined) {
+    if (typeof raw.displayName !== "string" || raw.displayName.length > 200) return { error: "displayName must be a string ≤200 chars" };
+    value.displayName = raw.displayName;
+  }
+  for (const key of ["contextWindow", "maxOutputTokens"] as const) {
+    if (raw[key] === undefined) continue;
+    const n = Number(raw[key]);
+    if (!Number.isFinite(n) || n <= 0 || n > 100_000_000) return { error: `${key} must be a positive number` };
+    value[key] = Math.floor(n);
+  }
+  for (const key of ["inputModalities", "outputModalities"] as const) {
+    if (raw[key] === undefined) continue;
+    if (!Array.isArray(raw[key]) || raw[key].some((m) => typeof m !== "string" || m.length > 32)) {
+      return { error: `${key} must be a string array` };
+    }
+    value[key] = [...new Set(raw[key] as string[])];
+  }
+  for (const key of ["reasoning", "toolCall"] as const) {
+    if (raw[key] === undefined) continue;
+    if (typeof raw[key] !== "boolean") return { error: `${key} must be boolean` };
+    value[key] = raw[key] as boolean;
+  }
+  if (raw.cost !== undefined) {
+    if (!raw.cost || typeof raw.cost !== "object" || Array.isArray(raw.cost)) return { error: "cost must be an object" };
+    const costRaw = raw.cost as Record<string, unknown>;
+    const cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+      const n = Number(costRaw[key] ?? 0);
+      if (!Number.isFinite(n) || n < 0) return { error: `cost.${key} must be a non-negative number` };
+      cost[key] = n;
+    }
+    value.cost = cost;
+  }
+  if (raw.costTiers !== undefined) {
+    if (!Array.isArray(raw.costTiers)) return { error: "costTiers must be an array" };
+    value.costTiers = raw.costTiers.map((tier: any, index: number) => {
+      const above = Number(tier?.inputTokensAbove);
+      if (!Number.isFinite(above) || above <= 0) throw new Error(`costTiers[${index}].inputTokensAbove must be positive`);
+      const rate = (value: unknown, field: string): number => {
+        const n = Number(value ?? 0);
+        if (!Number.isFinite(n) || n < 0) {
+          throw new Error(`costTiers[${index}].${field} must be a non-negative finite number`);
+        }
+        return n;
+      };
+      return {
+        inputTokensAbove: Math.floor(above),
+        input: rate(tier?.input, "input"),
+        output: rate(tier?.output, "output"),
+        cacheRead: rate(tier?.cacheRead, "cacheRead"),
+        cacheWrite: rate(tier?.cacheWrite, "cacheWrite"),
+      };
+    });
+  }
+  return { value };
 }
 
 export class AdminWebServer {
@@ -562,7 +641,7 @@ export class AdminWebServer {
           }
           // apiKey 留空表示保留已存密钥 (脱敏响应下前端不持有明文)
           const apiKey = body.apiKey || this.store.getModelProvider(body.id)?.apiKey || "";
-          this.store.saveModelProvider({
+          const saved = {
             id: body.id,
             name: body.name,
             protocol: body.protocol || "openai-completions",
@@ -571,7 +650,14 @@ export class AdminWebServer {
             models: Array.isArray(body.models) ? body.models : [],
             createdAt: body.createdAt || Date.now(),
             updatedAt: Date.now(),
-          });
+          };
+          this.store.saveModelProvider(saved);
+          // 七期：用缓存的 models.dev 目录尽力匹配新模型（不联网）；完成后 reload
+          try {
+            rematchProviderFromCache(this.store, saved);
+          } catch (err) {
+            logger.warn("WebServer", `Model metadata rematch failed: ${err}`);
+          }
           AgentManager.getInstance().reloadModels();
           this.sendJson(res, { success: true });
           return;
@@ -640,6 +726,244 @@ export class AdminWebServer {
           body.protocol || "openai-completions",
         );
         this.sendJson(res, result);
+        return;
+      }
+
+      // 6b. 七期：per-model 元数据（models.dev 自动匹配 + 手动覆盖）
+      if (pathname === "/api/model-metadata/candidates" && method === "GET") {
+        const providerId = url.searchParams.get("providerId");
+        const modelId = url.searchParams.get("modelId");
+        if (!providerId || !modelId) {
+          this.sendError(res, 400, "providerId and modelId are required");
+          return;
+        }
+        const provider = this.store.getModelProvider(providerId);
+        if (!provider) {
+          this.sendError(res, 404, `Provider '${providerId}' not found`);
+          return;
+        }
+        const catalog = loadCatalogFromCache(this.store);
+        const all = catalog ? listCatalogCandidates(catalog, provider, modelId) : [];
+        const q = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+        const filtered = q
+          ? all.filter((c) =>
+              [c.providerKey, c.providerName, c.modelKey, c.displayName, c.canonicalModelId]
+                .filter(Boolean)
+                .some((value) => String(value).toLowerCase().includes(q)),
+            )
+          : all;
+        const requested = Number(url.searchParams.get("limit") ?? 200);
+        const limit = Number.isFinite(requested) ? Math.min(200, Math.max(1, Math.floor(requested))) : 200;
+        this.sendJson(res, {
+          candidates: filtered.slice(0, limit),
+          total: filtered.length,
+          catalog: this.store.getModelCatalogMeta() ?? null,
+        });
+        return;
+      }
+
+      if (pathname === "/api/model-metadata" && method === "GET") {
+        const providerId = url.searchParams.get("providerId");
+        const providers = providerId
+          ? [this.store.getModelProvider(providerId)].filter((p): p is NonNullable<typeof p> => Boolean(p))
+          : this.store.listModelProviders();
+        if (providerId && providers.length === 0) {
+          this.sendError(res, 404, `Provider '${providerId}' not found`);
+          return;
+        }
+        const models = providers.flatMap((provider) =>
+          modelsForProvider(this.store, provider)
+            .sort()
+            .map((modelId) => {
+              const meta = resolveModelMetadata(provider, modelId, this.store);
+              const record = this.store.getModelMetadata(provider.id, modelId);
+              return {
+                providerId: provider.id,
+                providerName: provider.name,
+                protocol: provider.protocol,
+                modelId,
+                displayName: meta.displayName,
+                contextWindow: meta.contextWindow,
+                maxOutputTokens: meta.maxOutputTokens,
+                inputModalities: meta.inputModalities,
+                outputModalities: meta.outputModalities,
+                reasoning: meta.reasoning,
+                toolCall: meta.toolCall,
+                cost: meta.cost,
+                costTiers: meta.costTiers ?? [],
+                source: meta.source,
+                priced: hasPricing(meta),
+                auto: record?.auto ?? null,
+                autoSource: record?.autoSource ?? null,
+                manual: record?.manual ?? null,
+                reference: record?.manual?.reference ?? null,
+                matchedProvider: meta.matchedProvider,
+                matchedModel: meta.matchedModel,
+              };
+            }),
+        );
+        this.sendJson(res, {
+          models,
+          catalog: this.store.getModelCatalogMeta() ?? null,
+        });
+        return;
+      }
+
+      if (pathname === "/api/model-metadata" && method === "PUT") {
+        const body = await this.readJsonBody(req);
+        if (!body.providerId || !body.modelId) {
+          this.sendError(res, 400, "providerId and modelId are required");
+          return;
+        }
+        const provider = this.store.getModelProvider(body.providerId);
+        if (!provider) {
+          this.sendError(res, 404, `Provider '${body.providerId}' not found`);
+          return;
+        }
+        if (!modelsForProvider(this.store, provider).includes(body.modelId)) {
+          this.sendError(res, 400, `Model '${body.modelId}' is not configured for provider '${provider.id}'`);
+          return;
+        }
+        const existing = this.store.getModelMetadata(provider.id, body.modelId);
+        let manual = existing?.manual ?? null;
+        if (body.reset === true) {
+          manual = null;
+        } else {
+          const hasReference = body.reference !== undefined && body.reference !== null;
+          if (!hasReference && body.overrides === undefined) {
+            this.sendError(res, 400, "overrides or reference is required");
+            return;
+          }
+
+          let referenceValues: Partial<ModelMetadataValues> | undefined;
+          let reference: ModelMetadataValues["reference"] | undefined;
+          if (hasReference) {
+            const ref = body.reference as { providerId?: unknown; modelId?: unknown };
+            const refProviderId = typeof ref.providerId === "string" ? ref.providerId.trim() : "";
+            const refModelId = typeof ref.modelId === "string" ? ref.modelId.trim() : "";
+            if (!refProviderId || !refModelId) {
+              this.sendError(res, 400, "reference.providerId and reference.modelId are required");
+              return;
+            }
+            const catalog = loadCatalogFromCache(this.store);
+            if (!catalog) {
+              this.sendError(res, 409, "models.dev 目录尚未刷新，请先刷新模型目录");
+              return;
+            }
+            const catalogProvider = Object.prototype.hasOwnProperty.call(catalog, refProviderId)
+              ? catalog[refProviderId]
+              : undefined;
+            const entry =
+              catalogProvider?.models && Object.prototype.hasOwnProperty.call(catalogProvider.models, refModelId)
+                ? catalogProvider.models[refModelId]
+                : undefined;
+            if (!catalogProvider || !entry) {
+              this.sendError(res, 404, `models.dev 条目 '${refProviderId}/${refModelId}' 不存在`);
+              return;
+            }
+            referenceValues = modelsDevEntryToValues(entry, true);
+            reference = {
+              providerId: refProviderId,
+              providerName: typeof catalogProvider.name === "string" ? catalogProvider.name : undefined,
+              modelId: refModelId,
+              displayName: typeof entry.name === "string" ? entry.name : undefined,
+              matchedAt: Date.now(),
+            };
+          }
+
+          let normalized: Partial<ModelMetadataValues> | undefined;
+          if (body.overrides !== undefined) {
+            try {
+              const result = normalizeMetadataOverrides(body.overrides);
+              if (result.error) {
+                this.sendError(res, 400, result.error);
+                return;
+              }
+              normalized = result.value;
+            } catch (err: any) {
+              this.sendError(res, 400, err?.message || "invalid overrides");
+              return;
+            }
+          }
+
+          if (referenceValues) {
+            // 参考条目没有价格时清掉旧价格，避免沿用上一条参考的计费
+            const next: Partial<ModelMetadataValues> = { ...(manual ?? {}) };
+            if (!referenceValues.cost) {
+              delete next.cost;
+              delete next.costTiers;
+            }
+            manual = { ...next, ...referenceValues, ...(normalized ?? {}), reference };
+          } else {
+            manual = { ...(manual ?? {}), ...(normalized ?? {}) };
+            // 用户显式保存手动参数后不再标记为目录参考（值仍保留为手动覆盖）
+            if (manual) delete manual.reference;
+          }
+          if (Object.keys(manual).length === 0) manual = null;
+        }
+        const beforeMeta = resolveModelMetadata(provider, body.modelId, this.store);
+        this.store.saveModelMetadata({
+          providerId: provider.id,
+          modelId: body.modelId,
+          auto: existing?.auto ?? null,
+          autoSource: existing?.autoSource,
+          manual,
+          matchedProvider: existing?.matchedProvider,
+          matchedModel: existing?.matchedModel,
+          refreshedAt: existing?.refreshedAt,
+          updatedAt: Date.now(),
+        });
+        const afterMeta = resolveModelMetadata(provider, body.modelId, this.store);
+        const modelChanged = JSON.stringify([
+          beforeMeta.contextWindow,
+          beforeMeta.maxOutputTokens,
+          beforeMeta.inputModalities,
+          beforeMeta.reasoning,
+          beforeMeta.toolCall,
+          beforeMeta.cost,
+          beforeMeta.costTiers ?? null,
+        ]) !== JSON.stringify([
+          afterMeta.contextWindow,
+          afterMeta.maxOutputTokens,
+          afterMeta.inputModalities,
+          afterMeta.reasoning,
+          afterMeta.toolCall,
+          afterMeta.cost,
+          afterMeta.costTiers ?? null,
+        ]);
+        if (modelChanged) AgentManager.getInstance().reloadModels();
+        this.store.recordAudit("model.metadata_override", {
+          providerId: provider.id,
+          modelId: body.modelId,
+          reset: body.reset === true,
+          reference: body.reference ?? undefined,
+        });
+        const meta = afterMeta;
+        this.sendJson(res, {
+          ...meta,
+          priced: hasPricing(meta),
+          auto: existing?.auto ?? null,
+          manual,
+          reference: manual?.reference ?? null,
+        });
+        return;
+      }
+
+      if (pathname === "/api/model-metadata/refresh" && method === "POST") {
+        try {
+          const stats = await refreshModelsDevCatalog(this.store);
+          AgentManager.getInstance().reloadModels();
+          this.store.recordAudit("model.catalog_refresh", {
+            providers: stats.providers,
+            models: stats.models,
+            matched: stats.matched,
+            builtin: stats.builtin,
+            fallback: stats.fallback,
+          });
+          this.sendJson(res, stats);
+        } catch (err: any) {
+          this.sendError(res, 502, `models.dev refresh failed: ${err?.message || err}`);
+        }
         return;
       }
 
@@ -1575,6 +1899,169 @@ export class AdminWebServer {
           res,
           await readConversationHistory(conversationId, AgentManager.getInstance().getHarness()),
         );
+        return;
+      }
+
+      // 11a-2. 七期：上下文策略 / 会话观测 / 手动压缩
+      if (pathname === "/api/context/policy" && method === "GET") {
+        const policy = loadContextPolicy(this.store);
+        const effective = this.store.listModelProviders().flatMap((provider) =>
+          modelsForProvider(this.store, provider)
+            .sort()
+            .map((modelId) => {
+              const meta = resolveModelMetadata(provider, modelId, this.store);
+              const thresholds = resolveContextThresholds(policy, meta.contextWindow);
+              return {
+                providerId: provider.id,
+                modelId,
+                contextWindow: meta.contextWindow,
+                keepRecentTokens: thresholds.keepRecent,
+                globalThreshold: thresholds.globalThreshold,
+                scheduledFallbackThreshold: thresholds.scheduledFallbackThreshold,
+                fixedThreshold: thresholds.fixedThreshold,
+                idleHours: thresholds.idleHours,
+              };
+            }),
+        );
+        this.sendJson(res, {
+          policy,
+          effective,
+          catalogFetchedAt: catalogFetchedAt(this.store),
+        });
+        return;
+      }
+      if (pathname === "/api/context/policy" && method === "PUT") {
+        const body = await this.readJsonBody(req);
+        const policy = parseContextPolicy(JSON.stringify(body.policy ?? body));
+        const invalid = validateContextPolicy(policy);
+        if (invalid) {
+          this.sendError(res, 400, invalid);
+          return;
+        }
+        saveContextPolicy(policy, this.store);
+        AgentManager.getInstance().applyContextPolicy(policy);
+        this.store.recordAudit("context.policy_updated", {
+          strategies: policy.strategies,
+        });
+        this.sendJson(res, { success: true, policy });
+        return;
+      }
+
+      if (pathname === "/api/context/sessions" && method === "GET") {
+        const limitRaw = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+        const limit = Number.isFinite(limitRaw) ? Math.min(500, Math.max(1, limitRaw)) : 100;
+        const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "", 10);
+        const offset = Number.isFinite(offsetRaw) ? Math.max(0, offsetRaw) : 0;
+        const agentId = url.searchParams.get("agentId") || undefined;
+        const kindParam = url.searchParams.get("kind");
+        const sessionKind = kindParam === "scheduled" || kindParam === "normal" ? kindParam : undefined;
+        const since = url.searchParams.get("from") ? Number(url.searchParams.get("from")) : undefined;
+        const until = url.searchParams.get("to") ? Number(url.searchParams.get("to")) : undefined;
+        const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+        const result = this.store.listContextSessions({
+          agentId,
+          sessionKind,
+          since: Number.isFinite(since) ? since : undefined,
+          until: Number.isFinite(until) ? until : undefined,
+          q: q || undefined,
+          limit,
+          offset,
+        });
+        const rows = result.rows.map((row) => {
+          let label = row.sessionId;
+          if (row.schedulerTaskName) {
+            label = row.schedulerTaskName;
+          } else if (row.channelName) {
+            const channelId = row.sessionId.split(":")[0];
+            label = `${row.channelName} · ${row.sessionId.slice(channelId.length + 1)}`;
+          } else if (row.sessionId.startsWith("web-playground:")) {
+            label = "Web Playground";
+          } else if (row.sessionId.startsWith("terminal-main:")) {
+            label = "终端";
+          }
+          return {
+            ...row,
+            agentName: row.agentName ?? row.agentId,
+            label,
+            fillRatio:
+              row.contextTokens !== undefined && row.contextWindow && row.contextWindow > 0
+                ? Math.min(1, row.contextTokens / row.contextWindow)
+                : undefined,
+          };
+        });
+        this.sendJson(res, { rows, total: result.total, limit, offset });
+        return;
+      }
+
+      const turnsMatch = pathname.match(/^\/api\/context\/sessions\/([^/]+)\/turns$/);
+      if (turnsMatch && method === "GET") {
+        const conversationId = decodeURIComponent(turnsMatch[1]!);
+        const limitRaw = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+        const limit = Number.isFinite(limitRaw) ? Math.min(500, Math.max(1, limitRaw)) : 50;
+        const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "", 10);
+        const offset = Number.isFinite(offsetRaw) ? Math.max(0, offsetRaw) : 0;
+        this.sendJson(res, {
+          conversationId,
+          turns: this.store.listLlmTurns(conversationId, limit, offset),
+          total: this.store.countLlmTurns(conversationId),
+          compactions: this.store.listCompactionEvents({ conversationId, limit: 200 }),
+        });
+        return;
+      }
+
+      const turnMatch = pathname.match(/^\/api\/context\/turns\/([^/]+)$/);
+      if (turnMatch && method === "GET") {
+        const turnId = decodeURIComponent(turnMatch[1]!);
+        const turn = this.store.getLlmTurn(turnId);
+        if (!turn) {
+          this.sendError(res, 404, `Turn '${turnId}' not found`);
+          return;
+        }
+        this.sendJson(res, {
+          turn,
+          requests: this.store.listLlmRequests(turnId),
+          tools: this.store.listToolInvocations(turnId),
+          compactions: this.store.listCompactionEvents({ turnId, limit: 100 }),
+        });
+        return;
+      }
+
+      const compactMatch = pathname.match(/^\/api\/context\/sessions\/([^/]+)\/compact$/);
+      if (compactMatch && method === "POST") {
+        if (isDraining()) {
+          this.sendError(res, 503, "gateway 正在重启 (draining), 暂不接受压缩任务; 请稍后重试");
+          return;
+        }
+        const conversationId = decodeURIComponent(compactMatch[1]!);
+        const body = await this.readJsonBody(req);
+        // 读 body 期间可能刚开始 drain：复检，避免启动 90s 压缩
+        if (isDraining()) {
+          this.sendError(res, 503, "gateway 正在重启 (draining), 暂不接受压缩任务; 请稍后重试");
+          return;
+        }
+        const instructions = typeof body.instructions === "string" ? body.instructions : undefined;
+
+        // busy 前置检查（与 chat/compact 使用同一 session key 推导）
+        if (AgentManager.getInstance().isConversationBusy(conversationId)) {
+          this.sendError(res, 409, "会话正在生成，请先取消或等待本轮结束");
+          return;
+        }
+        try {
+          const outcome = await AgentManager.getInstance().compactConversation(conversationId, instructions);
+          this.store.recordAudit("context.manual_compact", {
+            conversationId,
+            status: outcome.status,
+            beforeTokens: outcome.beforeTokens ?? null,
+            afterTokens: outcome.afterTokens ?? null,
+          });
+          this.sendJson(res, outcome);
+        } catch (err: any) {
+          if (err instanceof ConversationMissing) {
+            this.sendError(res, 404, err.message);
+            return;
+          }
+          this.sendError(res, 500, err?.message || "compaction failed");
+        }
         return;
       }
 

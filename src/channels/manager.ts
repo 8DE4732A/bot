@@ -16,6 +16,8 @@ import {
   extractMediaMarkers,
 } from "./runtime/media-outbound.ts";
 import { splitMessage } from "./runtime/segmenter.ts";
+import { planVisionInput } from "./runtime/vision-input.ts";
+import { resolveModelMetadata } from "../core/model-metadata.ts";
 
 /** 多段连发间隔 (防平台风控, 对齐设计 §3.2) */
 const SEGMENT_GAP_MS = 300;
@@ -327,11 +329,42 @@ export class ChannelManager implements ChannelDispatchRuntime {
       `Dispatching inbound message from ${message.channelInstanceId}:${message.peerId} to Agent: ${agentId}`,
     );
 
+    // 图片输入能力分流：支持视觉的模型直接附加图片；明确不支持的模型
+    // 不调用 LLM 直接回复；目录 fallback（模态未知）保留路径引用让模型 read。
+    const agent = this.store.getAgent(agentId);
+    const provider = agent ? this.store.getModelProvider(agent.model.provider) : undefined;
+    const metadata = agent && provider ? resolveModelMetadata(provider, agent.model.modelId, this.store) : undefined;
+    const visionPlan = await planVisionInput(
+      message.content,
+      message.attachments,
+      agent && metadata
+        ? {
+            provider: agent.model.provider,
+            modelId: agent.model.modelId,
+            inputModalities: metadata.inputModalities,
+            known: metadata.source !== "fallback",
+          }
+        : undefined,
+    );
+    if (visionPlan.mode === "reject") {
+      this.store.recordAudit("channel.image_unsupported", {
+        agentId,
+        model: agent ? `${agent.model.provider}/${agent.model.modelId}` : undefined,
+        images: (message.attachments ?? []).filter((attachment) => attachment.kind === "image").length,
+      });
+      logger.info("ChannelManager", `Rejected image input for agent ${agentId}: unsupported model`);
+      return visionPlan.message;
+    }
+
     return AgentManager.getInstance().chat(
       agentId,
       `${message.channelInstanceId}:${message.peerId}`,
-      message.content,
+      visionPlan.text,
       onChunk,
+      {
+        ...(visionPlan.mode === "attach" ? { userContent: visionPlan.content } : {}),
+        messageTime: message.receivedAt ?? Date.now(),
+      },
     );
   }
 

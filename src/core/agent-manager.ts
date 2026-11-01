@@ -1,4 +1,5 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { estimateContextTokens } from "@earendil-works/pi-ai/utils/estimate";
 import {
   AssistantEntry,
   createRegistry,
@@ -7,7 +8,6 @@ import {
 } from "@earendil-works/pi-durable";
 import type {
   AgentEventStream,
-  CompactionPolicy,
   Conversation,
   ConversationId,
   Extension,
@@ -16,10 +16,17 @@ import type {
   ReportInfo,
   TaskId,
   TaskInspection,
+  UserInput,
 } from "@earendil-works/pi-durable";
 import type { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { DatabaseStore, type AgentDefinition } from "../config/database-store.ts";
+import {
+  DatabaseStore,
+  type AgentDefinition,
+  type LlmRequestRecord,
+  type LlmTurnRecord,
+  type SessionKind,
+} from "../config/database-store.ts";
 import type { CancelChatResult } from "../scheduler/contracts.ts";
 import { ConversationMissing, ConversationPoisoned } from "../scheduler/contracts.ts";
 import { getBotPaths } from "../config/env-paths.ts";
@@ -33,7 +40,22 @@ import { setAgentIdResolver } from "../skills/agent-scope.ts";
 import { purgeWorkspaceSkills } from "../skills/workspace.ts";
 import { SkillRegistry } from "../skills/registry.ts";
 import { logger } from "../utils/logger.ts";
+import { formatMessageContext, withMessageContext } from "./message-context.ts";
 import { ModelFactory } from "./model-factory.ts";
+import {
+  buildCompactionSettings,
+  DEFAULT_CONTEXT_POLICY,
+  loadContextPolicy,
+  type ContextPolicy,
+} from "./context-policy.ts";
+import { getContextTelemetry } from "./context-telemetry.ts";
+import {
+  compactConversationNow,
+  estimateIncomingTokens,
+  maybeCompactBeforeTurn,
+  type CompactionOutcome,
+} from "./context-compaction.ts";
+import { diffUsageState, emptyUsageDiff, snapshotUsage } from "./context-usage.ts";
 import { BOT_VERSION } from "../version.ts";
 import { SchedulerSystemExtension } from "../scheduler/system-extension.ts";
 
@@ -142,6 +164,27 @@ export interface ChatOptions {
   leaseFence?: number;
   /** 调度 lease owner：取消时绑定具体执行实例 */
   owner?: string;
+  /**
+   * 结构化用户输入（文本 + 图片 content blocks）。渠道层在模型支持视觉时
+   * 直接附带图片；userMessage 文本仍用于 token 估算与日志。
+   */
+  userContent?: UserInput;
+  /** 消息触发时间（epoch ms）；缺省为 chat() 受理时刻。 */
+  messageTime?: number;
+  /** 额外事实上下文（如未来位置），逐行并入 `<context>` 块。 */
+  messageContextFacts?: Record<string, string>;
+}
+
+/** 估算本轮新输入：文本按框架估算，图片按固定开销近似（用于前置压缩判定）。 */
+function estimateIncomingInput(content: string | UserInput): number {
+  if (typeof content === "string") return estimateIncomingTokens(content);
+  let text = "";
+  let images = 0;
+  for (const part of content) {
+    if (part.type === "text") text += `${part.text}\n`;
+    else if (part.type === "image") images++;
+  }
+  return estimateIncomingTokens(text) + images * 1_600;
 }
 
 const configFingerprint = (a: AgentDefinition) =>
@@ -231,6 +274,8 @@ export class AgentManager {
   private usageStats = new Map<string, SessionUsageStats>();
   /** 删除/改配置时在飞 turn 尚未收尾的 Agent：turn 结束后再清该代际缓存 */
   private pendingPurge = new Set<string>();
+  /** 七期：手动压缩在飞数（drain 等待面；pre-turn 压缩已被 busyTurns 覆盖） */
+  private manualCompactions = 0;
   /** 历史 workspaceDir 冲突缓存（保存/删除 Agent 时失效，避免每轮 chat 全表重算） */
   private workspaceConflicts?: Map<string, string>;
   /** init() 已完成；会话库故障后允许懒重建 harness */
@@ -240,8 +285,11 @@ export class AgentManager {
   private recovery?: Promise<void>;
   /** 持久故障的重试冷却，避免每条消息/队列轮询都同步重建 */
   private recoveryRetryAt = 0;
-  /** settings 派生缓存：models 原子替换后自动失效 */
-  private settingsFor?: { models: MutableModels; value: HarnessSettings };
+  /** settings 派生缓存：models 原子替换或策略变更后自动失效 */
+  private settingsFor?: { models: MutableModels; policyVersion: number; value: HarnessSettings };
+  /** 七期：上下文策略（内存快照；settings 同步读取，不能查库） */
+  private contextPolicy: ContextPolicy = structuredClone(DEFAULT_CONTEXT_POLICY);
+  private policyVersion = 0;
   /** 宿主是否已放行 resume；故障重建的新 Harness 沿用该意图 */
   private autoResume = true;
   /** 当前 harness 是否已 resume（避免重复调用/观测） */
@@ -340,6 +388,8 @@ export class AgentManager {
     if (this.harness) return;
     this.cwd = cwd;
     this.autoResume = options?.resume !== false;
+    this.contextPolicy = loadContextPolicy(this.store);
+    this.policyVersion++;
 
     const paths = getBotPaths(cwd);
     logger.info("AgentManager", `Initializing Agent Harness with conversations DB at ${paths.conversationsDbFile}`);
@@ -411,6 +461,8 @@ export class AgentManager {
           identity: { userAgent: "detailed", version: BOT_VERSION },
           // 函数形态: 压缩阈值按模型窗口派生，配置热更新无需重开 Harness
           settings: () => this.buildHarnessSettings(),
+          // 七期: 内容无关的 span 遥测（request/tool 明细，供上下文观测页）
+          telemetry: getContextTelemetry(),
           // 1.4.0 ReportInfo: Session/任务/扩展/host/listener 失败统一归因
           onReport: (err, info) => this.handleReport(err, info),
           registry: this.registry,
@@ -460,25 +512,33 @@ export class AgentManager {
     this.harness = harness;
   }
 
-  /** 1.4.0 settings 函数：按当前模型目录派生压缩阈值；models 替换后缓存失效。 */
+  /** 1.4.0 settings 函数：按当前模型目录 + 上下文策略派生压缩阈值；热更新无需重开 Harness。 */
   private buildHarnessSettings(): HarnessSettings {
-    if (this.models && this.settingsFor?.models === this.models) {
+    if (this.models && this.settingsFor?.models === this.models && this.settingsFor.policyVersion === this.policyVersion) {
       return this.settingsFor.value;
     }
-    const overrides: Record<string, Partial<CompactionPolicy>> = {};
-    for (const model of this.models?.getModels() ?? []) {
-      const window = model.contextWindow;
-      if (!window || window <= 0) continue;
-      overrides[`${model.provider}/${model.id}`] = {
-        // 给回答留 ~10%，保留最近 ~20% 原文；按窗口缩放，避免小窗口被固定默认值压死
-        reserveTokens: Math.min(16_384, Math.max(512, Math.floor(window * 0.1))),
-        keepRecentTokens: Math.min(32_768, Math.max(1_024, Math.floor(window * 0.2))),
-        backgroundTokens: Math.min(16_384, Math.floor(window * 0.1)),
-      };
-    }
-    const value: HarnessSettings = { compaction: { modelOverrides: overrides } };
-    if (this.models) this.settingsFor = { models: this.models, value };
+    const entries = (this.models?.getModels() ?? []).map((model) => ({
+      provider: model.provider,
+      id: model.id,
+      contextWindow: model.contextWindow,
+    }));
+    const value: HarnessSettings = {
+      compaction: buildCompactionSettings(this.contextPolicy, entries),
+    };
+    if (this.models) this.settingsFor = { models: this.models, policyVersion: this.policyVersion, value };
     return value;
+  }
+
+  /** 七期：策略热更新（settings 函数下次读取即生效；不重开 Harness）。 */
+  public applyContextPolicy(policy: ContextPolicy): void {
+    this.contextPolicy = policy;
+    this.policyVersion++;
+    this.settingsFor = undefined;
+    logger.info("AgentManager", "Context policy applied");
+  }
+
+  public getContextPolicy(): ContextPolicy {
+    return this.contextPolicy;
   }
 
   /** 1.4.0 ReportInfo：Session/任务/扩展/host/listener 失败统一记录审计。 */
@@ -586,6 +646,7 @@ export class AgentManager {
       }
       await this.storage?.close(BACKGROUND_CONTEXT);
       logger.info("AgentManager", "Conversations storage closed (WAL checkpointed)");
+      await getContextTelemetry().flush().catch(() => {});
     } catch (err) {
       logger.warn("AgentManager", `Failed to close conversations storage: ${err}`);
     } finally {
@@ -792,6 +853,13 @@ export class AgentManager {
 
     const peerId = `scheduler:${taskId}`;
     const mapping = this.store.getSession(MAPPING_CHANNEL, peerId);
+    // 轮询回滚模式（scheduler_durable_enabled=0）的旧映射是
+    // `${agentId}:scheduler:<taskId>`，且 scheduled_tasks.conversation_id 为空；
+    // 仅在 durable 绑定缺失时才回退到它，避免把旧轮询会话当成新会话。
+    const legacyMapping =
+      task.conversationId || mapping?.conversationId
+        ? undefined
+        : this.store.getSession(MAPPING_CHANNEL, `${agentId}:scheduler:${taskId}`);
     if (conversationId && mapping && mapping.conversationId !== conversationId) {
       throw new ConversationMissing(
         `Session mapping for '${taskId}' points at ${mapping.conversationId}, not ${conversationId}`,
@@ -814,7 +882,8 @@ export class AgentManager {
     const cacheKey = sessionKey(agentId, `scheduler:${taskId}`);
 
     let conv: Conversation | undefined;
-    const effective = conversationId ?? task.conversationId ?? mapping?.conversationId;
+    const effective =
+      conversationId ?? task.conversationId ?? mapping?.conversationId ?? legacyMapping?.conversationId;
     if (effective && this.store.isRetiredSchedulerConversation(effective)) {
       throw new ConversationMissing(
         `Scheduled conversation ${effective} for '${taskId}' is retired; reset the conversation`,
@@ -1104,7 +1173,14 @@ export class AgentManager {
     onChunk?: (chunk: ChatChunk) => void,
     options?: ChatOptions,
   ): Promise<string> {
-    const activeKey = options?.schedulerTaskId ? `task:${options.schedulerTaskId}` : `${agentId}:${sessionId}`;
+    // 在等待会话锁之前记录触发时间：排队/忙碌时仍使用用户真实发送时刻
+    const effectiveOptions: ChatOptions = {
+      ...options,
+      messageTime: options?.messageTime ?? Date.now(),
+    };
+    const activeKey = effectiveOptions.schedulerTaskId
+      ? `task:${effectiveOptions.schedulerTaskId}`
+      : `${agentId}:${sessionId}`;
     let resolveDone!: () => void;
     const done = new Promise<void>((resolve) => {
       resolveDone = resolve;
@@ -1116,9 +1192,9 @@ export class AgentManager {
       controller: new AbortController(),
       done,
       resolveDone,
-      runKey: options?.runKey,
-      leaseFence: options?.leaseFence,
-      owner: options?.owner,
+      runKey: effectiveOptions.runKey,
+      leaseFence: effectiveOptions.leaseFence,
+      owner: effectiveOptions.owner,
     };
     this.activeChats.set(activeKey, entry);
 
@@ -1129,7 +1205,7 @@ export class AgentManager {
     }
 
     const run = this.withSessionLock(`${agentId}:${sessionId}`, () =>
-      this.chatLocked(agentId, sessionId, userMessage, onChunk, options, entry),
+      this.chatLocked(agentId, sessionId, userMessage, onChunk, effectiveOptions, entry),
     );
     return run.finally(() => {
       entry.resolveDone();
@@ -1142,9 +1218,9 @@ export class AgentManager {
     return this.busyTurns.has(`${agentId}:${sessionId}`);
   }
 
-  /** 全进程在飞生成数 (gateway drain 协议的等待判据) */
+  /** 全进程在飞生成数 + 手动压缩数 (gateway drain 协议的等待判据) */
   public activeTurnCount(): number {
-    return this.busyTurns.size;
+    return this.busyTurns.size + this.manualCompactions;
   }
 
   /** 会话 usage 快照 (跨轮累计; 无记录返回 undefined) */
@@ -1294,6 +1370,14 @@ export class AgentManager {
     options?: ChatOptions,
     activeChat?: ActiveChat,
   ): Promise<string> {
+    // 每条用户消息前置事实型时间上下文（无指令）；图片 content 也会附带同一块。
+    const modelContent = withMessageContext(
+      options?.userContent ?? userMessage,
+      formatMessageContext({
+        messageTime: options?.messageTime ?? Date.now(),
+        extra: options?.messageContextFacts,
+      }),
+    );
     const conv = options?.schedulerTaskId
       ? await this.openSchedulerConversation(
           agentId,
@@ -1310,7 +1394,65 @@ export class AgentManager {
     // busy 登记在拿到 conv 之后 (存引用: LRU 逐出后 cancel 仍可中止)
     this.busyTurns.set(`${agentId}:${sessionId}`, conv);
     const context = BACKGROUND_CONTEXT;
+    const telemetry = getContextTelemetry();
+    const sessionKind: SessionKind =
+      options?.schedulerTaskId !== undefined || sessionId.startsWith("scheduler:") ? "scheduled" : "normal";
+    const schedulerTaskId =
+      options?.schedulerTaskId ??
+      (sessionId.startsWith("scheduler:") ? sessionId.slice("scheduler:".length) : undefined);
+    const agentForModel = this.store.getAgent(agentId);
+    const contextWindow = agentForModel
+      ? (this.models?.getModel(agentForModel.model.provider, agentForModel.model.modelId)?.contextWindow ?? 0)
+      : 0;
+
+    // 七期：前置压缩（普通/定时各一套阈值；失败 fail-open，取消则不提交）
+    let preCompaction: CompactionOutcome | null = null;
+    try {
+      preCompaction = await maybeCompactBeforeTurn({
+        harness: this.harness!,
+        conversation: conv,
+        conversationId: String(conv.id),
+        agentId,
+        sessionId,
+        policy: this.contextPolicy,
+        profile: sessionKind === "scheduled" ? "scheduled" : "normal",
+        trigger: "pre_turn",
+        contextWindow,
+        incomingTokens: estimateIncomingInput(modelContent),
+        instructions:
+          sessionKind === "scheduled"
+            ? "保留任务目标、已完成步骤、当前状态、待办与关键约束"
+            : undefined,
+        signal: activeChat?.controller.signal,
+        telemetry,
+        store: this.store,
+      });
+    } catch (err) {
+      if (activeChat?.controller.signal.aborted) throw new Error("Chat cancelled");
+      logger.warn("AgentManager", `Pre-turn compaction failed (fail-open): ${err}`);
+    }
+    if (preCompaction) {
+      EventBus.getInstance().publish({
+        type: "context.compacted",
+        agentId,
+        sessionId,
+        conversationId: String(conv.id),
+        trigger: preCompaction.trigger,
+        status: preCompaction.status,
+        beforeTokens: preCompaction.beforeTokens,
+        afterTokens: preCompaction.afterTokens,
+        durationMs: preCompaction.durationMs,
+        costUsd: preCompaction.costUsd,
+      });
+      if (preCompaction.status === "aborted" || activeChat?.controller.signal.aborted) {
+        throw new Error("Chat cancelled");
+      }
+    }
+
+    const turnId = crypto.randomUUID();
+    telemetry.beginTurn(String(conv.id), turnId);
     const turnStartedAt = Date.now();
+    const usageBefore = await snapshotUsage(this.harness!, conv.id);
 
     // turn 事件 sink (四期 M2): 流式 chunk 同步广播给监听方 (SessionHub →
     // WS 第二传输), 再交给调用方回调。无调用方回调但有监听方时也挂 watch——
@@ -1344,8 +1486,8 @@ export class AgentManager {
       });
     }
 
-    // Attach the framework's typed event stream (watchEvents) for streaming output;
-    // 不再读取 pi.live 内部文档结构, 框架升级时由编译期类型兜底
+    // Attach the framework's typed event stream (watchEvents): 流式输出 + 七期指标
+    // (首字、压缩事件、durationMs 兜底)。metrics 常驻，即使无人观看也挂 watch。
     let watch: AgentEventStream | undefined;
     let lastRenderedText = "";
     // 本轮消耗 = 轮内各 assistant 消息 usage 相加; 当前上下文 = 最后一条
@@ -1353,62 +1495,206 @@ export class AgentManager {
     // 相加, 虚高于真实上下文——实测踩坑, 勿改回差值口径)
     const turnAgg = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, reasoning: 0, cost: 0 };
     let lastMsgUsage: { input: number; cacheRead: number; cacheWrite: number } | undefined;
+    let firstTokenAt: number | undefined;
+    let compactionActive = 0;
+    let fallbackLlmMs = 0;
+    let fallbackToolMs = 0;
+    const compactionSnapshots = new Map<
+      string,
+      { startedAt: number; usageBefore: Awaited<ReturnType<typeof snapshotUsage>>; reason: string }
+    >();
+    let watchInFlight = 0;
+    const waitWatchDrain = async (timeoutMs = 1_000): Promise<void> => {
+      const deadline = Date.now() + timeoutMs;
+      while (watchInFlight > 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
 
-    if (sink) {
-      try {
-        watch = await watchEvents(this.harness!, conv.id, context);
-        let lastToolEvent = "";
-        watch.start(async (events) => {
-          for (const e of events) {
-            if (e.type === "message_end") {
-              // EntryRecord.model = 该条目贡献给模型上下文的消息数组;
-              // assistant 消息的 usage 是本次请求的计量 (input=未命中, cacheRead=命中);
-              // toolResult 消息可能带独立 usage (工具内部模型调用), 一并计入本轮消耗
-              const msgs = (e.entry as any)?.model as any[] | undefined;
-              for (const m of msgs ?? []) {
-                const usage = m?.usage;
-                if (!usage) continue;
-                turnAgg.input += usage.input ?? 0;
-                turnAgg.output += usage.output ?? 0;
-                turnAgg.cacheRead += usage.cacheRead ?? 0;
-                turnAgg.cacheWrite += usage.cacheWrite ?? 0;
-                turnAgg.totalTokens += usage.totalTokens ?? 0;
-                turnAgg.cost += usage.cost?.total ?? 0;
-                if (typeof usage.reasoning === "number") turnAgg.reasoning += usage.reasoning;
-                // 当前上下文取最后一条 assistant 消息的 prompt 侧 (含全部历史)
-                if (m.role === "assistant") {
-                  lastMsgUsage = { input: usage.input ?? 0, cacheRead: usage.cacheRead ?? 0, cacheWrite: usage.cacheWrite ?? 0 };
-                }
-              }
-            } else if (e.type === "message_update") {
-              for (const change of e.changes) {
-                if (change.type === "text_delta") {
-                  lastRenderedText += change.delta;
-                  sink({ delta: change.delta });
-                }
-              }
-            } else if (e.type === "tool_execution_start" || e.type === "tool_execution_update") {
-              if (lastToolEvent !== `${e.toolName}:running`) {
-                lastToolEvent = `${e.toolName}:running`;
-                sink({ toolCall: { name: e.toolName, status: "running" } });
-              }
-            } else if (e.type === "tool_execution_end") {
-              if (lastToolEvent !== `${e.toolName}:done`) {
-                lastToolEvent = `${e.toolName}:done`;
-                sink({ toolCall: { name: e.toolName, status: "done" } });
+    try {
+      watch = await watchEvents(this.harness!, conv.id, context);
+      let lastToolEvent = "";
+      watch.start(async (events) => {
+        watchInFlight++;
+        try {
+        for (const e of events) {
+          if (e.type === "message_end") {
+            // 压缩摘要的消息不计入用户可见的 turn usage（UsageDoc 差分仍包含其成本）
+            if (compactionActive > 0) continue;
+            // EntryRecord.model = 该条目贡献给模型上下文的消息数组;
+            // assistant 消息的 usage 是本次请求的计量 (input=未命中, cacheRead=命中);
+            // toolResult 消息可能带独立 usage (工具内部模型调用), 一并计入本轮消耗
+            const msgs = (e.entry as any)?.model as any[] | undefined;
+            for (const m of msgs ?? []) {
+              const usage = m?.usage;
+              if (!usage) continue;
+              turnAgg.input += usage.input ?? 0;
+              turnAgg.output += usage.output ?? 0;
+              turnAgg.cacheRead += usage.cacheRead ?? 0;
+              turnAgg.cacheWrite += usage.cacheWrite ?? 0;
+              turnAgg.totalTokens += usage.totalTokens ?? 0;
+              turnAgg.cost += usage.cost?.total ?? 0;
+              if (typeof usage.reasoning === "number") turnAgg.reasoning += usage.reasoning;
+              if (typeof m.durationMs === "number" && m.role === "assistant") fallbackLlmMs += m.durationMs;
+              if (typeof m.durationMs === "number" && m.role === "toolResult") fallbackToolMs += m.durationMs;
+              // 当前上下文取最后一条 assistant 消息的 prompt 侧 (含全部历史)
+              if (m.role === "assistant") {
+                lastMsgUsage = {
+                  input: usage.input ?? 0,
+                  cacheRead: usage.cacheRead ?? 0,
+                  cacheWrite: usage.cacheWrite ?? 0,
+                };
               }
             }
+          } else if (e.type === "message_update") {
+            for (const change of e.changes) {
+              if (
+                change.type === "text_start" ||
+                change.type === "text_delta" ||
+                change.type === "thinking_start" ||
+                change.type === "thinking_delta" ||
+                change.type === "toolcall_start" ||
+                change.type === "toolcall_delta"
+              ) {
+                if (firstTokenAt === undefined && compactionActive === 0) firstTokenAt = Date.now();
+              }
+              if (change.type === "text_delta") {
+                if (compactionActive > 0) continue;
+                lastRenderedText += change.delta;
+                sink?.({ delta: change.delta });
+              }
+            }
+          } else if (e.type === "tool_execution_start" || e.type === "tool_execution_update") {
+            if (lastToolEvent !== `${e.toolName}:running`) {
+              lastToolEvent = `${e.toolName}:running`;
+              sink?.({ toolCall: { name: e.toolName, status: "running" } });
+            }
+          } else if (e.type === "tool_execution_end") {
+            if (lastToolEvent !== `${e.toolName}:done`) {
+              lastToolEvent = `${e.toolName}:done`;
+              sink?.({ toolCall: { name: e.toolName, status: "done" } });
+            }
+          } else if (e.type === "compaction_start") {
+            compactionActive++;
+            const snapUsage = await snapshotUsage(this.harness!, conv.id);
+            compactionSnapshots.set(String(e.taskId), {
+              startedAt: Date.now(),
+              usageBefore: snapUsage,
+              reason: e.reason,
+            });
+          } else if (e.type === "compaction_end") {
+            compactionActive = Math.max(0, compactionActive - 1);
+            const key = String(e.taskId);
+            const snap = compactionSnapshots.get(key);
+            compactionSnapshots.delete(key);
+            const snapAfter = await snapshotUsage(this.harness!, conv.id);
+            const diff = snap?.usageBefore && snapAfter
+              ? diffUsageState(snap.usageBefore, snapAfter)
+              : emptyUsageDiff();
+            const endedAt = Date.now();
+            const startedAt = snap?.startedAt ?? endedAt;
+            try {
+              const taskId = e.taskId !== undefined ? String(e.taskId) : undefined;
+              const already = taskId
+                ? this.store.listCompactionEvents({ turnId, limit: 200 }).find((x) => x.taskId === taskId)
+                : undefined;
+              if (already?.id) {
+                this.store.updateCompactionEventMetrics(already.id, {
+                  requestCount: already.requestCount,
+                  traceId: telemetry.traceForTurn(turnId),
+                });
+                continue;
+              }
+              const eventId = this.store.insertCompactionEvent({
+                conversationId: String(conv.id),
+                agentId,
+                sessionId,
+                turnId,
+                taskId,
+                profile: sessionKind === "scheduled" ? "scheduled" : "normal",
+                trigger: e.reason === "overflow" ? "overflow" : e.reason === "manual" ? "manual" : "threshold",
+                startedAt,
+                endedAt,
+                durationMs: Math.max(0, endedAt - startedAt),
+                costUsd: diff.totals.costUsd,
+                costInTurn: true,
+                requestCount: Object.keys(diff.models).length,
+                status: e.error ? "failed" : "done",
+                failOpen: false,
+                error: e.error?.slice(0, 500),
+              });
+            } catch (err) {
+              logger.warn("AgentManager", `Failed to record in-turn compaction: ${err}`);
+            }
+            EventBus.getInstance().publish({
+              type: "context.compacted",
+              agentId,
+              sessionId,
+              conversationId: String(conv.id),
+              trigger: e.reason,
+              status: e.error ? "failed" : "done",
+              durationMs: Math.max(0, endedAt - startedAt),
+              costUsd: diff.totals.costUsd,
+            });
           }
-        });
-      } catch (e) {
-        logger.warn("AgentManager", `Failed to attach streaming watch: ${e}`);
-        watch = undefined;
-      }
+        }
+        } finally {
+          watchInFlight--;
+        }
+      });
+    } catch (e) {
+      logger.warn("AgentManager", `Failed to attach streaming watch: ${e}`);
+      watch = undefined;
+    }
+
+    const modelCost = agentForModel
+      ? this.models?.getModel(agentForModel.model.provider, agentForModel.model.modelId)?.cost
+      : undefined;
+    try {
+      this.store.insertLlmTurn({
+        turnId,
+        conversationId: String(conv.id),
+        agentId,
+        sessionId,
+        sessionKind,
+        schedulerTaskId,
+        provider: agentForModel?.model.provider,
+        modelId: agentForModel?.model.modelId,
+        startedAt: turnStartedAt,
+        requestCount: 0,
+        toolCount: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoningTokens: 0,
+        costUsd: 0,
+        priced: Boolean(
+          modelCost &&
+            (modelCost.input > 0 ||
+              modelCost.output > 0 ||
+              modelCost.cacheRead > 0 ||
+              modelCost.cacheWrite > 0 ||
+              (modelCost.tiers?.length ?? 0) > 0),
+        ),
+        contextWindow,
+        compactedBefore: preCompaction?.status === "done",
+        compactionMs: preCompaction?.durationMs ?? 0,
+        status: "running",
+        requestId: options?.requestId,
+        runKey: options?.runKey,
+        detailTruncated: false,
+      });
+    } catch (err) {
+      logger.warn("AgentManager", `Failed to record running turn (ignored): ${err}`);
     }
 
     try {
+      if (activeChat?.controller.signal.aborted) {
+        throw new Error("Chat cancelled");
+      }
       const submission = await conv.submit(
-        { type: "input", content: userMessage, requestId: options?.requestId },
+        { type: "input", content: modelContent, requestId: options?.requestId },
         context,
       );
       if (activeChat) {
@@ -1439,6 +1725,15 @@ export class AgentManager {
             }
           }
         }
+        // watch 的最终 message_end 可能因 stop() 丢弃：用最终 assistant usage 兜底，
+        // 保证 /status 的 contextTokens 与 sink usage 不为空（成本仍以 UsageDoc 差分为准）
+        if (assistantMsg?.role === "assistant" && assistantMsg.usage && !lastMsgUsage) {
+          lastMsgUsage = {
+            input: assistantMsg.usage.input ?? 0,
+            cacheRead: assistantMsg.usage.cacheRead ?? 0,
+            cacheWrite: assistantMsg.usage.cacheWrite ?? 0,
+          };
+        }
 
         // 流式已发送的内容与最终回答不是前缀关系时 (多轮工具调用导致生成重置),
         // 不能按长度切片, 否则发出错位的中段子串——改为显式补发完整回答
@@ -1452,46 +1747,151 @@ export class AgentManager {
           }
         }
 
+        // 七期：turn 成本以 UsageDoc 差分为真相源（含压缩摘要/工具内部调用），
+        // message_end 汇总只作兜底与 /status 的实时快照。
+        // 观测写入失败绝不能影响已经成功的回答（fail-open）。
+        let costUsd = turnAgg.cost;
+        let inputTokens = turnAgg.input;
+        let outputTokens = turnAgg.output;
+        let cacheRead = turnAgg.cacheRead;
+        let cacheWrite = turnAgg.cacheWrite;
+        const contextTokens = lastMsgUsage
+          ? lastMsgUsage.input + lastMsgUsage.cacheRead + lastMsgUsage.cacheWrite
+          : undefined;
+        const durationMs = Date.now() - turnStartedAt;
+        // 终端 /status 与会话累计也使用与 llm_turns 相同的账本（diff 可用时）
+        let usageForStats = turnAgg;
+        try {
+          await waitWatchDrain();
+          await telemetry.flush().catch(() => {});
+          const usageAfter = await snapshotUsage(this.harness!, conv.id);
+          const usageDiff = usageBefore && usageAfter
+            ? diffUsageState(usageBefore, usageAfter)
+            : emptyUsageDiff();
+          const requests = this.store.listLlmRequests(turnId);
+          const tools = this.store.listToolInvocations(turnId);
+          const generationRequests = requests
+            .filter((r) => r.taskKind === "generation" && r.kind === "request")
+            .sort((a, b) => a.startedAt - b.startedAt);
+          const firstGeneration = generationRequests[0];
+          const llmMs =
+            generationRequests.reduce((sum, r) => sum + (r.durationMs ?? 0), 0) || fallbackLlmMs;
+          const toolMs = tools.reduce((sum, t) => sum + (t.durationMs ?? 0), 0) || fallbackToolMs;
+          const ttftMs =
+            firstTokenAt === undefined
+              ? undefined
+              : Math.max(0, firstTokenAt - (firstGeneration?.startedAt ?? turnStartedAt));
+          let contextEstimateTokens = contextTokens;
+          if (contextEstimateTokens === undefined) {
+            // 只有 watch 没拿到 prompt 侧 usage 时才回读整段上下文估算
+            try {
+              const view = await conv.context(context);
+              contextEstimateTokens = estimateContextTokens(view.messages).tokens;
+            } catch {
+              /* keep undefined */
+            }
+          }
+          // 两个 snapshot 都成功时以 diff 为唯一真相（零也是有效值），
+          // 只有 snapshot 不可用时才整体回退到 message_end 汇总。
+          const hasUsageDiff = Boolean(usageBefore && usageAfter);
+          const diffCost = hasUsageDiff ? usageDiff.totals.costUsd : turnAgg.cost;
+          const diffInput = hasUsageDiff ? usageDiff.totals.input : turnAgg.input;
+          const diffOutput = hasUsageDiff ? usageDiff.totals.output : turnAgg.output;
+          const diffCacheRead = hasUsageDiff ? usageDiff.totals.cacheRead : turnAgg.cacheRead;
+          const diffCacheWrite = hasUsageDiff ? usageDiff.totals.cacheWrite : turnAgg.cacheWrite;
+          usageForStats = {
+            input: diffInput,
+            output: diffOutput,
+            cacheRead: diffCacheRead,
+            cacheWrite: diffCacheWrite,
+            totalTokens: diffInput + diffOutput + diffCacheRead + diffCacheWrite,
+            reasoning: hasUsageDiff ? usageDiff.totals.reasoning : turnAgg.reasoning,
+            cost: diffCost,
+          };
+          costUsd = diffCost;
+          inputTokens = diffInput;
+          outputTokens = diffOutput;
+          cacheRead = diffCacheRead;
+          cacheWrite = diffCacheWrite;
+          const traceId =
+            telemetry.traceForTurn(turnId) ?? telemetry.traceForSubmission(String(submission.id));
+          this.backfillInTurnCompactions({
+            conversationId: String(conv.id),
+            agentId,
+            sessionId,
+            sessionKind,
+            turnId,
+            requests,
+            traceId,
+          });
+          this.store.updateLlmTurn(turnId, {
+            endedAt: Date.now(),
+            durationMs,
+            firstChunkMs: firstGeneration?.firstChunkMs,
+            ttftMs,
+            llmMs,
+            toolMs,
+            requestCount: requests.length,
+            toolCount: tools.length,
+            inputTokens: diffInput,
+            outputTokens: diffOutput,
+            cacheRead: diffCacheRead,
+            cacheWrite: diffCacheWrite,
+            reasoningTokens: hasUsageDiff ? usageDiff.totals.reasoning : turnAgg.reasoning,
+            costUsd: diffCost,
+            usageJson: hasUsageDiff ? JSON.stringify(usageDiff) : undefined,
+            contextTokens,
+            contextEstimateTokens,
+            contextWindow,
+            status: "done",
+            traceId,
+            submissionId: String(submission.id),
+            detailTruncated: telemetry.wasTruncated(turnId),
+          });
+          EventBus.getInstance().publish({
+            type: "context.turn",
+            agentId,
+            sessionId,
+            conversationId: String(conv.id),
+            turnId,
+            status: "done",
+            contextTokens,
+            contextWindow,
+            costUsd: diffCost,
+          });
+        } catch (err) {
+          logger.warn("AgentManager", `Failed to record turn metrics (ignored): ${err}`);
+        }
+
         // 轮统计: 本轮消耗 = 轮内各 assistant 消息 usage 相加;
         // 当前上下文 = 最后一条 assistant 消息的 prompt 侧 (input+cacheRead+cacheWrite)
         // ——工具调用轮的"累计差值"会把多条消息 prompt 相加, 虚高于真实上下文 (实测踩坑)
         if (lastMsgUsage) {
-          const contextTokens = lastMsgUsage.input + lastMsgUsage.cacheRead + lastMsgUsage.cacheWrite;
-          const cacheHitRate = contextTokens > 0 ? (lastMsgUsage.cacheRead / contextTokens) * 100 : undefined;
-          let contextWindow = 0;
-          try {
-            const agent = this.store.getAgent(agentId);
-            if (agent) {
-              // 目录未命中的自定义模型 → 0 (终端只显示 tokens, 不显示假百分比);
-              // 目录命中优先 (如 deepseek-v4 = 1M, 厂商注册表不含这些 BYOK id)
-              contextWindow = this.models?.getModel(agent.model.provider, agent.model.modelId)?.contextWindow ?? 0;
-            }
-          } catch { /* 未知模型不显示百分比 */ }
-          const durationMs = Date.now() - turnStartedAt;
+          const cacheHitRate = contextTokens! > 0 ? (lastMsgUsage.cacheRead / contextTokens!) * 100 : undefined;
 
           // 会话 usage 快照 (跨轮累计): /status 命令与订阅方的会话上下文信息源。
           // 独立于 sink——即使无人观看 (IM 后台会话), 统计也持续累计
           this.recordUsageStats(`${agentId}:${sessionId}`, {
-            contextTokens,
+            contextTokens: contextTokens!,
             contextWindow,
             cacheHitRate,
-            turnAgg,
+            turnAgg: usageForStats,
             durationMs,
           });
 
           if (sink) {
             sink({
               usage: {
-                input: turnAgg.input,
-                output: turnAgg.output,
-                cacheRead: turnAgg.cacheRead,
-                cacheWrite: turnAgg.cacheWrite,
-                totalTokens: turnAgg.totalTokens,
-                reasoning: turnAgg.reasoning || undefined,
-                contextTokens,
+                input: inputTokens,
+                output: outputTokens,
+                cacheRead,
+                cacheWrite,
+                totalTokens: usageForStats.totalTokens,
+                reasoning: usageForStats.reasoning || undefined,
+                contextTokens: contextTokens!,
                 contextWindow,
                 cacheHitRate,
-                costTotal: turnAgg.cost,
+                costTotal: costUsd,
                 durationMs,
               },
             });
@@ -1503,7 +1903,78 @@ export class AgentManager {
         const reason = (settled as any).reason || "unknown";
         throw new Error(`Agent failed to answer: ${reason}`);
       }
+    } catch (err) {
+      const aborted =
+        activeChat?.controller.signal.aborted === true ||
+        /cancel/i.test(String(err)) ||
+        /\babort(ed)?\b/i.test(String(err));
+      try {
+        const endedAt = Date.now();
+        await waitWatchDrain();
+        const usageAfter = await snapshotUsage(this.harness!, conv.id).catch(() => undefined);
+        const usageDiff = usageBefore && usageAfter
+            ? diffUsageState(usageBefore, usageAfter)
+            : emptyUsageDiff();
+        await telemetry.flush().catch(() => {});
+        const requests = this.store.listLlmRequests(turnId);
+        const tools = this.store.listToolInvocations(turnId);
+        const generationRequests = requests
+          .filter((r) => r.taskKind === "generation" && r.kind === "request")
+          .sort((a, b) => a.startedAt - b.startedAt);
+        const firstGeneration = generationRequests[0];
+        const hasUsageDiff = Boolean(usageBefore && usageAfter);
+        const costUsd = hasUsageDiff ? usageDiff.totals.costUsd : turnAgg.cost;
+        const turnTraceId = telemetry.traceForTurn(turnId);
+        this.backfillInTurnCompactions({
+          conversationId: String(conv.id),
+          agentId,
+          sessionId,
+          sessionKind,
+          turnId,
+          requests,
+          traceId: turnTraceId,
+        });
+        this.store.updateLlmTurn(turnId, {
+          endedAt,
+          durationMs: Math.max(0, endedAt - turnStartedAt),
+          firstChunkMs: firstGeneration?.firstChunkMs,
+          ttftMs:
+            firstTokenAt === undefined
+              ? undefined
+              : Math.max(0, firstTokenAt - (firstGeneration?.startedAt ?? turnStartedAt)),
+          llmMs: generationRequests.reduce((sum, r) => sum + (r.durationMs ?? 0), 0) || fallbackLlmMs,
+          toolMs: tools.reduce((sum, t) => sum + (t.durationMs ?? 0), 0) || fallbackToolMs,
+          requestCount: requests.length,
+          toolCount: tools.length,
+          inputTokens: hasUsageDiff ? usageDiff.totals.input : turnAgg.input,
+          outputTokens: hasUsageDiff ? usageDiff.totals.output : turnAgg.output,
+          cacheRead: hasUsageDiff ? usageDiff.totals.cacheRead : turnAgg.cacheRead,
+          cacheWrite: hasUsageDiff ? usageDiff.totals.cacheWrite : turnAgg.cacheWrite,
+          reasoningTokens: hasUsageDiff ? usageDiff.totals.reasoning : turnAgg.reasoning,
+          costUsd,
+          usageJson: hasUsageDiff ? JSON.stringify(usageDiff) : undefined,
+          status: aborted ? "aborted" : "error",
+          error: String(err).slice(0, 500),
+          traceId: telemetry.traceForTurn(turnId),
+          detailTruncated: telemetry.wasTruncated(turnId),
+        });
+        EventBus.getInstance().publish({
+          type: "context.turn",
+          agentId,
+          sessionId,
+          conversationId: String(conv.id),
+          turnId,
+          status: aborted ? "aborted" : "error",
+          contextTokens: lastMsgUsage ? lastMsgUsage.input + lastMsgUsage.cacheRead + lastMsgUsage.cacheWrite : undefined,
+          contextWindow,
+          costUsd,
+        });
+      } catch (metricsErr) {
+        logger.warn("AgentManager", `Failed to record failed turn metrics (ignored): ${metricsErr}`);
+      }
+      throw err;
     } finally {
+      telemetry.endTurn(String(conv.id), turnId);
       if (watch) {
         await watch.stop().catch(() => {});
       }
@@ -1515,17 +1986,32 @@ export class AgentManager {
    * 返回 true = 该会话确实在生成中且已发出 abort; 会话未缓存或空闲则无事发生。
    */
   public async abortSession(agentId: string, sessionId: string): Promise<boolean> {
-    const key = sessionKey(agentId, sessionId);
-    if (!this.busyTurns.has(key)) return false;
-    const conv = this.busyTurns.get(key)!;
-    try {
-      await conv.abort(BACKGROUND_CONTEXT);
-      logger.info("AgentManager", `Aborted active generation for ${agentId}:${sessionId}`);
-      return true;
-    } catch (err) {
-      logger.warn("AgentManager", `Abort failed for ${agentId}:${sessionId}: ${err}`);
-      return false;
+    let aborted = false;
+    // 先取消宿主侧 signal：前置压缩/idle 检查/估算窗口内 conversation 可能已经 idle，
+    // 仅 conv.abort() 不会阻止随后 submit（七期评审 BLOCKING）。
+    const activeKeys = new Set<string>([`${agentId}:${sessionId}`]);
+    if (sessionId.startsWith("scheduler:")) {
+      activeKeys.add(`task:${sessionId.slice("scheduler:".length)}`);
     }
+    for (const key of activeKeys) {
+      const entry = this.activeChats.get(key);
+      if (entry && !entry.controller.signal.aborted) {
+        entry.controller.abort();
+        aborted = true;
+      }
+    }
+    const key = sessionKey(agentId, sessionId);
+    const conv = this.busyTurns.get(key);
+    if (conv) {
+      try {
+        await conv.abort(BACKGROUND_CONTEXT);
+        logger.info("AgentManager", `Aborted active generation for ${agentId}:${sessionId}`);
+        aborted = true;
+      } catch (err) {
+        logger.warn("AgentManager", `Abort failed for ${agentId}:${sessionId}: ${err}`);
+      }
+    }
+    return aborted;
   }
 
   public async resetSession(
@@ -1542,16 +2028,177 @@ export class AgentManager {
     });
   }
 
+  /**
+   * 七期：轮内压缩事件回填。watch 的 compaction_end 可能还在 pending frames 中，
+   * 这里以已 flush 的请求明细（task_kind=compaction + task_id）为准补齐事件，
+   * 并按 task_id 精确统计请求数与 trace；失败只告警，不影响 turn 终态。
+   */
+  private backfillInTurnCompactions(input: {
+    conversationId: string;
+    agentId: string;
+    sessionId: string;
+    sessionKind: SessionKind;
+    turnId: string;
+    requests: LlmRequestRecord[];
+    traceId?: string;
+  }): void {
+    try {
+      const groups = new Map<string, LlmRequestRecord[]>();
+      for (const request of input.requests) {
+        if (request.taskKind !== "compaction" || !request.taskId) continue;
+        const rows = groups.get(request.taskId) ?? [];
+        rows.push(request);
+        groups.set(request.taskId, rows);
+      }
+      if (groups.size === 0) return;
+      const existing = this.store.listCompactionEvents({ turnId: input.turnId, limit: 200 });
+      const byTask = new Map(
+        existing.filter((e) => e.taskId).map((e) => [e.taskId!, e] as const),
+      );
+      for (const [taskId, rows] of groups) {
+        const already = byTask.get(taskId);
+        if (already?.id) {
+          // watch 已写入权威事件：只补真实请求数与 trace
+          this.store.updateCompactionEventMetrics(already.id, {
+            requestCount: rows.length,
+            traceId: input.traceId,
+          });
+          continue;
+        }
+        const startedAt = Math.min(...rows.map((r) => r.startedAt));
+        const endedAt = Math.max(...rows.map((r) => r.endedAt ?? r.startedAt));
+        const status = rows.some((r) => r.status === "error")
+          ? "failed"
+          : rows.some((r) => r.status === "aborted")
+            ? "aborted"
+            : "done";
+        this.store.insertCompactionEvent({
+          conversationId: input.conversationId,
+          agentId: input.agentId,
+          sessionId: input.sessionId,
+          turnId: input.turnId,
+          taskId,
+          traceId: input.traceId,
+          profile: input.sessionKind === "scheduled" ? "scheduled" : "normal",
+          trigger: "threshold",
+          startedAt,
+          endedAt,
+          durationMs: Math.max(0, endedAt - startedAt),
+          costUsd: rows.reduce((sum, r) => sum + r.costUsd, 0),
+          costInTurn: true,
+          requestCount: rows.length,
+          status,
+          failOpen: false,
+        });
+      }
+    } catch (err) {
+      logger.warn("AgentManager", `Failed to backfill in-turn compactions (ignored): ${err}`);
+    }
+  }
+
+  /**
+   * 手动压缩。scheduler 会话必须走 openSchedulerConversation：
+   * scheduler 的映射 peerId 是 `scheduler:<taskId>`（无 agentId 前缀），
+   * getOrCreateConversation 查不到会新建一个错误的会话。
+   */
   public async compactSession(
     agentId: string,
     sessionId: string,
     instructions?: string,
-  ): Promise<void> {
-    await this.withSessionLock(`${agentId}:${sessionId}`, async () => {
-      const conv = await this.getOrCreateConversation(agentId, sessionId);
-      await conv.compact(instructions, BACKGROUND_CONTEXT);
-      logger.info("AgentManager", `Compacted session for ${agentId}:${sessionId}`);
+  ): Promise<CompactionOutcome> {
+    // 在任何 await 之前登记 drain 等待面；REST 二次检查后到这里仍可能开始 drain。
+    this.manualCompactions++;
+    try {
+      return await this.withSessionLock(`${agentId}:${sessionId}`, async () => {
+        const taskId = sessionId.startsWith("scheduler:") ? sessionId.slice("scheduler:".length) : undefined;
+        const conv = taskId
+          ? await this.openSchedulerConversation(agentId, taskId)
+          : await this.getOrCreateConversation(agentId, sessionId);
+        return this.runManualCompaction(agentId, sessionId, conv, instructions);
+      });
+    } finally {
+      this.manualCompactions = Math.max(0, this.manualCompactions - 1);
+    }
+  }
+
+  /** conversationId → 与 chat 一致的 {agentId, sessionId}（REST/命令/压缩共用）。 */
+  public resolveConversationSession(
+    conversationId: string,
+  ): { agentId: string; sessionId: string } | undefined {
+    const scheduled = this.store.getScheduledTaskByConversation(conversationId);
+    if (scheduled) {
+      return { agentId: scheduled.agentId, sessionId: `scheduler:${scheduled.id}` };
+    }
+    const session = this.store.getSessionByConversation(conversationId);
+    if (!session) return undefined;
+    let sessionId: string;
+    if (session.peerId.startsWith("scheduler:")) {
+      sessionId = session.peerId;
+    } else if (session.channelInstanceId === MAPPING_CHANNEL) {
+      const prefix = `${session.agentId}:`;
+      sessionId = session.peerId.startsWith(prefix)
+        ? session.peerId.slice(prefix.length)
+        : session.peerId;
+    } else {
+      sessionId = `${session.channelInstanceId}:${session.peerId}`;
+    }
+    return { agentId: session.agentId, sessionId };
+  }
+
+  public isConversationBusy(conversationId: string): boolean {
+    const resolved = this.resolveConversationSession(conversationId);
+    return resolved ? this.isBusy(resolved.agentId, resolved.sessionId) : false;
+  }
+
+  /** 管理台按 conversationId 手动压缩（真实渠道 / sentinel / scheduler 统一入口）。 */
+  public async compactConversation(conversationId: string, instructions?: string): Promise<CompactionOutcome> {
+    const resolved = this.resolveConversationSession(conversationId);
+    if (!resolved) throw new ConversationMissing(conversationId);
+    return this.compactSession(resolved.agentId, resolved.sessionId, instructions);
+  }
+
+  private async runManualCompaction(
+    agentId: string,
+    sessionId: string,
+    conv: Conversation,
+    instructions?: string,
+  ): Promise<CompactionOutcome> {
+    if (!this.harness) throw new Error("Agent Harness is not initialized");
+    const agent = this.store.getAgent(agentId);
+    const contextWindow = agent
+      ? (this.models?.getModel(agent.model.provider, agent.model.modelId)?.contextWindow ?? 0)
+      : 0;
+    const outcome = await compactConversationNow({
+      harness: this.harness,
+      conversation: conv,
+      conversationId: String(conv.id),
+      agentId,
+      sessionId,
+      policy: this.contextPolicy,
+      profile: "manual",
+      trigger: "manual",
+      contextWindow,
+      instructions,
+      telemetry: getContextTelemetry(),
+      store: this.store,
     });
+    EventBus.getInstance().publish({
+      type: "context.compacted",
+      agentId,
+      sessionId,
+      conversationId: String(conv.id),
+      trigger: "manual",
+      status: outcome.status,
+      beforeTokens: outcome.beforeTokens,
+      afterTokens: outcome.afterTokens,
+      durationMs: outcome.durationMs,
+      costUsd: outcome.costUsd,
+    });
+    logger.info(
+      "AgentManager",
+      `Manual compaction for ${agentId}:${sessionId}: ${outcome.status} (${outcome.beforeTokens ?? "?"} → ${outcome.afterTokens ?? "?"})`,
+    );
+    return outcome;
   }
 }
 

@@ -11,6 +11,15 @@ import type {
   DurableTaskInfo,
   McpServer,
   ModelProvider,
+  ModelMetadataCandidatesResponse,
+  ModelMetadataResponse,
+  ModelMetadataRow,
+  ModelMetadataOverride,
+  ContextPolicyResponse,
+  ContextPolicy,
+  ContextSessionRow,
+  ContextSessionTurns,
+  ContextTurnDetail,
   ScheduledTask,
   ScheduledTaskRun,
   ScheduleType,
@@ -139,6 +148,84 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req),
     }),
+
+  listModelMetadata: (providerId?: string) =>
+    request<ModelMetadataResponse>(
+      `/api/model-metadata${providerId ? `?providerId=${encodeURIComponent(providerId)}` : ""}`,
+    ),
+  listModelMetadataCandidates: (providerId: string, modelId: string, q?: string) =>
+    request<ModelMetadataCandidatesResponse>(
+      `/api/model-metadata/candidates?providerId=${encodeURIComponent(providerId)}&modelId=${encodeURIComponent(modelId)}${
+        q ? `&q=${encodeURIComponent(q)}` : ""
+      }`,
+    ),
+  saveModelMetadata: (input: {
+    providerId: string;
+    modelId: string;
+    overrides?: ModelMetadataOverride;
+    reference?: { providerId: string; modelId: string };
+    reset?: boolean;
+  }) =>
+    request<ModelMetadataRow & { priced: boolean }>("/api/model-metadata", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  refreshModelMetadata: () =>
+    request<{
+      providers: number;
+      models: number;
+      matched: number;
+      builtin: number;
+      fallback: number;
+      manualPreserved: number;
+      fetchedAt: number;
+      changed: boolean;
+    }>("/api/model-metadata/refresh", { method: "POST" }),
+
+  getContextPolicy: () => request<ContextPolicyResponse>("/api/context/policy"),
+  saveContextPolicy: (policy: ContextPolicy) =>
+    request<{ success: boolean; policy: ContextPolicy }>("/api/context/policy", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ policy }),
+    }),
+  listContextSessions: (params: {
+    agentId?: string;
+    kind?: "normal" | "scheduled";
+    from?: number;
+    to?: number;
+    q?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const usp = new URLSearchParams();
+    if (params.agentId) usp.set("agentId", params.agentId);
+    if (params.kind) usp.set("kind", params.kind);
+    if (params.from !== undefined) usp.set("from", String(params.from));
+    if (params.to !== undefined) usp.set("to", String(params.to));
+    if (params.q) usp.set("q", params.q);
+    usp.set("limit", String(params.limit ?? 100));
+    usp.set("offset", String(params.offset ?? 0));
+    return request<{ rows: ContextSessionRow[]; total: number; limit: number; offset: number }>(
+      `/api/context/sessions?${usp.toString()}`,
+    );
+  },
+  contextTurns: (conversationId: string, limit = 50, offset = 0) =>
+    request<ContextSessionTurns>(
+      `/api/context/sessions/${encodeURIComponent(conversationId)}/turns?limit=${limit}&offset=${offset}`,
+    ),
+  contextTurnDetail: (turnId: string) =>
+    request<ContextTurnDetail>(`/api/context/turns/${encodeURIComponent(turnId)}`),
+  compactConversation: (conversationId: string, instructions?: string) =>
+    request<Record<string, unknown>>(
+      `/api/context/sessions/${encodeURIComponent(conversationId)}/compact`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instructions }),
+      },
+    ),
 
   listChannelTypes: () => request<ChannelTypeDescriptor[]>("/api/channel-types"),
   listChannels: () => request<Channel[]>("/api/channels"),

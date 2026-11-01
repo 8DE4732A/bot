@@ -21,11 +21,40 @@ export type PlatformEvent =
   | SchedulerCompletedEvent
   | SandboxViolationEvent
   | ChatTurnEvent
+  | ContextTurnEvent
+  | ContextCompactedEvent
   | ChannelStatusEvent
   | ChannelHealthEvent
   | TaskUpdatedEvent
   | AuditRecordedEvent
   | WorkspaceChangedEvent;
+
+/** 七期：一轮对话的上下文/成本快照（管理台「上下文」页静默刷新）。 */
+export interface ContextTurnEvent {
+  type: "context.turn";
+  agentId: string;
+  sessionId: string;
+  conversationId: string;
+  turnId: string;
+  status: string;
+  contextTokens?: number;
+  contextWindow?: number;
+  costUsd?: number;
+}
+
+/** 七期：压缩完成/失败/跳过。 */
+export interface ContextCompactedEvent {
+  type: "context.compacted";
+  agentId?: string;
+  sessionId?: string;
+  conversationId: string;
+  trigger: string;
+  status: string;
+  beforeTokens?: number;
+  afterTokens?: number;
+  durationMs?: number;
+  costUsd?: number;
+}
 
 /** 工作区技能/记忆发生变化 (五期; 管理台静默刷新用) */
 export interface WorkspaceChangedEvent {

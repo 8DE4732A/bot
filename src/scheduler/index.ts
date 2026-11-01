@@ -187,6 +187,8 @@ export class SchedulerManager {
         task.agentId,
         `scheduler:${task.id}`,
         triggerMessage,
+        undefined,
+        { messageTime: startedAt },
       );
 
       const runStatus = task.scheduleType === "once" ? "done" : "ok";

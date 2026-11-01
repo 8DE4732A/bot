@@ -52,7 +52,13 @@ function installQueueDriver(store: DatabaseStore): void {
     for (const row of leftovers) {
       const key = `${row.agentId}:${row.sessionId}`;
       const queue = sessionQueues.get(key) ?? [];
-      queue.push({ dbId: row.id, agentId: row.agentId, sessionId: row.sessionId, message: row.message });
+      queue.push({
+        dbId: row.id,
+        agentId: row.agentId,
+        sessionId: row.sessionId,
+        message: row.message,
+        createdAt: row.createdAt,
+      });
       sessionQueues.set(key, queue);
     }
     if (leftovers.length > 0) {
@@ -120,7 +126,9 @@ async function dispatchQueueFor(key: string, sharedDurable?: number): Promise<vo
   if (fresh.length === 0) sessionQueues.delete(key);
   logger.debug("WsGateway", `Queued prompt dispatched for ${key} (${fresh.length} remaining)`);
   void manager
-    .chat(head.agentId, head.sessionId, head.message)
+    .chat(head.agentId, head.sessionId, head.message, undefined, {
+      messageTime: head.createdAt,
+    })
     .then(() => {
       // 投递成功删持久化行 (失败保留, 重启后恢复重投)
       if (head.dbId) queueStore?.deleteQueuedPrompt(head.dbId);
@@ -328,7 +336,13 @@ async function handleClient(client: WebSocket, hub: SessionHub): Promise<void> {
                 if (queue.length >= 16) throw new Error("queue full (16); wait for the current turn to finish");
                 // 受理即落库 (R2 评审 B6): 持久化行随队列条目, 出队成功/清空删除
                 const dbId = queueStore!.enqueueQueuedPrompt(p.agentId!, p.sessionId!, p.message);
-                queue.push({ dbId, agentId: p.agentId!, sessionId: p.sessionId!, message: p.message });
+                queue.push({
+                  dbId,
+                  agentId: p.agentId!,
+                  sessionId: p.sessionId!,
+                  message: p.message,
+                  createdAt: Date.now(),
+                });
                 sessionQueues.set(key, queue);
                 send(client, { id, result: { accepted: "queued", position: queue.length } });
               }

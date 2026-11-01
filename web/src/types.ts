@@ -387,3 +387,297 @@ export interface DurableTaskInfo {
   restarts: number;
   startedAt?: number;
 }
+
+/* ---------------- 上下文管理与可观测性（七期） ---------------- */
+
+export type StrategyScope = "all" | "normal" | "scheduled";
+
+export interface GlobalContextStrategy {
+  enabled: boolean;
+  percent: number;
+  minTokens: number;
+}
+
+export interface ScheduledHeuristicStrategy {
+  enabled: boolean;
+  sampleSize: number;
+  multiplier: number;
+  fallbackTokens: number;
+  minTokens: number;
+  maxPercentOfWindow: number;
+}
+
+export interface FixedContextStrategy {
+  enabled: boolean;
+  tokens: number;
+  minTokens: number;
+  scope: StrategyScope;
+}
+
+export interface IdleContextStrategy {
+  enabled: boolean;
+  idleHours: number;
+  minTokens: number;
+}
+
+export interface ContextStrategies {
+  global: GlobalContextStrategy;
+  scheduledHeuristic: ScheduledHeuristicStrategy;
+  fixed: FixedContextStrategy;
+  idle: IdleContextStrategy;
+}
+
+export interface ContextPolicy {
+  strategies: ContextStrategies;
+  safetyTokens: number;
+  keepRecentCapTokens: number;
+  emergencyReserveCapTokens: number;
+  timeoutMs: number;
+  settleTimeoutMs: number;
+  retentionDays: number;
+  detailRetentionDays: number;
+}
+
+export interface EffectiveContextThreshold {
+  providerId: string;
+  modelId: string;
+  contextWindow: number;
+  keepRecentTokens: number;
+  globalThreshold: number;
+  scheduledFallbackThreshold: number;
+  fixedThreshold: number;
+  idleHours: number;
+}
+
+export interface ContextPolicyResponse {
+  policy: ContextPolicy;
+  effective: EffectiveContextThreshold[];
+  catalogFetchedAt?: number;
+}
+
+export interface ContextSessionRow {
+  conversationId: string;
+  agentId: string;
+  agentName?: string;
+  sessionId: string;
+  sessionKind: "normal" | "scheduled";
+  schedulerTaskId?: string;
+  schedulerTaskName?: string;
+  channelType?: string;
+  label?: string;
+  provider?: string;
+  modelId?: string;
+  contextTokens?: number;
+  contextWindow?: number;
+  fillRatio?: number;
+  turns: number;
+  costUsd: number;
+  priced: boolean;
+  lastActiveAt: number;
+  compactions: number;
+  status?: string;
+}
+
+export interface ContextTurn {
+  turnId: string;
+  conversationId: string;
+  agentId: string;
+  sessionId: string;
+  sessionKind: string;
+  schedulerTaskId?: string;
+  provider?: string;
+  modelId?: string;
+  startedAt: number;
+  endedAt?: number;
+  durationMs?: number;
+  firstChunkMs?: number;
+  ttftMs?: number;
+  llmMs?: number;
+  toolMs?: number;
+  requestCount: number;
+  toolCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheRead: number;
+  cacheWrite: number;
+  reasoningTokens: number;
+  costUsd: number;
+  priced: boolean;
+  contextTokens?: number;
+  contextEstimateTokens?: number;
+  contextWindow?: number;
+  compactedBefore: boolean;
+  compactionMs: number;
+  status: string;
+  error?: string;
+  requestId?: string;
+  runKey?: string;
+  traceId?: string;
+  detailTruncated: boolean;
+}
+
+export interface ContextRequest {
+  spanId: string;
+  turnId?: string;
+  conversationId?: string;
+  traceId?: string;
+  parentSpanId?: string;
+  kind: "request" | "poll";
+  taskKind?: "generation" | "compaction" | "tool";
+  compactionId?: string;
+  provider?: string;
+  modelId?: string;
+  api?: string;
+  startedAt: number;
+  endedAt?: number;
+  durationMs?: number;
+  firstChunkMs?: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheRead: number;
+  cacheWrite: number;
+  reasoningTokens: number;
+  costUsd: number;
+  stopReason?: string;
+  status: string;
+  error?: string;
+}
+
+export interface ContextTool {
+  turnId?: string;
+  conversationId?: string;
+  traceId?: string;
+  taskId?: string;
+  toolCallId?: string;
+  toolName: string;
+  startedAt: number;
+  endedAt?: number;
+  durationMs?: number;
+  status: string;
+  error?: string;
+}
+
+export interface CompactionEvent {
+  conversationId: string;
+  agentId?: string;
+  sessionId?: string;
+  turnId?: string;
+  taskId?: string;
+  traceId?: string;
+  compactionId?: string;
+  profile: "normal" | "scheduled" | "manual";
+  trigger:
+    | "pre_turn"
+    | "pre_turn_global"
+    | "pre_turn_scheduled"
+    | "pre_turn_fixed"
+    | "pre_turn_idle"
+    | "manual"
+    | "threshold"
+    | "overflow";
+  thresholdTokens?: number;
+  keepRecentTokens?: number;
+  beforeTokens?: number;
+  afterTokens?: number;
+  beforeEstimateTokens?: number;
+  afterEstimateTokens?: number;
+  beforeEntries?: number;
+  afterEntries?: number;
+  startedAt: number;
+  endedAt?: number;
+  durationMs?: number;
+  costUsd?: number;
+  costInTurn: boolean;
+  requestCount: number;
+  status: string;
+  failOpen: boolean;
+  error?: string;
+}
+
+export interface ContextSessionTurns {
+  conversationId: string;
+  turns: ContextTurn[];
+  total: number;
+  compactions: CompactionEvent[];
+}
+
+export interface ContextTurnDetail {
+  turn: ContextTurn;
+  requests: ContextRequest[];
+  tools: ContextTool[];
+  compactions: CompactionEvent[];
+}
+
+export interface ModelMetadataReference {
+  providerId: string;
+  providerName?: string;
+  modelId: string;
+  displayName?: string;
+  matchedAt: number;
+}
+
+export interface ModelMetadataRow {
+  providerId: string;
+  providerName: string;
+  protocol: string;
+  modelId: string;
+  displayName?: string;
+  contextWindow: number;
+  maxOutputTokens: number;
+  inputModalities: string[];
+  outputModalities: string[];
+  reasoning: boolean;
+  toolCall: boolean;
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  costTiers: { inputTokensAbove: number; input: number; output: number; cacheRead: number; cacheWrite: number }[];
+  source: string;
+  priced: boolean;
+  auto: Record<string, unknown> | null;
+  autoSource?: string | null;
+  manual: Record<string, unknown> | null;
+  reference?: ModelMetadataReference | null;
+  matchedProvider?: string;
+  matchedModel?: string;
+}
+
+export interface ModelMetadataCandidate {
+  providerKey: string;
+  providerName?: string;
+  modelKey: string;
+  displayName?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  inputModalities?: string[];
+  outputModalities?: string[];
+  reasoning?: boolean;
+  toolCall?: boolean;
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  costTiers?: { inputTokensAbove: number; input: number; output: number; cacheRead: number; cacheWrite: number }[];
+  priced: boolean;
+  canonicalModelId?: string;
+  match: "exact" | "normalized";
+  preferredProvider: boolean;
+}
+
+export interface ModelMetadataCandidatesResponse {
+  candidates: ModelMetadataCandidate[];
+  total: number;
+  catalog: { fetchedAt: number; lastCheckedAt: number; providerCount: number; modelCount: number } | null;
+}
+
+export interface ModelMetadataResponse {
+  models: ModelMetadataRow[];
+  catalog: { fetchedAt: number; lastCheckedAt: number; providerCount: number; modelCount: number } | null;
+}
+
+export interface ModelMetadataOverride {
+  displayName?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  inputModalities?: string[];
+  outputModalities?: string[];
+  reasoning?: boolean;
+  toolCall?: boolean;
+  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  costTiers?: { inputTokensAbove: number; input: number; output: number; cacheRead: number; cacheWrite: number }[];
+}

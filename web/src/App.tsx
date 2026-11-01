@@ -7,6 +7,7 @@ import { AgentsView } from "./views/AgentsView";
 import { AuditView } from "./views/AuditView";
 import { ChannelsView } from "./views/ChannelsView";
 import { ChatView } from "./views/ChatView";
+import { ContextView } from "./views/ContextView";
 import { McpView } from "./views/McpView";
 import { OverviewView } from "./views/OverviewView";
 import { ProvidersView } from "./views/ProvidersView";
@@ -32,6 +33,7 @@ const VIEWS: ViewDef[] = [
   { view: "mcp", label: "MCP 服务", icon: "plug", render: () => <McpView /> },
   { view: "tasks", label: "定时任务", icon: "clock", render: () => <ScheduledTasksView /> },
   { view: "sessions", label: "会话浏览", icon: "layers", render: () => <SessionsView /> },
+  { view: "context", label: "上下文", icon: "layers", render: () => <ContextView /> },
   { view: "chat", label: "对话调试", icon: "message", render: ({ agentId }) => <ChatView initialAgentId={agentId} /> },
   { view: "audit", label: "沙盒审计", icon: "shield", render: () => <AuditView /> },
 ];

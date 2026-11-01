@@ -3,8 +3,14 @@ import { googleGenerativeAIApi } from "@earendil-works/pi-ai/api/google-generati
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { createModels, createProvider } from "@earendil-works/pi-ai/models";
-import { DatabaseStore, type ModelProtocol, type ModelProviderDefinition } from "../config/database-store.ts";
-import { lookupContextWindow } from "../config/context-windows.ts";
+import {
+  DatabaseStore,
+  type AgentDefinition,
+  type ModelMetadataRecord,
+  type ModelProtocol,
+  type ModelProviderDefinition,
+} from "../config/database-store.ts";
+import { effectiveModelMetadataFromRecord, resolveModelMetadata } from "./model-metadata.ts";
 import { logger } from "../utils/logger.ts";
 
 export class ModelFactory {
@@ -21,10 +27,16 @@ export class ModelFactory {
   public static createConfiguredModels() {
     const models = createModels();
     const providers = this.store.listModelProviders();
+    // 一次性预取 agents/metadata，避免每 provider/每 model 重复 SELECT。
+    const agents = this.store.listAgents();
+    const metadata = new Map<string, ModelMetadataRecord>();
+    for (const record of this.store.listModelMetadata()) {
+      metadata.set(`${record.providerId}/${record.modelId}`, record);
+    }
 
     for (const p of providers) {
       try {
-        const providerInstance = this.buildProviderInstance(p);
+        const providerInstance = this.buildProviderInstance(p, { agents, metadata });
         models.setProvider(providerInstance);
         logger.debug("ModelFactory", `Registered BYOK provider: ${p.id} (${p.models.length} models)`);
       } catch (err) {
@@ -35,7 +47,10 @@ export class ModelFactory {
     return models;
   }
 
-  public static buildProviderInstance(p: ModelProviderDefinition) {
+  public static buildProviderInstance(
+    p: ModelProviderDefinition,
+    context?: { agents?: AgentDefinition[]; metadata?: Map<string, ModelMetadataRecord> },
+  ) {
     let api: any;
     switch (p.protocol) {
       case "openai-responses":
@@ -56,7 +71,7 @@ export class ModelFactory {
     const isStandardOpenAiHost = p.apiBase.includes("api.openai.com");
     const registeredModelIds = new Set<string>(p.models && p.models.length > 0 ? p.models : ["default"]);
     try {
-      const agents = this.store.listAgents();
+      const agents = context?.agents ?? this.store.listAgents();
       for (const a of agents) {
         if (a.model?.provider === p.id && a.model.modelId) {
           registeredModelIds.add(a.model.modelId);
@@ -66,24 +81,35 @@ export class ModelFactory {
       // ignore
     }
 
-    const modelEntries = Array.from(registeredModelIds).map((modelId) => ({
-      id: modelId,
-      name: modelId,
-      type: "chat" as const,
-      api: p.protocol as any,
-      provider: p.id,
-      baseUrl: p.apiBase,
-      reasoning: false,
-      input: ["text" as const],
-      // 目录未命中 → 0: 终端只显示 tokens 不显示假百分比 (pi-ai 内部不依赖此值做决策)
-      contextWindow: lookupContextWindow(modelId) ?? 0,
-      maxTokens: 8192,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      compat: {
-        supportsStore: isStandardOpenAiHost,
-        supportsDeveloperRole: isStandardOpenAiHost,
-      },
-    }));
+    const modelEntries = Array.from(registeredModelIds).map((modelId) => {
+      const meta = context?.metadata
+        ? effectiveModelMetadataFromRecord(p, modelId, context.metadata.get(`${p.id}/${modelId}`))
+        : resolveModelMetadata(p, modelId);
+      return {
+        id: modelId,
+        name: meta.displayName ?? modelId,
+        type: "chat" as const,
+        api: p.protocol as any,
+        provider: p.id,
+        baseUrl: p.apiBase,
+        reasoning: meta.reasoning,
+        input: meta.inputModalities.filter((m): m is "text" | "image" => m === "text" || m === "image"),
+        // 目录未命中 → 0: 终端只显示 tokens 不显示假百分比 (pi-ai 内部不依赖此值做决策)
+        contextWindow: meta.contextWindow,
+        maxTokens: meta.maxOutputTokens,
+        cost: {
+          input: meta.cost.input,
+          output: meta.cost.output,
+          cacheRead: meta.cost.cacheRead,
+          cacheWrite: meta.cost.cacheWrite,
+          ...(meta.costTiers && meta.costTiers.length > 0 ? { tiers: meta.costTiers } : {}),
+        },
+        compat: {
+          supportsStore: isStandardOpenAiHost,
+          supportsDeveloperRole: isStandardOpenAiHost,
+        },
+      };
+    });
 
     return createProvider({
       id: p.id,

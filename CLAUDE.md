@@ -1,6 +1,6 @@
 # Bot Agent — 基于 pi-durable 的轻量级多 Agent 平台
 
-> 架构详解、pi-durable 框架理解见 **docs/TECHNICAL.md**；渠道平台（声明式注册表/出站媒体/访问策略/weixin·qq 协议）见 **docs/CHANNEL-PLATFORM.md**；二期设计（SKILL/MCP/统一技能模型，已交付）见 **docs/PHASE2-DESIGN.md**；三期设计（多渠道：飞书/QQ/微信/企微，已交付）见 **docs/PHASE3-DESIGN.md**；四期（用户体验：gateway 服务化/TUI 分离/统一命令/管理台 2.0，**已交付**）见 **docs/PHASE4-DESIGN.md**（调研全文在 docs/PHASE4-research/）；五期（工作区技能/AGENTS.md 记忆，**已交付**）见 **docs/PHASE5-DESIGN.md**；六期（Durable 调度与任务生命周期，**已交付**）见 **docs/PHASE6-DESIGN.md**。
+> 架构详解、pi-durable 框架理解见 **docs/TECHNICAL.md**；渠道平台（声明式注册表/出站媒体/访问策略/weixin·qq 协议）见 **docs/CHANNEL-PLATFORM.md**；二期设计（SKILL/MCP/统一技能模型，已交付）见 **docs/PHASE2-DESIGN.md**；三期设计（多渠道：飞书/QQ/微信/企微，已交付）见 **docs/PHASE3-DESIGN.md**；四期（用户体验：gateway 服务化/TUI 分离/统一命令/管理台 2.0，**已交付**）见 **docs/PHASE4-DESIGN.md**（调研全文在 docs/PHASE4-research/）；五期（工作区技能/AGENTS.md 记忆，**已交付**）见 **docs/PHASE5-DESIGN.md**；六期（Durable 调度与任务生命周期，**已交付**）见 **docs/PHASE6-DESIGN.md**；七期（上下文管理与可观测性，**已交付**）见 **docs/CONTEXT-OBSERVABILITY.md**。
 
 基于 `@earendil-works/pi-durable` 的多 Agent 对话网关：零配置文件（一切存 SQLite）、双层安全沙盒、多渠道接入（终端 + 企微/微信/QQ 预留）、免密 Web 管理后台。原始需求见 `INTEND.md`（一期目标：完整 agent 能力、沙盒、终端渠道）。
 
@@ -58,7 +58,9 @@ bun run build:binary # build:web + 编译单二进制到 bin/bot（bun build --c
    - 通知走 `scheduled_task_notifications` outbox（runId 唯一 + claim_token + 退避）；`scheduler.completed` 仅作进程内唤醒。
    - 业务库 migration v6 只增列/表；升级前仍需备份 `conversations.sqlite`（框架 schema v2 不可回退）。
 
-12. **渠道平台化（声明式注册表，2026-10 交付）**：渠道类型元数据只在 `src/channels/descriptors/` 声明一次（label/凭据字段/secret/能力/auth/onDelete/create），`registry.ts` 聚合，`GET /api/channel-types` 驱动管理台；`ChannelAdapter.type`/`ChannelInstanceConfig.type` 为 string，合法性由 registry 在 API 边界 fail-closed。生命周期（start/stop/restart/delete/saveAndRestart + per-channel 锁 + getHealth）统一在 `ChannelManager`，server 只做 HTTP 校验；adapter 通过 `ChannelAdapterDeps.runtime` 构造注入网关，禁止 import manager。出站媒体仅由 `deliverOutbound` 解析 `MEDIA:` 标记（realpath + workspace 包含 + `.bot` 非 workspaces 拒绝 + 128MB/8 个/总计 256MB 上限 + nlink>1 拒绝；校验后以 O_NOFOLLOW fd 读取并比对 dev/ino，adapter 发送内容快照而非路径），adapter 负责 getuploadurl→AES/分片→平台消息。**未做真机联调**：weixin/qq 新能力（出站媒体、群/DM 策略、引用/语音、健康/重连）只经本地模拟与 hermes 对照验证，真实账号协议差异仍是 backlog。
+12. **渠道平台化（声明式注册表，2026-10 交付）**：渠道类型元数据只在 `src/channels/descriptors/` 声明一次（label/凭据字段/secret/能力/auth/onDelete/create），`registry.ts` 聚合，`GET /api/channel-types` 驱动管理台；`ChannelAdapter.type`/`ChannelInstanceConfig.type` 为 string，合法性由 registry 在 API 边界 fail-closed。生命周期（start/stop/restart/delete/saveAndRestart + per-channel 锁 + getHealth）统一在 `ChannelManager`，server 只做 HTTP 校验；adapter 通过 `ChannelAdapterDeps.runtime` 构造注入网关，禁止 import manager。出站媒体仅由 `deliverOutbound` 解析 `MEDIA:` 标记（realpath + workspace 包含 + `.bot` 非 workspaces 拒绝 + 128MB/8 个/总计 256MB 上限 + nlink>1 拒绝；校验后以 O_NOFOLLOW fd 读取并比对 dev/ino，adapter 发送内容快照而非路径），adapter 负责 getuploadurl→AES/分片→平台消息。**入站图片按模型模态分流**（`src/channels/runtime/vision-input.ts`）：`ChannelManager.dispatchInbound` 用绑定 Agent 的有效模型 `inputModalities` 判定——支持 image 时把 jpg/png/gif/webp 直接作为 `ChatOptions.userContent` 的 image block 提交（base64 ≤ pi-durable 默认 4.5MiB；文件头 sniff 校验），明确不支持时**不调用 LLM** 直接回复用户换模型/去掉图片，目录 fallback（模态未知）保留路径引用并提示模型用 read 读取。**未做真机联调**：weixin/qq 新能力（出站媒体、群/DM 策略、引用/语音、健康/重连）只经本地模拟与 hermes 对照验证，真实账号协议差异仍是 backlog。
+
+13. **上下文管理与可观测性（七期，2026-10 交付）**：模型元数据按 **手动 > models.dev（provider 精确命中才采用价格）> pi-ai builtin > 静态前缀表** 解析，目录 gzip 缓存在 `model_catalog_cache`，启动后台刷新（24h TTL，失败静默）+ 手动刷新；Provider 页可逐模型查看/覆盖窗口、最大输出、模态、价格（`model_metadata.auto_json` + `manual_json`）。模型 id 的 `.`/`-` 在 fuzzy 匹配中视为等价（精确匹配仍原样优先），带 `:free`/`-free`/`:thinking` 等变体后缀的条目不作为基础模型的候选；无 provider 精确命中时，参数页经 `/api/model-metadata/candidates` 列出 models.dev 跨供应商条目并「应用为参考」（值写入 `manual_json`，`reference` 记录来源，徽章显示「参考 · <provider>」；显式保存手动参数后清除参考标记）。每条用户消息（IM/Web/TUI/定时/图片）提交前由 `src/core/message-context.ts` 前置 `<context>消息时间: YYYY-MM-DD HH:mm:ss ±HH:mm</context>`：事实型、无指令，用于让模型感知真实消息时间与跨轮间隔；scheduler 使用触发时刻、WS 排队消息使用受理时刻，图片消息作为首个 text block，后续可在同一块扩展位置等事实。上下文策略存 `system_config.context_policy`，为**多策略叠加**：全局百分比（默认 80% 窗口）→ 定时任务增量启发式（最近 N 次 run 的 context 净增量平均 × 倍数，无历史回退 50k）→ 固定 token 上限（默认关闭，可按全部/普通/定时限定）→ 空闲超时（仅普通会话，默认关闭，24h）；命中即压缩，每轮最多一次，`compaction_events.trigger` 记录 `pre_turn_global/scheduled/fixed/idle`。旧配置（normal/scheduled）解析时映射为全局百分比 + 仅定时固定 token，保持原行为。`AgentManager` 在 submit 前用 `conv.context()+estimateContextTokens` 判定，超阈值则 `conv.compact` → `waitForTask` → `waitForIdle` → head 复核，失败 **fail-open**（审计 `context.compact_failed`），取消则不提交。框架 compaction 只保留 ~95% 紧急兜底且 **必须显式设置 harness-wide `backgroundTokens:0`**（否则窗口未知的模型会落回框架默认后台压缩）；`keepRecentTokens` 是全局值，按已启用策略中最低阈值的 40% 且不超过 10% 窗口/上限约束，保证任一策略触发时都能选出 cut。turn 成本以 `harness.snapshot(UsageDoc)` 前后差分为唯一真相源（含压缩摘要/工具内部调用）；`ContextTelemetry` 只记录 `pi.ai.request/poll`、带 `tool.name` 的 `pi.durable.phase`、`pi.durable.submit`，内存缓冲后批量写 `llm_turns/llm_requests/tool_invocations/compaction_events`，不含 prompt/正文。**首包不是 HTTP TTFB**（pi-ai 首个归一化流事件），首字为 watch 首个文本/思考/工具调用 token 的近似 TTFT；`/compact` 现在等待完成并返回前后 tokens/耗时/成本，scheduler 会话必须走 `openSchedulerConversation`（旧实现会压错会话）。启动时若 `PRAGMA user_version` 领先于当前源码但 `model_metadata` 缺失（切旧分支/手工改版本/曾运行更高版本二进制），`runMigrations` 会重放最新**幂等**迁移（仅 CREATE IF NOT EXISTS），避免启动即 `no such table`；新增迁移必须保持幂等或显式扩展该修复路径。
 
 ## 架构
 
@@ -118,8 +120,16 @@ src/
 │   │                       identity、onReport→审计、durable 任务状态与 retryTask、
 │   │                       SessionFailed 后懒重建 Harness（复用 models/registry/cwd）
 │   ├── chat-orchestrator.ts (见上)
-│   └── model-factory.ts    BYOK 模型提供商：4 种协议（openai-completions/responses、
-│                           anthropic-messages、google）、/v1/models 远程发现、连通性测试
+│   ├── model-factory.ts    BYOK 模型提供商：4 种协议（openai-completions/responses、
+│   │                       anthropic-messages、google）、/v1/models 远程发现、连通性测试；
+│   │                       模型元数据经 models-dev/model-metadata 注入
+│   ├── models-dev.ts       models.dev 目录拉取/gzip 缓存/匹配（内置目录 + 静态 fallback）
+│   ├── model-metadata.ts   auto/manual 合并、有效元数据解析、fingerprint（reload 风暴防护）
+│   ├── context-policy.ts   普通/定时压缩策略、阈值/keepRecent/紧急兜底换算
+│   ├── context-compaction.ts 前置/手动压缩状态机（idle 检查、UsageDoc 差分、fail-open）
+│   ├── context-usage.ts    UsageDoc 前后差分（turn 成本真相源）
+│   ├── context-telemetry.ts 自研 TelemetryContext：request/tool span 内存缓冲 → SQLite
+│   └── message-context.ts  每条用户消息前置 `<context>消息时间: ... ±HH:mm</context>`（事实型、无指令；图片消息作为首个 text block；可扩展位置等额外事实）
 ├── sandbox/
 │   ├── manager.ts          SandboxRuntimeManager：ASRT 内核级沙盒（bash 命令包装）；
 │   │                       包装失败 **fail-closed** 拒绝执行（不降级裸跑）
@@ -186,7 +196,9 @@ src/
 │   │                       coalesce（防抖合并）、segmenter（块级贪心分段, 围栏块
 │   │                       不可切）、markdown（降级）、typing（心跳）、media-cache
 │   │                       （媒体缓存）、media-outbound（MEDIA 标记解析 + workspace
-│   │                       路径安全）、loop-guard（防自循环）、dispatch（管道组装,
+│   │                       路径安全）、loop-guard（防自循环）、vision-input（入站
+│   │                       图片按模型模态分流：直接附加 / 拒绝 / fallback read）、
+│   │                       dispatch（管道组装,
 │   │                       含四期 slash fast path——dedupe 后/媒体与防抖前, handler
 │   │                       经 setSlashFastPath 注入）
 │   ├── terminal/index.ts   本地 REPL 渠道（terminal-main）+ 斜杠命令；
@@ -227,7 +239,7 @@ scripts/
 ### 管理后台前端（web/）
 
 - **栈**：React 19 + Vite + 原生 CSS（无 CSS 框架）；字体 @fontsource/instrument-sans + ibm-plex-mono（打包内嵌，离线可用）。运行时零新增依赖（全部打进产物）。
-- **结构**：`web/src/` 下 `App.tsx`（壳 + 极简 hash 路由 + **视图注册表**——新视图只需在 VIEWS 表加一行）、`api.ts`（fetch + SSE 流解析）、`types.ts`（后端类型副本）、`components/ui.tsx`（Icon/Toast/Modal/ConfirmButton/Field/Empty/useAsync/**useFormDialog**——列表页弹窗统一单状态）、`views/`（Overview/Agents/Providers/Channels/Chat/Audit）、`styles/base.css`（设计 token + 全部样式）。
+- **结构**：`web/src/` 下 `App.tsx`（壳 + 极简 hash 路由 + **视图注册表**——新视图只需在 VIEWS 表加一行）、`api.ts`（fetch + SSE 流解析）、`types.ts`（后端类型副本）、`components/ui.tsx`（Icon/Toast/Modal/ConfirmButton/Field/Empty/useAsync/**useFormDialog**——列表页弹窗统一单状态）、`views/`（Overview/Agents/Providers/Channels/Chat/Audit/Context/Sessions/Mcp/ScheduledTasks）、`styles/base.css`（设计 token + 全部样式）。
 - **与后端共享代码**：vite alias `@bot-core` → `../src`，仅限**无 node 依赖的纯数据模块**（如 `config/sandbox-defaults.ts` 沙盒默认值——migrations 与前端表单共用，防止两处漂移；type-only import 不会把 node:sqlite 拉进 bundle）。
 - **设计语言**：浅色工程工作台；色彩只做状态语义（青绿=运行/启用，琥珀=警告，砖红=危险）；**机器数据层**——所有 ID/模型名/URL/时间戳渲染为 mono（`.mono`）；签名元素为 Agent 卡片左侧状态轨（`.card--rail`）。改视觉从 `base.css` 的 token 入手。
 - **工作流**：改 UI 一律改 `web/src/`，`bun run dev:web` 热更新；改完 `bun run build:web` 重新生成内嵌资源（generated.ts 需随改动提交）。后端 API 不变时前端可独立开发。
@@ -276,13 +288,13 @@ QQ=msg_id+msg_seq（群 5min/单聊 60min）、微信=context_token、企微=原
 
 ### 数据模型（双文件分库）
 
-- **业务库 `<cwd>/.bot/bot.sqlite`**：`DatabaseManager`（`node:sqlite`）管理，表：`system_config`、`model_providers`、`agents`、`channel_instances`、`channel_sessions`（主键 channel_instance_id+peer_id）、`mcp_servers`、`scheduled_tasks`（逻辑删除：deleted_at；六期新增 durable 生命周期列）、`scheduled_task_runs`（run ledger：runKey 唯一 + lease/fence）、`scheduled_task_notifications`（通知 outbox）、`audit_logs`。schema 由 `migrations.ts` 建（当前 v6）。
+- **业务库 `<cwd>/.bot/bot.sqlite`**：`DatabaseManager`（`node:sqlite`）管理，表：`system_config`、`model_providers`、`agents`、`channel_instances`、`channel_sessions`（主键 channel_instance_id+peer_id）、`mcp_servers`、`scheduled_tasks`（逻辑删除：deleted_at；六期新增 durable 生命周期列）、`scheduled_task_runs`（run ledger：runKey 唯一 + lease/fence）、`scheduled_task_notifications`（通知 outbox）、`audit_logs`；七期新增 `model_catalog_cache`、`model_metadata`、`llm_turns`、`llm_requests`、`tool_invocations`、`compaction_events`。schema 由 `migrations.ts` 建（当前 v7）。
 - **会话库 `<cwd>/.bot/conversations.sqlite`**：pi-durable 状态机专用（`openNodeSqliteStorage` 自建自管：`conversations`、`entries`、`tasks`、`submissions`、`documents`、`durable_*` 等表与 `durable_schema` 版本迁移）。**业务代码不得触碰**——升级框架时由它自己的 schema 迁移负责；要重置全部会话直接删此文件即可。
 - 两库仅通过业务库 `channel_sessions.conversation_id` 软引用关联（无外键）。
 
 ### 管理后台 API（server.ts）
 
-`/api/status`、`/api/bootstrap`（token 下发，豁免鉴权）、`/api/config`（GET/POST）、`/api/providers`（GET/POST/DELETE）、`/api/providers/fetch-models`、`/api/providers/test`、`/api/agents`（GET/POST/DELETE）、`/api/channels`（GET/POST/DELETE）、`/api/channels/:id/health`（adapter 健康检查）、`/api/channels/:id/qr-login` + `/qr-status`（微信 iLink 扫码, confirmed 自动并入凭据并热重启 adapter）、`/api/skills`、`/api/agents/:id/workspace-skills`（GET 受保护扫描 + POST `/reload` 强制重扫；返回技能/诊断/记忆元数据，不返回记忆正文）、`/api/mcp-servers`（GET/POST/DELETE；headers/env 脱敏语义同渠道凭据）、`/api/mcp-servers/test`（连接试测，不落库）、`/api/scheduled-tasks`（GET / POST 创建与编辑(五模式人话编辑器) / DELETE 逻辑删除）、`/api/scheduled-tasks/:id/runs`（run ledger 分页）、`/api/scheduled-tasks/:id/reset-conversation`（poisoned 人工恢复）、`/api/scheduled-tasks/trigger`（手动触发，统一走 reserve/lease/ledger/outbox）、`/api/durable-tasks`（GET 1.4.0 durable 任务状态：running/ready/waiting/sleeping/completing/blocked）、`/api/durable-tasks/retry`（POST `{taskId}` 仅重跑 `restart_limit` blocked 任务）、`/api/audit-logs`（支持 event/agentId/since/until/limit/offset 过滤分页，返回 {items,total}）、`/api/sessions`（channel_sessions 列表）+ `/api/sessions/search?q=` + `/api/sessions/:conversationId/history`（经 pi-durable Conversation API 读取只读时间线）、`/api/chat`（POST，Accept: text/event-stream 时走 SSE 流式；经 ChatOrchestrator——slash 命令先行，未识别命令不送 LLM）、`/api/chat/reset`、`/api/chat/cancel`（显式取消生成）、`/api/gateway/events`（EventBus → SSE 事件流）、WS `/api/gateway/ws?token=`（SessionHub 第二传输）。
+`/api/status`、`/api/bootstrap`（token 下发，豁免鉴权）、`/api/config`（GET/POST）、`/api/providers`（GET/POST/DELETE）、`/api/providers/fetch-models`、`/api/providers/test`、`/api/model-metadata`（GET 每模型有效参数/来源 + PUT 手动覆盖/恢复自动/应用目录参考 `reference:{providerId,modelId}`）、`/api/model-metadata/candidates`（models.dev 跨供应商候选，供参考价选择）、`/api/model-metadata/refresh`（models.dev 手动刷新，失败 502）、`/api/context/policy`（GET/PUT 上下文策略）、`/api/context/sessions`（会话观测聚合）、`/api/context/sessions/:conversationId/turns`、`/api/context/turns/:turnId`（请求/工具/压缩明细）、`/api/context/sessions/:conversationId/compact`（手动压缩，busy 409）、`/api/agents`（GET/POST/DELETE）、`/api/channels`（GET/POST/DELETE）、`/api/channels/:id/health`（adapter 健康检查）、`/api/channels/:id/qr-login` + `/qr-status`（微信 iLink 扫码, confirmed 自动并入凭据并热重启 adapter）、`/api/skills`、`/api/agents/:id/workspace-skills`（GET 受保护扫描 + POST `/reload` 强制重扫；返回技能/诊断/记忆元数据，不返回记忆正文）、`/api/mcp-servers`（GET/POST/DELETE；headers/env 脱敏语义同渠道凭据）、`/api/mcp-servers/test`（连接试测，不落库）、`/api/scheduled-tasks`（GET / POST 创建与编辑(五模式人话编辑器) / DELETE 逻辑删除）、`/api/scheduled-tasks/:id/runs`（run ledger 分页）、`/api/scheduled-tasks/:id/reset-conversation`（poisoned 人工恢复）、`/api/scheduled-tasks/trigger`（手动触发，统一走 reserve/lease/ledger/outbox）、`/api/durable-tasks`（GET 1.4.0 durable 任务状态：running/ready/waiting/sleeping/completing/blocked）、`/api/durable-tasks/retry`（POST `{taskId}` 仅重跑 `restart_limit` blocked 任务）、`/api/audit-logs`（支持 event/agentId/since/until/limit/offset 过滤分页，返回 {items,total}）、`/api/sessions`（channel_sessions 列表）+ `/api/sessions/search?q=` + `/api/sessions/:conversationId/history`（经 pi-durable Conversation API 读取只读时间线）、`/api/chat`（POST，Accept: text/event-stream 时走 SSE 流式；经 ChatOrchestrator——slash 命令先行，未识别命令不送 LLM）、`/api/chat/reset`、`/api/chat/cancel`（显式取消生成）、`/api/gateway/events`（EventBus → SSE 事件流）、WS `/api/gateway/ws?token=`（SessionHub 第二传输）。
 
 保存 provider/agent 后需调用 `AgentManager.reloadModels()` 热刷新 pi-ai 模型注册（server.ts 中已这样处理）。
 
@@ -297,5 +309,5 @@ QQ=msg_id+msg_seq（群 5min/单聊 60min）、微信=context_token、企微=原
   - **定时任务**（内置技能 `scheduler`）：`schedule_create/list/update/delete` 四工具；任务归属创建它的 Agent（经 `api.conversationId` → `AgentManager.getAgentIdForConversation` 反查，fail-closed）；触发由 `SchedulerManager`（cli 启动）执行，会话 key `scheduler:<taskId>` 天然复用同一 conversation；interval 最小 60s（防高频烧 token）；删除为逻辑删除。**触发结果经事件机制推送渠道**：SchedulerManager publish `scheduler.completed` → NotificationDispatcher 按"任务记录的通知目标（来源渠道+peer）→ Agent 绑定渠道兜底"投递——渠道层寻址与会话无关，会话重置不影响；通知目标依赖真实渠道映射行（`chat` 的 `origin` 参数写入，`getSessionByConversation` 优先非哨兵行）。
   - skills-catalog 本身**不注册进 SkillRegistry**（避免出现在选配列表），但必须在 `AgentManager.init` 显式 `registry.install`——会话按名字解析，缺注册物会被静默丢弃。
 - **新渠道（渠道平台化）**：实现 `ChannelAdapter`（入站提交 `InboundPipeline`；出站可选 `sendReply`/`sendMedia`/`formatOutbound`/`sendTyping`/`healthCheck`），并在 `src/channels/descriptors/<type>.ts` 声明 `ChannelTypeDescriptor`（label、凭据字段与 secret、能力位、auth、onDelete、`create`），再加进 `descriptors/index.ts`。管理台不再需要改代码：类型下拉、凭据表单、扫码入口、能力提示全部由 `GET /api/channel-types` 驱动。adapter 通过构造注入的 `ChannelAdapterDeps.runtime` 调网关（禁止 import `ChannelManager`）；渠道实例与 Agent 的绑定关系存 `channel_instances.bound_agent_id`。出站媒体约定：Agent 回复中独占一行的 `MEDIA:<workspace 内路径>` 由 `ChannelManager.deliverOutbound` 解析并校验（realpath + workspace 包含 + 禁止 `.bot` 非 workspaces 路径 + 大小/数量上限）。
-- **测试**：`test/` 下 24 个套件（paths/database/sandbox/skills/server/phase2/scheduler/notifications/phase3/phase4-m0/phase4-m12/phase4-m3/phase5-workspace/durable-tasks/phase6-scheduler/channel-registry/channel-access-policy/channel-media/channel-protocol/channel-lifecycle/weixin-adapter/qq-adapter 等，277 tests），基于 `bun:test`，多为真实文件系统 + 真实 HTTP 端口的集成测试；server 测试已隔离到临时目录（测试顶部显式 `DatabaseManager.getInstance(临时路径)` + `logger.init(临时目录)`，新增测试套件须沿用此模式，勿写真实 cwd 的 `.bot/`）；**单例被全部套件共享（首个 getInstance 绑定生效），任何套件不得 rmSync 单例库文件所在目录**，否则并行套件会 disk I/O error。渠道协议测试用 `Bun.serve`/本地 WS 模拟 iLink/QQ，并通过 `ChannelAdapterDeps` 注入 `dotBotDir`/`mediaFetch`/`qq`/`wsFactory`/`tuning`，绝不走生产旁路。
+- **测试**：`test/` 下 33 个套件（paths/database/sandbox/skills/server/phase2/scheduler/notifications/phase3/phase4-m0/phase4-m12/phase4-m3/phase5-workspace/durable-tasks/phase6-scheduler/channel-registry/channel-access-policy/channel-media/channel-protocol/channel-lifecycle/weixin-adapter/qq-adapter/models-dev/context-policy/context-telemetry/context-compaction/context-server/context-agent-chat/migrations-repair/vision-input/message-context 等，334 tests），基于 `bun:test`，多为真实文件系统 + 真实 HTTP 端口的集成测试；server 测试已隔离到临时目录（测试顶部显式 `DatabaseManager.getInstance(临时路径)` + `logger.init(临时目录)`，新增测试套件须沿用此模式，勿写真实 cwd 的 `.bot/`）；**单例被全部套件共享（首个 getInstance 绑定生效），任何套件不得 rmSync 单例库文件所在目录**，否则并行套件会 disk I/O error。渠道协议测试用 `Bun.serve`/本地 WS 模拟 iLink/QQ，并通过 `ChannelAdapterDeps` 注入 `dotBotDir`/`mediaFetch`/`qq`/`wsFactory`/`tuning`，绝不走生产旁路；上下文观测测试用 faux provider/本地 SSE provider + 真实 Harness/AgentManager，临时 DB 目录不删除。
 - 代码中的中文注释/命名（如技能名称、终端 banner）是刻意为之，保持一致。

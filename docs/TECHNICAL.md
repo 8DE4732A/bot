@@ -197,7 +197,7 @@ SandboxedExecutionEnv   pi-durable env 的安全实现 (每个工具轮次由框
 
 - **历史查询/导出**：pi-durable 的文档 API（`ConversationView`/entries）可读任意会话历史——做"按 Agent/渠道列出会话 + 导出 markdown"的管理台页面。注意只走类型化 view，不碰内部文档
 - **孤儿 GC**：等框架提供会话删除 API；在此之前删除 Agent 时把 `conversation_id` 列表写入一张 tombstone 表（业务库），GC 任务按表清理
-- **上下文策略**：`conv.compact()` 已在终端暴露；二期把自动 compaction 策略（阈值触发）接入 AgentManager
+- **上下文策略**：七期已交付——普通会话默认 80% 窗口、定时任务默认 50k tokens 的 pre-turn 压缩（`src/core/context-compaction.ts`），失败 fail-open；`/compact` 等待完成并回报前后指标；模型参数自动匹配与每轮可观测见 `docs/CONTEXT-OBSERVABILITY.md`
 
 ### 5.3 模型与技能
 

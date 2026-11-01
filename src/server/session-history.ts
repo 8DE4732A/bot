@@ -76,6 +76,12 @@ function entriesToMessages(entries: readonly EntryRecord[], seqStart = 0): Sessi
   const messages: SessionMessage[] = [];
   let seq = seqStart;
   for (const entry of entries) {
+    // 七期：CompactionEntry 的摘要以 user message 形式存在，必须按 kind 识别，
+    // 否则管理台会把压缩摘要当成普通用户消息。
+    if (entry.kind === "pi.compaction") {
+      messages.push({ role: "handoff", text: "Context handoff (上下文已压缩)", seq: seq++ });
+      continue;
+    }
     const model = entry.model;
     if (!model || model.length === 0) {
       messages.push({ role: "handoff", text: "Context handoff (上下文已压缩)", seq: seq++ });

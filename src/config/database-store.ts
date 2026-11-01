@@ -247,6 +247,215 @@ export interface ScheduledTaskDefinition {
   updatedAt: number;
 }
 
+// --- 七期：上下文管理与可观测性 ---
+
+export interface ModelCostRates {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+export interface ModelCostTier extends ModelCostRates {
+  inputTokensAbove: number;
+}
+
+export interface ModelMetadataReference {
+  /** models.dev 的 provider key（非本地 provider id） */
+  providerId: string;
+  providerName?: string;
+  /** models.dev 的 model key */
+  modelId: string;
+  displayName?: string;
+  matchedAt: number;
+}
+
+export interface ModelMetadataValues {
+  displayName?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  inputModalities?: string[];
+  outputModalities?: string[];
+  reasoning?: boolean;
+  toolCall?: boolean;
+  cost?: ModelCostRates;
+  costTiers?: ModelCostTier[];
+  /** 手动值来自用户选择的目录参考条目时记录来源（仅 manual_json） */
+  reference?: ModelMetadataReference;
+}
+
+export type ModelMetadataSource = "models.dev" | "builtin" | "fallback";
+
+export interface ModelMetadataRecord {
+  providerId: string;
+  modelId: string;
+  auto: ModelMetadataValues | null;
+  autoSource?: ModelMetadataSource;
+  manual: Partial<ModelMetadataValues> | null;
+  matchedProvider?: string;
+  matchedModel?: string;
+  refreshedAt?: number;
+  updatedAt: number;
+}
+
+export interface ModelCatalogCacheRecord {
+  payload: Buffer;
+  etag?: string;
+  lastModified?: string;
+  fetchedAt: number;
+  lastCheckedAt: number;
+  providerCount: number;
+  modelCount: number;
+}
+
+export type LlmTurnStatus = "running" | "done" | "error" | "aborted" | "interrupted";
+export type SessionKind = "normal" | "scheduled";
+
+export interface LlmTurnRecord {
+  turnId: string;
+  conversationId: string;
+  agentId: string;
+  sessionId: string;
+  sessionKind: SessionKind;
+  schedulerTaskId?: string;
+  provider?: string;
+  modelId?: string;
+  startedAt: number;
+  endedAt?: number;
+  durationMs?: number;
+  firstChunkMs?: number;
+  ttftMs?: number;
+  llmMs?: number;
+  toolMs?: number;
+  requestCount: number;
+  toolCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheRead: number;
+  cacheWrite: number;
+  reasoningTokens: number;
+  costUsd: number;
+  priced: boolean;
+  usageJson?: string;
+  contextTokens?: number;
+  contextEstimateTokens?: number;
+  contextWindow?: number;
+  compactedBefore: boolean;
+  compactionMs: number;
+  status: LlmTurnStatus;
+  error?: string;
+  requestId?: string;
+  runKey?: string;
+  traceId?: string;
+  submissionId?: string;
+  detailTruncated: boolean;
+}
+
+export interface LlmRequestRecord {
+  spanId: string;
+  turnId?: string;
+  conversationId?: string;
+  traceId?: string;
+  parentSpanId?: string;
+  taskId?: string;
+  kind: "request" | "poll";
+  taskKind?: "generation" | "compaction" | "tool";
+  compactionId?: string;
+  provider?: string;
+  modelId?: string;
+  api?: string;
+  startedAt: number;
+  endedAt?: number;
+  durationMs?: number;
+  firstChunkMs?: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheRead: number;
+  cacheWrite: number;
+  reasoningTokens: number;
+  costUsd: number;
+  stopReason?: string;
+  status: "ok" | "error" | "aborted";
+  error?: string;
+}
+
+export interface ToolInvocationRecord {
+  turnId?: string;
+  conversationId?: string;
+  traceId?: string;
+  taskId?: string;
+  toolCallId?: string;
+  toolName: string;
+  startedAt: number;
+  endedAt?: number;
+  durationMs?: number;
+  status: "ok" | "error" | "aborted";
+  error?: string;
+}
+
+export type CompactionTrigger =
+  | "pre_turn"
+  | "pre_turn_global"
+  | "pre_turn_scheduled"
+  | "pre_turn_fixed"
+  | "pre_turn_idle"
+  | "manual"
+  | "threshold"
+  | "overflow";
+export type CompactionStatus = "done" | "skipped" | "failed" | "timeout" | "aborted";
+
+export interface CompactionEventRecord {
+  id?: number;
+  conversationId: string;
+  agentId?: string;
+  sessionId?: string;
+  turnId?: string;
+  taskId?: string;
+  traceId?: string;
+  compactionId?: string;
+  profile: "normal" | "scheduled" | "manual";
+  trigger: CompactionTrigger;
+  thresholdTokens?: number;
+  keepRecentTokens?: number;
+  beforeTokens?: number;
+  afterTokens?: number;
+  beforeEstimateTokens?: number;
+  afterEstimateTokens?: number;
+  beforeEntries?: number;
+  afterEntries?: number;
+  startedAt: number;
+  endedAt?: number;
+  durationMs?: number;
+  costUsd?: number;
+  costInTurn: boolean;
+  requestCount: number;
+  status: CompactionStatus;
+  failOpen: boolean;
+  error?: string;
+}
+
+export interface ContextSessionRow {
+  conversationId: string;
+  agentId: string;
+  agentName?: string;
+  sessionId: string;
+  sessionKind: SessionKind;
+  schedulerTaskId?: string;
+  schedulerTaskName?: string;
+  channelType?: string;
+  channelName?: string;
+  provider?: string;
+  modelId?: string;
+  contextTokens?: number;
+  contextWindow?: number;
+  turns: number;
+  costUsd: number;
+  priced: boolean;
+  lastActiveAt: number;
+  compactions: number;
+  status?: string;
+}
+
 export class DatabaseStore {
   private db: DatabaseManager;
 
@@ -346,8 +555,157 @@ export class DatabaseStore {
     if (inUse && inUse.count > 0) {
       throw new Error(`Provider '${id}' is still referenced by ${inUse.count} agent(s); rebind them first`);
     }
-    this.db.run("DELETE FROM model_providers WHERE id = ?", id);
+    this.db.transaction(() => {
+      this.db.run("DELETE FROM model_providers WHERE id = ?", id);
+      this.db.run("DELETE FROM model_metadata WHERE provider_id = ?", id);
+    });
     return true;
+  }
+
+  // --- 七期：模型目录缓存与 per-model 元数据 ---
+
+  private parseJsonOrNull<T>(value: unknown): T | null {
+    if (typeof value !== "string" || value.length === 0) return null;
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  public getModelCatalogCache(): ModelCatalogCacheRecord | undefined {
+    const row = this.db.queryOne<any>("SELECT * FROM model_catalog_cache WHERE id = 1");
+    if (!row) return undefined;
+    return {
+      payload: Buffer.isBuffer(row.payload_gz) ? row.payload_gz : Buffer.from(row.payload_gz),
+      etag: row.etag ?? undefined,
+      lastModified: row.last_modified ?? undefined,
+      fetchedAt: row.fetched_at,
+      lastCheckedAt: row.last_checked_at,
+      providerCount: row.provider_count,
+      modelCount: row.model_count,
+    };
+  }
+
+  /** 只取元信息（不读 payload_gz BLOB）：TTL/界面状态用。 */
+  public getModelCatalogMeta():
+    | { fetchedAt: number; lastCheckedAt: number; providerCount: number; modelCount: number }
+    | undefined {
+    const row = this.db.queryOne<any>(
+      "SELECT fetched_at, last_checked_at, provider_count, model_count FROM model_catalog_cache WHERE id = 1",
+    );
+    if (!row) return undefined;
+    return {
+      fetchedAt: row.fetched_at,
+      lastCheckedAt: row.last_checked_at,
+      providerCount: row.provider_count,
+      modelCount: row.model_count,
+    };
+  }
+
+  public saveModelCatalogCache(record: ModelCatalogCacheRecord): void {
+    this.db.run(
+      `INSERT INTO model_catalog_cache (
+        id, payload_gz, etag, last_modified, fetched_at, last_checked_at, provider_count, model_count
+      ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        payload_gz = excluded.payload_gz,
+        etag = excluded.etag,
+        last_modified = excluded.last_modified,
+        fetched_at = excluded.fetched_at,
+        last_checked_at = excluded.last_checked_at,
+        provider_count = excluded.provider_count,
+        model_count = excluded.model_count`,
+      record.payload,
+      record.etag ?? null,
+      record.lastModified ?? null,
+      record.fetchedAt,
+      record.lastCheckedAt,
+      record.providerCount,
+      record.modelCount,
+    );
+  }
+
+  private mapModelMetadataRow(row: any): ModelMetadataRecord {
+    return {
+      providerId: row.provider_id,
+      modelId: row.model_id,
+      auto: this.parseJsonOrNull<ModelMetadataValues>(row.auto_json),
+      autoSource: row.auto_source ?? undefined,
+      manual: this.parseJsonOrNull<Partial<ModelMetadataValues>>(row.manual_json),
+      matchedProvider: row.matched_provider ?? undefined,
+      matchedModel: row.matched_model ?? undefined,
+      refreshedAt: row.refreshed_at ?? undefined,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  public listModelMetadata(providerId?: string): ModelMetadataRecord[] {
+    const rows = providerId
+      ? this.db.query<any>("SELECT * FROM model_metadata WHERE provider_id = ? ORDER BY model_id", providerId)
+      : this.db.query<any>("SELECT * FROM model_metadata ORDER BY provider_id, model_id");
+    return rows.map((row) => this.mapModelMetadataRow(row));
+  }
+
+  public getModelMetadata(providerId: string, modelId: string): ModelMetadataRecord | undefined {
+    const row = this.db.queryOne<any>(
+      "SELECT * FROM model_metadata WHERE provider_id = ? AND model_id = ?",
+      providerId,
+      modelId,
+    );
+    return row ? this.mapModelMetadataRow(row) : undefined;
+  }
+
+  public saveModelMetadata(record: ModelMetadataRecord): void {
+    this.db.run(
+      `INSERT INTO model_metadata (
+        provider_id, model_id, auto_json, auto_source, manual_json,
+        matched_provider, matched_model, refreshed_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(provider_id, model_id) DO UPDATE SET
+        auto_json = excluded.auto_json,
+        auto_source = excluded.auto_source,
+        manual_json = excluded.manual_json,
+        matched_provider = excluded.matched_provider,
+        matched_model = excluded.matched_model,
+        refreshed_at = excluded.refreshed_at,
+        updated_at = excluded.updated_at`,
+      record.providerId,
+      record.modelId,
+      record.auto ? JSON.stringify(record.auto) : null,
+      record.autoSource ?? null,
+      record.manual && Object.keys(record.manual).length > 0 ? JSON.stringify(record.manual) : null,
+      record.matchedProvider ?? null,
+      record.matchedModel ?? null,
+      record.refreshedAt ?? null,
+      record.updatedAt,
+    );
+  }
+
+  /** 批量元数据写入：refresh 时数百个模型共用一个事务，避免逐条 fsync。 */
+  public saveModelMetadataBatch(records: ModelMetadataRecord[]): void {
+    if (records.length === 0) return;
+    this.db.transaction(() => {
+      for (const record of records) this.saveModelMetadata(record);
+    });
+  }
+
+  public deleteModelMetadata(providerId: string, modelId?: string): void {
+    if (modelId === undefined) {
+      this.db.run("DELETE FROM model_metadata WHERE provider_id = ?", providerId);
+    } else {
+      this.db.run("DELETE FROM model_metadata WHERE provider_id = ? AND model_id = ?", providerId, modelId);
+    }
+  }
+
+  /** 删除 provider 已不再声明的模型元数据（agent 绑定仍算声明，调用方合并后传入）。 */
+  public pruneModelMetadata(providerId: string, keepModelIds: string[]): number {
+    const existing = this.listModelMetadata(providerId).map((r) => r.modelId);
+    const keep = new Set(keepModelIds);
+    const stale = existing.filter((id) => !keep.has(id));
+    if (stale.length === 0) return 0;
+    for (const modelId of stale) this.deleteModelMetadata(providerId, modelId);
+    return stale.length;
   }
 
   // --- Agents ---
@@ -607,12 +965,18 @@ export class DatabaseStore {
         let channelInstanceId = r.channel_instance_id as string;
         let peerId = r.peer_id as string;
         if (channelInstanceId === "channel_session") {
-          // 哨兵行提升: peerId 形态为 `${agentId}:${sessionId}`——剥 agentId
-          // 得 sessionId, 再剥 sessionId 首段为来源 (web-playground/scheduler)
-          const derivedPeer = peerId.slice(peerId.indexOf(":") + 1);
-          const sep = derivedPeer.indexOf(":");
-          channelInstanceId = sep > 0 ? derivedPeer.slice(0, sep) : "internal";
-          peerId = sep > 0 ? derivedPeer.slice(sep + 1) : derivedPeer;
+          if (peerId.startsWith("scheduler:")) {
+            // 调度会话的映射 peerId 是 `scheduler:<taskId>`（没有 agentId 前缀）
+            channelInstanceId = "scheduler";
+            peerId = peerId.slice("scheduler:".length);
+          } else {
+            // 哨兵行提升: peerId 形态为 `${agentId}:${sessionId}`——剥 agentId
+            // 得 sessionId, 再剥 sessionId 首段为来源 (web-playground/scheduler)
+            const derivedPeer = peerId.slice(peerId.indexOf(":") + 1);
+            const sep = derivedPeer.indexOf(":");
+            channelInstanceId = sep > 0 ? derivedPeer.slice(0, sep) : "internal";
+            peerId = sep > 0 ? derivedPeer.slice(sep + 1) : derivedPeer;
+          }
         }
         return {
           channelInstanceId,
@@ -841,6 +1205,16 @@ export class DatabaseStore {
     const row = this.db.queryOne<any>(
       "SELECT * FROM scheduled_tasks WHERE id = ? AND deleted_at IS NULL",
       id,
+    );
+    return row ? this.mapScheduledTaskRow(row) : undefined;
+  }
+
+  /** 七期：按 conversation 反查定时任务（手动压缩/会话观测用）。 */
+  public getScheduledTaskByConversation(conversationId: string): ScheduledTaskDefinition | undefined {
+    if (!conversationId) return undefined;
+    const row = this.db.queryOne<any>(
+      "SELECT * FROM scheduled_tasks WHERE conversation_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 1",
+      conversationId,
     );
     return row ? this.mapScheduledTaskRow(row) : undefined;
   }
@@ -1744,10 +2118,598 @@ export class DatabaseStore {
   }
 
   /** 启动恢复: 上次进程残留的排队消息 (出队失败/崩溃遗留) */
-  public listQueuedPrompts(): { id: number; agentId: string; sessionId: string; message: string }[] {
+  public listQueuedPrompts(): { id: number; agentId: string; sessionId: string; message: string; createdAt: number }[] {
     return this.db
       .query<any>("SELECT * FROM gateway_queued_prompts ORDER BY id ASC")
-      .map((r) => ({ id: r.id, agentId: r.agent_id, sessionId: r.session_id, message: r.message }));
+      .map((r) => ({
+        id: r.id,
+        agentId: r.agent_id,
+        sessionId: r.session_id,
+        message: r.message,
+        createdAt: r.created_at,
+      }));
+  }
+
+  // --- 七期：上下文观测（turn / request / tool / compaction） ---
+
+  private mapLlmTurnRow(row: any): LlmTurnRecord {
+    return {
+      turnId: row.turn_id,
+      conversationId: row.conversation_id,
+      agentId: row.agent_id,
+      sessionId: row.session_id,
+      sessionKind: row.session_kind,
+      schedulerTaskId: row.scheduler_task_id ?? undefined,
+      provider: row.provider ?? undefined,
+      modelId: row.model_id ?? undefined,
+      startedAt: row.started_at,
+      endedAt: row.ended_at ?? undefined,
+      durationMs: row.duration_ms ?? undefined,
+      firstChunkMs: row.first_chunk_ms ?? undefined,
+      ttftMs: row.ttft_ms ?? undefined,
+      llmMs: row.llm_ms ?? undefined,
+      toolMs: row.tool_ms ?? undefined,
+      requestCount: row.request_count,
+      toolCount: row.tool_count,
+      inputTokens: row.input_tokens,
+      outputTokens: row.output_tokens,
+      cacheRead: row.cache_read,
+      cacheWrite: row.cache_write,
+      reasoningTokens: row.reasoning_tokens,
+      costUsd: row.cost_usd,
+      priced: row.priced !== 0,
+      usageJson: row.usage_json ?? undefined,
+      contextTokens: row.context_tokens ?? undefined,
+      contextEstimateTokens: row.context_estimate_tokens ?? undefined,
+      contextWindow: row.context_window ?? undefined,
+      compactedBefore: row.compacted_before !== 0,
+      compactionMs: row.compaction_ms,
+      status: row.status,
+      error: row.error ?? undefined,
+      requestId: row.request_id ?? undefined,
+      runKey: row.run_key ?? undefined,
+      traceId: row.trace_id ?? undefined,
+      submissionId: row.submission_id ?? undefined,
+      detailTruncated: row.detail_truncated !== 0,
+    };
+  }
+
+  public insertLlmTurn(turn: LlmTurnRecord): void {
+    this.db.run(
+      `INSERT INTO llm_turns (
+        turn_id, conversation_id, agent_id, session_id, session_kind, scheduler_task_id,
+        provider, model_id, started_at, ended_at, duration_ms, first_chunk_ms, ttft_ms,
+        llm_ms, tool_ms, request_count, tool_count,
+        input_tokens, output_tokens, cache_read, cache_write, reasoning_tokens,
+        cost_usd, priced, usage_json, context_tokens, context_estimate_tokens, context_window,
+        compacted_before, compaction_ms, status, error, request_id, run_key, trace_id,
+        submission_id, detail_truncated
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(turn_id) DO UPDATE SET
+        provider = excluded.provider,
+        model_id = excluded.model_id,
+        ended_at = excluded.ended_at,
+        duration_ms = excluded.duration_ms,
+        first_chunk_ms = excluded.first_chunk_ms,
+        ttft_ms = excluded.ttft_ms,
+        llm_ms = excluded.llm_ms,
+        tool_ms = excluded.tool_ms,
+        request_count = excluded.request_count,
+        tool_count = excluded.tool_count,
+        input_tokens = excluded.input_tokens,
+        output_tokens = excluded.output_tokens,
+        cache_read = excluded.cache_read,
+        cache_write = excluded.cache_write,
+        reasoning_tokens = excluded.reasoning_tokens,
+        cost_usd = excluded.cost_usd,
+        priced = excluded.priced,
+        usage_json = excluded.usage_json,
+        context_tokens = excluded.context_tokens,
+        context_estimate_tokens = excluded.context_estimate_tokens,
+        context_window = excluded.context_window,
+        compacted_before = excluded.compacted_before,
+        compaction_ms = excluded.compaction_ms,
+        status = excluded.status,
+        error = excluded.error,
+        request_id = excluded.request_id,
+        run_key = excluded.run_key,
+        trace_id = excluded.trace_id,
+        submission_id = excluded.submission_id,
+        detail_truncated = excluded.detail_truncated`,
+      turn.turnId,
+      turn.conversationId,
+      turn.agentId,
+      turn.sessionId,
+      turn.sessionKind,
+      turn.schedulerTaskId ?? null,
+      turn.provider ?? null,
+      turn.modelId ?? null,
+      turn.startedAt,
+      turn.endedAt ?? null,
+      turn.durationMs ?? null,
+      turn.firstChunkMs ?? null,
+      turn.ttftMs ?? null,
+      turn.llmMs ?? null,
+      turn.toolMs ?? null,
+      turn.requestCount,
+      turn.toolCount,
+      turn.inputTokens,
+      turn.outputTokens,
+      turn.cacheRead,
+      turn.cacheWrite,
+      turn.reasoningTokens,
+      turn.costUsd,
+      turn.priced ? 1 : 0,
+      turn.usageJson ?? null,
+      turn.contextTokens ?? null,
+      turn.contextEstimateTokens ?? null,
+      turn.contextWindow ?? null,
+      turn.compactedBefore ? 1 : 0,
+      turn.compactionMs,
+      turn.status,
+      turn.error ?? null,
+      turn.requestId ?? null,
+      turn.runKey ?? null,
+      turn.traceId ?? null,
+      turn.submissionId ?? null,
+      turn.detailTruncated ? 1 : 0,
+    );
+  }
+
+  public updateLlmTurn(turnId: string, patch: Partial<LlmTurnRecord>): void {
+    const current = this.getLlmTurn(turnId);
+    if (!current) return;
+    this.insertLlmTurn({ ...current, ...patch, turnId });
+  }
+
+  public getLlmTurn(turnId: string): LlmTurnRecord | undefined {
+    const row = this.db.queryOne<any>("SELECT * FROM llm_turns WHERE turn_id = ?", turnId);
+    return row ? this.mapLlmTurnRow(row) : undefined;
+  }
+
+  public listLlmTurns(conversationId: string, limit = 50, offset = 0): LlmTurnRecord[] {
+    return this.db
+      .query<any>(
+        "SELECT * FROM llm_turns WHERE conversation_id = ? ORDER BY started_at DESC LIMIT ? OFFSET ?",
+        conversationId,
+        limit,
+        offset,
+      )
+      .map((row) => this.mapLlmTurnRow(row));
+  }
+
+  public countLlmTurns(conversationId: string): number {
+    return (
+      this.db.queryOne<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM llm_turns WHERE conversation_id = ?",
+        conversationId,
+      )?.n ?? 0
+    );
+  }
+
+  public listContextSessions(filters: {
+    agentId?: string;
+    sessionKind?: SessionKind;
+    since?: number;
+    until?: number;
+    q?: string;
+    limit?: number;
+    offset?: number;
+  }): { rows: ContextSessionRow[]; total: number } {
+    const since = filters.since ?? 0;
+    const until = filters.until ?? Number.MAX_SAFE_INTEGER;
+    const where = ["t.started_at >= ?", "t.started_at <= ?"];
+    const baseParams: unknown[] = [since, until];
+    if (filters.agentId) {
+      where.push("t.agent_id = ?");
+      baseParams.push(filters.agentId);
+    }
+    if (filters.sessionKind) {
+      where.push("t.session_kind = ?");
+      baseParams.push(filters.sessionKind);
+    }
+    const q = filters.q?.trim().toLowerCase();
+    if (q) {
+      const escaped = q.replace(/[\\%_]/g, "\\$&");
+      const like = `%${escaped}%`;
+      where.push(`(
+        LOWER(t.session_id) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(t.model_id, '')) LIKE ? ESCAPE '\\'
+        OR LOWER(t.agent_id) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(a.name, '')) LIKE ? ESCAPE '\\'
+        OR LOWER(COALESCE(st.name, '')) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(ci.name, '')) LIKE ? ESCAPE '\\'
+      )`);
+      for (let i = 0; i < 6; i++) baseParams.push(like);
+    }
+    const whereSql = where.join(" AND ");
+    const joins = `
+      LEFT JOIN agents a ON a.id = t.agent_id
+      LEFT JOIN scheduled_tasks st ON st.id = t.scheduler_task_id
+      LEFT JOIN channel_instances ci ON ci.id = CASE
+        WHEN instr(t.session_id, ':') > 0 THEN substr(t.session_id, 1, instr(t.session_id, ':') - 1)
+        ELSE t.session_id END`;
+    const rangeParams = [since, until];
+    const rows = this.db.query<any>(
+      `SELECT t.conversation_id, t.agent_id, t.session_id, t.session_kind, t.scheduler_task_id,
+              a.name AS agent_name, st.name AS scheduler_task_name,
+              ci.type AS channel_type, ci.name AS channel_name,
+              COUNT(*) AS turns,
+              SUM(t.cost_usd) + COALESCE((
+                SELECT SUM(c.cost_usd) FROM compaction_events c
+                WHERE c.conversation_id = t.conversation_id AND c.cost_in_turn = 0
+                  AND c.started_at >= ? AND c.started_at <= ?
+              ), 0) AS cost_usd,
+              MAX(t.priced) AS priced,
+              MAX(t.started_at) AS last_active_at,
+              (SELECT x.context_tokens FROM llm_turns x
+                WHERE x.conversation_id = t.conversation_id ORDER BY x.started_at DESC LIMIT 1) AS context_tokens,
+              (SELECT x.context_window FROM llm_turns x
+                WHERE x.conversation_id = t.conversation_id ORDER BY x.started_at DESC LIMIT 1) AS context_window,
+              (SELECT x.provider FROM llm_turns x
+                WHERE x.conversation_id = t.conversation_id ORDER BY x.started_at DESC LIMIT 1) AS provider,
+              (SELECT x.model_id FROM llm_turns x
+                WHERE x.conversation_id = t.conversation_id ORDER BY x.started_at DESC LIMIT 1) AS model_id,
+              (SELECT x.status FROM llm_turns x
+                WHERE x.conversation_id = t.conversation_id ORDER BY x.started_at DESC LIMIT 1) AS status,
+              (SELECT COUNT(*) FROM compaction_events c
+                WHERE c.conversation_id = t.conversation_id
+                  AND c.started_at >= ? AND c.started_at <= ?) AS compactions
+       FROM llm_turns t
+       ${joins}
+       WHERE ${whereSql}
+       GROUP BY t.conversation_id, t.agent_id, t.session_id, t.session_kind, t.scheduler_task_id
+       ORDER BY last_active_at DESC
+       LIMIT ? OFFSET ?`,
+      ...rangeParams,
+      ...rangeParams,
+      ...baseParams,
+      filters.limit ?? 100,
+      filters.offset ?? 0,
+    );
+    const total =
+      this.db.queryOne<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM (
+           SELECT 1 FROM llm_turns t ${joins} WHERE ${whereSql} GROUP BY t.conversation_id
+         )`,
+        ...baseParams,
+      )?.n ?? 0;
+    return {
+      total,
+      rows: rows.map((r) => ({
+        conversationId: r.conversation_id,
+        agentId: r.agent_id,
+        agentName: r.agent_name ?? undefined,
+        sessionId: r.session_id,
+        sessionKind: r.session_kind,
+        schedulerTaskId: r.scheduler_task_id ?? undefined,
+        schedulerTaskName: r.scheduler_task_name ?? undefined,
+        channelType: r.channel_type ?? undefined,
+        channelName: r.channel_name ?? undefined,
+        provider: r.provider ?? undefined,
+        modelId: r.model_id ?? undefined,
+        contextTokens: r.context_tokens ?? undefined,
+        contextWindow: r.context_window ?? undefined,
+        turns: r.turns,
+        costUsd: r.cost_usd ?? 0,
+        priced: r.priced !== 0,
+        lastActiveAt: r.last_active_at,
+        compactions: r.compactions ?? 0,
+        status: r.status ?? undefined,
+      })),
+    };
+  }
+
+  public insertLlmRequests(rows: LlmRequestRecord[]): void {
+    if (rows.length === 0) return;
+    this.db.transaction(() => {
+      for (const r of rows) {
+        this.db.run(
+          `INSERT OR IGNORE INTO llm_requests (
+            span_id, turn_id, conversation_id, trace_id, parent_span_id, task_id, kind, task_kind,
+            compaction_id, provider, model_id, api, started_at, ended_at, duration_ms,
+            first_chunk_ms, input_tokens, output_tokens, cache_read, cache_write,
+            reasoning_tokens, cost_usd, stop_reason, status, error
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          r.spanId,
+          r.turnId ?? null,
+          r.conversationId ?? null,
+          r.traceId ?? null,
+          r.parentSpanId ?? null,
+          r.taskId ?? null,
+          r.kind,
+          r.taskKind ?? null,
+          r.compactionId ?? null,
+          r.provider ?? null,
+          r.modelId ?? null,
+          r.api ?? null,
+          r.startedAt,
+          r.endedAt ?? null,
+          r.durationMs ?? null,
+          r.firstChunkMs ?? null,
+          r.inputTokens,
+          r.outputTokens,
+          r.cacheRead,
+          r.cacheWrite,
+          r.reasoningTokens,
+          r.costUsd,
+          r.stopReason ?? null,
+          r.status,
+          r.error ?? null,
+        );
+      }
+    });
+  }
+
+  public listLlmRequests(turnId: string): LlmRequestRecord[] {
+    return this.db
+      .query<any>("SELECT * FROM llm_requests WHERE turn_id = ? ORDER BY started_at ASC", turnId)
+      .map((r) => ({
+        spanId: r.span_id,
+        turnId: r.turn_id ?? undefined,
+        conversationId: r.conversation_id ?? undefined,
+        traceId: r.trace_id ?? undefined,
+        parentSpanId: r.parent_span_id ?? undefined,
+        taskId: r.task_id ?? undefined,
+        kind: r.kind,
+        taskKind: r.task_kind ?? undefined,
+        compactionId: r.compaction_id ?? undefined,
+        provider: r.provider ?? undefined,
+        modelId: r.model_id ?? undefined,
+        api: r.api ?? undefined,
+        startedAt: r.started_at,
+        endedAt: r.ended_at ?? undefined,
+        durationMs: r.duration_ms ?? undefined,
+        firstChunkMs: r.first_chunk_ms ?? undefined,
+        inputTokens: r.input_tokens,
+        outputTokens: r.output_tokens,
+        cacheRead: r.cache_read,
+        cacheWrite: r.cache_write,
+        reasoningTokens: r.reasoning_tokens,
+        costUsd: r.cost_usd,
+        stopReason: r.stop_reason ?? undefined,
+        status: r.status,
+        error: r.error ?? undefined,
+      }));
+  }
+
+  public countLlmRequestsByTask(taskId: string): number {
+    return (
+      this.db.queryOne<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM llm_requests WHERE task_id = ?",
+        taskId,
+      )?.n ?? 0
+    );
+  }
+
+  public countLlmRequestsByCompaction(compactionId: string): number {
+    return (
+      this.db.queryOne<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM llm_requests WHERE compaction_id = ?",
+        compactionId,
+      )?.n ?? 0
+    );
+  }
+
+  public insertToolInvocations(rows: ToolInvocationRecord[]): void {
+    if (rows.length === 0) return;
+    this.db.transaction(() => {
+      for (const r of rows) {
+        this.db.run(
+          `INSERT INTO tool_invocations (
+            turn_id, conversation_id, trace_id, task_id, tool_call_id, tool_name,
+            started_at, ended_at, duration_ms, status, error
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(trace_id, tool_call_id) DO UPDATE SET
+            turn_id = COALESCE(excluded.turn_id, tool_invocations.turn_id),
+            started_at = MIN(tool_invocations.started_at, excluded.started_at),
+            ended_at = CASE
+              WHEN excluded.ended_at IS NULL THEN tool_invocations.ended_at
+              WHEN tool_invocations.ended_at IS NULL THEN excluded.ended_at
+              ELSE MAX(tool_invocations.ended_at, excluded.ended_at) END,
+            duration_ms = CASE
+              WHEN excluded.ended_at IS NULL OR tool_invocations.ended_at IS NULL THEN tool_invocations.duration_ms
+              ELSE MAX(tool_invocations.ended_at, excluded.ended_at) - MIN(tool_invocations.started_at, excluded.started_at) END,
+            status = excluded.status,
+            error = COALESCE(excluded.error, tool_invocations.error)`,
+          r.turnId ?? null,
+          r.conversationId ?? null,
+          r.traceId ?? null,
+          r.taskId ?? null,
+          r.toolCallId ?? "",
+          r.toolName,
+          r.startedAt,
+          r.endedAt ?? null,
+          r.durationMs ?? null,
+          r.status,
+          r.error ?? null,
+        );
+      }
+    });
+  }
+
+  public listToolInvocations(turnId: string): ToolInvocationRecord[] {
+    return this.db
+      .query<any>("SELECT * FROM tool_invocations WHERE turn_id = ? ORDER BY started_at ASC", turnId)
+      .map((r) => ({
+        turnId: r.turn_id ?? undefined,
+        conversationId: r.conversation_id ?? undefined,
+        traceId: r.trace_id ?? undefined,
+        taskId: r.task_id ?? undefined,
+        toolCallId: r.tool_call_id ?? undefined,
+        toolName: r.tool_name,
+        startedAt: r.started_at,
+        endedAt: r.ended_at ?? undefined,
+        durationMs: r.duration_ms ?? undefined,
+        status: r.status,
+        error: r.error ?? undefined,
+      }));
+  }
+
+  public insertCompactionEvent(event: CompactionEventRecord): number {
+    const result = this.db.run(
+      `INSERT OR IGNORE INTO compaction_events (
+        conversation_id, agent_id, session_id, turn_id, task_id, trace_id, compaction_id,
+        profile, trigger, threshold_tokens, keep_recent_tokens,
+        before_tokens, after_tokens, before_estimate_tokens, after_estimate_tokens,
+        before_entries, after_entries, started_at, ended_at, duration_ms,
+        cost_usd, cost_in_turn, request_count, status, fail_open, error
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      event.conversationId,
+      event.agentId ?? null,
+      event.sessionId ?? null,
+      event.turnId ?? null,
+      event.taskId ?? null,
+      event.traceId ?? null,
+      event.compactionId ?? null,
+      event.profile,
+      event.trigger,
+      event.thresholdTokens ?? null,
+      event.keepRecentTokens ?? null,
+      event.beforeTokens ?? null,
+      event.afterTokens ?? null,
+      event.beforeEstimateTokens ?? null,
+      event.afterEstimateTokens ?? null,
+      event.beforeEntries ?? null,
+      event.afterEntries ?? null,
+      event.startedAt,
+      event.endedAt ?? null,
+      event.durationMs ?? null,
+      event.costUsd ?? null,
+      event.costInTurn ? 1 : 0,
+      event.requestCount,
+      event.status,
+      event.failOpen ? 1 : 0,
+      event.error ?? null,
+    );
+    const changes = Number(result?.changes ?? 0);
+    if (changes === 0 && event.turnId && event.taskId) {
+      return (
+        this.db.queryOne<{ id: number }>(
+          "SELECT id FROM compaction_events WHERE turn_id = ? AND task_id = ?",
+          event.turnId,
+          event.taskId,
+        )?.id ?? 0
+      );
+    }
+    return changes === 0
+      ? 0
+      : Number(this.db.queryOne<{ id: number }>("SELECT last_insert_rowid() AS id")?.id ?? 0);
+  }
+
+  public listCompactionEvents(input: {
+    conversationId?: string;
+    turnId?: string;
+    limit?: number;
+  }): CompactionEventRecord[] {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (input.conversationId) {
+      where.push("conversation_id = ?");
+      params.push(input.conversationId);
+    }
+    if (input.turnId) {
+      where.push("turn_id = ?");
+      params.push(input.turnId);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    return this.db
+      .query<any>(
+        `SELECT * FROM compaction_events ${whereSql} ORDER BY started_at DESC LIMIT ?`,
+        ...params,
+        input.limit ?? 100,
+      )
+      .map((r) => ({
+        id: r.id,
+        conversationId: r.conversation_id,
+        agentId: r.agent_id ?? undefined,
+        sessionId: r.session_id ?? undefined,
+        turnId: r.turn_id ?? undefined,
+        taskId: r.task_id ?? undefined,
+        traceId: r.trace_id ?? undefined,
+        compactionId: r.compaction_id ?? undefined,
+        profile: r.profile,
+        trigger: r.trigger,
+        thresholdTokens: r.threshold_tokens ?? undefined,
+        keepRecentTokens: r.keep_recent_tokens ?? undefined,
+        beforeTokens: r.before_tokens ?? undefined,
+        afterTokens: r.after_tokens ?? undefined,
+        beforeEstimateTokens: r.before_estimate_tokens ?? undefined,
+        afterEstimateTokens: r.after_estimate_tokens ?? undefined,
+        beforeEntries: r.before_entries ?? undefined,
+        afterEntries: r.after_entries ?? undefined,
+        startedAt: r.started_at,
+        endedAt: r.ended_at ?? undefined,
+        durationMs: r.duration_ms ?? undefined,
+        costUsd: r.cost_usd ?? undefined,
+        costInTurn: r.cost_in_turn !== 0,
+        requestCount: r.request_count,
+        status: r.status,
+        failOpen: r.fail_open !== 0,
+        error: r.error ?? undefined,
+      }));
+  }
+
+  /** 七期：turn 结束后补写轮内压缩事件的实际请求数与 trace（请求明细此时已 flush）。 */
+  public updateCompactionEventMetrics(
+    id: number,
+    patch: { requestCount?: number; traceId?: string },
+  ): void {
+    if (!Number.isFinite(id) || id <= 0) return;
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (patch.requestCount !== undefined) {
+      sets.push("request_count = ?");
+      params.push(Math.max(0, Math.floor(patch.requestCount)));
+    }
+    if (patch.traceId !== undefined) {
+      sets.push("trace_id = ?");
+      params.push(patch.traceId);
+    }
+    if (sets.length === 0) return;
+    this.db.run(`UPDATE compaction_events SET ${sets.join(", ")} WHERE id = ?`, ...params, id);
+  }
+
+  /** 启动时把上次进程遗留的 running turn 标记为 interrupted。 */
+  public markRunningTurnsInterrupted(now = Date.now()): number {
+    const result = this.db.run(
+      `UPDATE llm_turns
+         SET status = 'interrupted', ended_at = COALESCE(ended_at, ?),
+             duration_ms = COALESCE(duration_ms, MAX(0, ? - started_at))
+       WHERE status = 'running'`,
+      now,
+      now,
+    );
+    return Number(result?.changes ?? 0);
+  }
+
+  private deleteOlderThan(table: string, column: string, cutoff: number, limit = 5000): number {
+    let deleted = 0;
+    for (;;) {
+      const result = this.db.run(
+        `DELETE FROM ${table} WHERE rowid IN (
+           SELECT rowid FROM ${table} WHERE ${column} < ? LIMIT ?
+         )`,
+        cutoff,
+        limit,
+      );
+      const changes = Number(result?.changes ?? 0);
+      deleted += changes;
+      if (changes < limit) break;
+    }
+    return deleted;
+  }
+
+  /** 保留期清理：聚合约 90 天、明细约 30 天（由策略传入）。 */
+  public cleanupContextMetrics(input: { turnCutoff: number; detailCutoff: number }): {
+    turns: number;
+    compactions: number;
+    requests: number;
+    tools: number;
+  } {
+    return this.db.transaction(() => ({
+      turns: this.deleteOlderThan("llm_turns", "started_at", input.turnCutoff),
+      compactions: this.deleteOlderThan("compaction_events", "started_at", input.turnCutoff),
+      requests: this.deleteOlderThan("llm_requests", "started_at", input.detailCutoff),
+      tools: this.deleteOlderThan("tool_invocations", "started_at", input.detailCutoff),
+    }));
   }
 
   // --- Audit Logs ---

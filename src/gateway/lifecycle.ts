@@ -445,6 +445,8 @@ export interface QueuedPrompt {
   agentId: string;
   sessionId: string;
   message: string;
+  /** 受理时间（用于消息上下文里的“触发时间”） */
+  createdAt?: number;
 }
 
 export const sessionQueues = new Map<string, QueuedPrompt[]>();

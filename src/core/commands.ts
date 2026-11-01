@@ -237,13 +237,39 @@ function registerBuiltinCommands(): void {
 
   commandRouter.register({
     name: "compact",
-    description: "压缩当前对话历史 (释放 Token)",
+    argsHint: "[额外关注点]",
+    description: "压缩当前对话历史 (释放 Token)；可附加摘要关注点",
     category: "Session",
     visibility: "all",
     busyPolicy: "interrupt-then-dispatch",
     handler: async (ctx) => {
-      await AgentManager.getInstance().compactSession(ctx.agentId, ctx.sessionId);
-      return { ok: true, content: "✅ 对话历史已压缩。", data: { compacted: true } };
+      const outcome = await AgentManager.getInstance().compactSession(
+        ctx.agentId,
+        ctx.sessionId,
+        ctx.rest.trim() || undefined,
+      );
+      if (outcome.status === "done" && outcome.compacted) {
+        const before = formatCompactTokens(outcome.beforeTokens);
+        const after = formatCompactTokens(outcome.afterTokens);
+        const cost = outcome.costUsd && outcome.costUsd > 0 ? `，$${outcome.costUsd.toFixed(4)}` : "";
+        return {
+          ok: true,
+          content: `✅ 已压缩：${before} → ${after} tokens（耗时 ${(outcome.durationMs / 1000).toFixed(1)}s${cost}）`,
+          data: { ...outcome },
+        };
+      }
+      if (outcome.status === "skipped") {
+        return {
+          ok: true,
+          content: "ℹ️ 当前上下文没有可压缩的历史前缀（保持原样）。",
+          data: { ...outcome },
+        };
+      }
+      return {
+        ok: false,
+        content: `⚠️ 压缩未完成：${outcome.error ?? outcome.status}`,
+        data: { ...outcome },
+      };
     },
   });
 
@@ -330,3 +356,7 @@ function registerBuiltinCommands(): void {
 }
 
 registerBuiltinCommands();
+
+function formatCompactTokens(value: number | undefined): string {
+  return value === undefined || !Number.isFinite(value) ? "?" : fmtTokens(Math.round(value));
+}
