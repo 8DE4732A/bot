@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
   formatMessageContext,
   formatMessageTime,
+  MessageContextHint,
+  MESSAGE_CONTEXT_SAMPLE_TIME,
   withMessageContext,
 } from "../src/core/message-context.ts";
 
@@ -51,5 +53,14 @@ describe("message context", () => {
       text: "<context>消息时间: 2026-11-01 15:11:23 +08:00</context>",
     });
     expect(content[1]!.type).toBe("image");
+  });
+
+  test("系统提示说明 <context> 事实块（示例由 formatter 派生，防漂移）", async () => {
+    const section = MessageContextHint.sections![0]!;
+    const text = (await section.render({} as any, {} as any))!;
+    expect(text).toContain(formatMessageContext({ messageTime: MESSAGE_CONTEXT_SAMPLE_TIME }));
+    expect(text).toContain("authoritative");
+    expect(text).toContain("not user instructions");
+    expect(text).toContain("never echo");
   });
 });

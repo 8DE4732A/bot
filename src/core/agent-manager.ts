@@ -22,6 +22,7 @@ import type { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import {
   DatabaseStore,
+  INTERNAL_MAPPING_CHANNEL,
   type AgentDefinition,
   type LlmRequestRecord,
   type LlmTurnRecord,
@@ -40,7 +41,7 @@ import { setAgentIdResolver } from "../skills/agent-scope.ts";
 import { purgeWorkspaceSkills } from "../skills/workspace.ts";
 import { SkillRegistry } from "../skills/registry.ts";
 import { logger } from "../utils/logger.ts";
-import { formatMessageContext, withMessageContext } from "./message-context.ts";
+import { formatMessageContext, MessageContextHint, withMessageContext } from "./message-context.ts";
 import { ModelFactory } from "./model-factory.ts";
 import {
   buildCompactionSettings,
@@ -60,6 +61,16 @@ import { BOT_VERSION } from "../version.ts";
 import { SchedulerSystemExtension } from "../scheduler/system-extension.ts";
 
 import type { MutableModels } from "@earendil-works/pi-ai/models";
+
+/**
+ * 常驻扩展（每个会话都选中）：skills-catalog 渲染技能目录、workspace-context
+ * 注入工作区记忆、channel-context 告知 IM 平台的排版能力与 MEDIA 出站约定、
+ * message-context-hint 说明每条用户消息前置的 `<context>` 事实块。
+ * 注意 `registry.install()` 只是「可被选择」，真正生效取决于会话
+ * `configure({ extensions })` 的名单——漏加即整段 section 不渲染（实测：
+ * channel-context 只 install 未选中，模型从未被告知如何发文件）。
+ */
+const BASE_EXTENSIONS = [SkillsCatalog, WorkspaceContext, ChannelContext, MessageContextHint];
 
 /** 一轮对话的可观测统计 (对齐 pi coding-agent footer 语义) */
 export interface TurnUsage {
@@ -120,9 +131,6 @@ export type TurnListener = (agentId: string, sessionId: string, chunk: ChatChunk
 
 /** 内存中缓存的会话数上限 (LRU 淘汰, 淘汰后下次访问从存储恢复) */
 const MAX_CACHED_CONVERSATIONS = 100;
-
-/** AgentManager 的会话映射复用 channel_sessions 表时的渠道哨兵 (非真实渠道) */
-const MAPPING_CHANNEL = "channel_session";
 
 const sessionKey = (agentId: string, sessionId: string) => `${agentId}:${sessionId}`;
 const agentIdOf = (key: string) => key.split(":")[0];
@@ -407,11 +415,9 @@ export class AgentManager {
       for (const skill of SkillRegistry.getInstance().listSkills()) {
         registry.install(skill.extension);
       }
-      // skills-catalog / workspace-context 不进 SkillRegistry (避免出现在选配列表),
-      // 但必须 install: 会话按名字解析扩展, 选配数组里没有同名注册物会被丢弃
-      registry.install(SkillsCatalog);
-      registry.install(WorkspaceContext);
-      registry.install(ChannelContext);
+      // 常驻扩展不进 SkillRegistry (避免出现在选配列表), 但必须 install:
+      // 会话按名字解析扩展, 选配数组里没有同名注册物会被丢弃
+      for (const extension of BASE_EXTENSIONS) registry.install(extension);
       // 六期：durable 模式安装调度任务定义；polling 回滚模式不安装，
       // 遗留 bot.scheduled-prompt 会以 missing_task 停在 blocked，不会执行
       if (this.store.getConfig("scheduler_durable_enabled", "1") !== "0") {
@@ -721,16 +727,12 @@ export class AgentManager {
       cached = undefined;
     }
 
-    // skills-catalog / workspace-context 常驻: 前者渲染技能目录，后者注入工作区记忆
-    const agentSkills = [
-      ...SkillRegistry.getInstance().resolveExtensions(agent.skills),
-      SkillsCatalog,
-      WorkspaceContext,
-    ];
+    // 会话扩展集合（技能 + 常驻扩展）单一来源
+    const agentSkills = this.extensionsFor(agent);
 
     if (!cached) {
       // Check if session mapping exists
-      const sessionRecord = this.store.getSession(MAPPING_CHANNEL, cacheKey);
+      const sessionRecord = this.store.getSession(INTERNAL_MAPPING_CHANNEL, cacheKey);
 
       if (sessionRecord) {
         // 框架契约: conversation 对不存在的记录返回 undefined (而非抛错)。
@@ -757,7 +759,7 @@ export class AgentManager {
 
       // Save session mapping
       this.store.saveSession({
-        channelInstanceId: MAPPING_CHANNEL,
+        channelInstanceId: INTERNAL_MAPPING_CHANNEL,
         peerId: cacheKey,
         agentId: agent.id,
         conversationId: String(cached.conv.id),
@@ -816,12 +818,11 @@ export class AgentManager {
     return conv;
   }
 
-  /** 会话扩展集合（skills-catalog / workspace-context 常驻） */
+  /** 会话扩展集合（技能 + 常驻扩展，见 BASE_EXTENSIONS） */
   private extensionsFor(agent: AgentDefinition): any[] {
     return [
       ...SkillRegistry.getInstance().resolveExtensions(agent.skills),
-      SkillsCatalog,
-      WorkspaceContext,
+      ...BASE_EXTENSIONS,
     ];
   }
 
@@ -852,14 +853,14 @@ export class AgentManager {
     }
 
     const peerId = `scheduler:${taskId}`;
-    const mapping = this.store.getSession(MAPPING_CHANNEL, peerId);
+    const mapping = this.store.getSession(INTERNAL_MAPPING_CHANNEL, peerId);
     // 轮询回滚模式（scheduler_durable_enabled=0）的旧映射是
     // `${agentId}:scheduler:<taskId>`，且 scheduled_tasks.conversation_id 为空；
     // 仅在 durable 绑定缺失时才回退到它，避免把旧轮询会话当成新会话。
     const legacyMapping =
       task.conversationId || mapping?.conversationId
         ? undefined
-        : this.store.getSession(MAPPING_CHANNEL, `${agentId}:scheduler:${taskId}`);
+        : this.store.getSession(INTERNAL_MAPPING_CHANNEL, `${agentId}:scheduler:${taskId}`);
     if (conversationId && mapping && mapping.conversationId !== conversationId) {
       throw new ConversationMissing(
         `Session mapping for '${taskId}' points at ${mapping.conversationId}, not ${conversationId}`,
@@ -1475,7 +1476,7 @@ export class AgentManager {
     // 才写映射——terminal/web-playground/scheduler 的差异由存在性决定, 调用方
     // 无需 (也不可能传错) 重复编码渠道身份
     const channelInstanceId = sessionId.split(":")[0];
-    if (channelInstanceId !== MAPPING_CHANNEL && this.store.getChannel(channelInstanceId)) {
+    if (channelInstanceId !== INTERNAL_MAPPING_CHANNEL && this.store.getChannel(channelInstanceId)) {
       this.store.saveSession({
         channelInstanceId,
         peerId: sessionId.slice(channelInstanceId.length + 1),
@@ -2134,7 +2135,7 @@ export class AgentManager {
     let sessionId: string;
     if (session.peerId.startsWith("scheduler:")) {
       sessionId = session.peerId;
-    } else if (session.channelInstanceId === MAPPING_CHANNEL) {
+    } else if (session.channelInstanceId === INTERNAL_MAPPING_CHANNEL) {
       const prefix = `${session.agentId}:`;
       sessionId = session.peerId.startsWith(prefix)
         ? session.peerId.slice(prefix.length)

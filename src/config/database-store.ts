@@ -4,6 +4,12 @@ import { LAST_RESULT_MAX_CHARS } from "../scheduler/schedule.ts";
 import { logger } from "../utils/logger.ts";
 import { normalizeSandbox } from "./sandbox-defaults.ts";
 
+/**
+ * 内部会话映射的哨兵渠道 id（非真实渠道实例）：AgentManager 用它记录
+ * `${agentId}:${sessionId}` 形态的映射，真实渠道行优先于它。
+ */
+export const INTERNAL_MAPPING_CHANNEL = "channel_session";
+
 export type ModelProtocol = "openai-completions" | "openai-responses" | "anthropic-messages" | "google";
 
 export interface ModelProviderDefinition {

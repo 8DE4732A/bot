@@ -5,7 +5,14 @@ import { join } from "node:path";
 import { DatabaseManager } from "../src/database/index.ts";
 import { DatabaseStore } from "../src/config/database-store.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { getCurrentSystemMessage } from "@earendil-works/pi-ai/utils/transcript";
 import { AgentManager } from "../src/core/agent-manager.ts";
+import { DEFAULT_CONTEXT_POLICY } from "../src/core/context-policy.ts";
+import {
+  MAX_OUTBOUND_MEDIA,
+  MAX_TOTAL_OUTBOUND_MEDIA_BYTES,
+  MEDIA_MAX_BYTES,
+} from "../src/channels/runtime/media-outbound.ts";
 import { logger } from "../src/utils/logger.ts";
 
 const root = mkdtempSync(join(tmpdir(), "bot-context-agent-chat-"));
@@ -60,6 +67,23 @@ function startMock() {
   return `http://127.0.0.1:${mock.port}/v1`;
 }
 
+/** 保证 mock provider 与本地 SSE 服务就绪（多个用例共用） */
+function ensureMockProvider(): void {
+  const store = new DatabaseStore();
+  if (store.getModelProvider("mock")) return;
+  const apiBase = startMock();
+  store.saveModelProvider({
+    id: "mock",
+    name: "Mock",
+    protocol: "openai-completions",
+    apiBase,
+    apiKey: "mock-key",
+    models: ["deepseek-chat"],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+}
+
 afterAll(async () => {
   await AgentManager.getInstance().shutdown().catch(() => {});
   mock?.stop(true);
@@ -67,18 +91,8 @@ afterAll(async () => {
 
 describe("AgentManager chat observability", () => {
   test("一轮 chat 写 llm_turns / llm_requests，并经 telemetry 归因", async () => {
-    const apiBase = startMock();
+    ensureMockProvider();
     const store = new DatabaseStore();
-    store.saveModelProvider({
-      id: "mock",
-      name: "Mock",
-      protocol: "openai-completions",
-      apiBase,
-      apiKey: "mock-key",
-      models: ["deepseek-chat"],
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
     store.saveModelMetadata({
       providerId: "mock",
       modelId: "deepseek-chat",
@@ -117,6 +131,9 @@ describe("AgentManager chat observability", () => {
     );
     expect(userTexts.some((text) => text.includes("<context>消息时间: 2026-11-01 15:11:23"))).toBe(true);
     expect(userTexts.some((text) => text.includes("hello"))).toBe(true);
+    // 终端会话同样要拿到 <context> 说明（说明挂在常驻扩展，不依赖 IM 渠道）
+    const terminalSections = getCurrentSystemMessage(view.entries.flatMap((entry) => entry.model ?? []))?.sections;
+    expect(terminalSections?.message_time_context).toContain("authoritative");
 
     const turns = store.listLlmTurns(session!.conversationId, 10, 0);
     expect(turns).toHaveLength(1);
@@ -136,7 +153,7 @@ describe("AgentManager chat observability", () => {
   test("轮询模式 legacy scheduler 映射：手动压缩不新建会话", async () => {
     const store = new DatabaseStore();
     AgentManager.getInstance().applyContextPolicy(
-      (await import("../src/core/context-policy.ts")).DEFAULT_CONTEXT_POLICY,
+      DEFAULT_CONTEXT_POLICY,
     );
     const now = Date.now();
     store.saveScheduledTask({
@@ -171,9 +188,9 @@ describe("AgentManager chat observability", () => {
   test("取消落在压缩/请求窗口时不继续提交", async () => {
     const sessionId = "terminal-main:local-user";
     AgentManager.getInstance().applyContextPolicy({
-      ...(await import("../src/core/context-policy.ts")).DEFAULT_CONTEXT_POLICY,
+      ...DEFAULT_CONTEXT_POLICY,
       strategies: {
-        ...(await import("../src/core/context-policy.ts")).DEFAULT_CONTEXT_POLICY.strategies,
+        ...DEFAULT_CONTEXT_POLICY.strategies,
         global: { enabled: true, percent: 0.0001, minTokens: 0 },
       },
       safetyTokens: 0,
@@ -196,9 +213,9 @@ describe("AgentManager chat observability", () => {
   test("下一轮超过策略阈值时，先压缩再提交，turn 标记 compactedBefore", async () => {
     const store = new DatabaseStore();
     AgentManager.getInstance().applyContextPolicy({
-      ...(await import("../src/core/context-policy.ts")).DEFAULT_CONTEXT_POLICY,
+      ...DEFAULT_CONTEXT_POLICY,
       strategies: {
-        ...(await import("../src/core/context-policy.ts")).DEFAULT_CONTEXT_POLICY.strategies,
+        ...DEFAULT_CONTEXT_POLICY.strategies,
         global: { enabled: true, percent: 0.0001, minTokens: 0 },
       },
       safetyTokens: 0,
@@ -222,5 +239,42 @@ describe("AgentManager chat observability", () => {
     expect(latest.compactedBefore).toBe(true);
     const compactions = store.listCompactionEvents({ conversationId: session!.conversationId });
     expect(compactions.some((c) => c.trigger.startsWith("pre_turn") && c.status === "done")).toBe(true);
+  });
+
+  test("IM 会话的系统提示注入 channel_context（MEDIA 出站约定）", async () => {
+    ensureMockProvider();
+    const store = new DatabaseStore();
+    store.saveChannel({
+      id: "weixin-test",
+      type: "weixin",
+      name: "微信测试",
+      enabled: true,
+      boundAgentId: "agent-default",
+      credentials: {},
+      updatedAt: Date.now(),
+    });
+    const agent = store.getAgent("agent-default")!;
+    store.saveAgent({ ...agent, model: { ...agent.model, provider: "mock", modelId: "deepseek-chat" } });
+    AgentManager.getInstance().applyContextPolicy(DEFAULT_CONTEXT_POLICY);
+
+    await AgentManager.getInstance().chat("agent-default", "weixin-test:wx-peer-1", "发一张图给我");
+
+    const session = store.getSession("channel_session", "agent-default:weixin-test:wx-peer-1");
+    expect(session?.conversationId).toBeTruthy();
+    const harness = AgentManager.getInstance().getHarness()!;
+    const conv = await harness.conversation(Number(session!.conversationId) as never, BACKGROUND_CONTEXT);
+    const view = await conv.context(BACKGROUND_CONTEXT);
+    // registry.install 只是「可被选择」；会话 configure 的 extensions 名单漏加
+    // channel-context 时，整段 section 不会出现在系统提示里（回归点）
+    const sections = getCurrentSystemMessage(view.entries.flatMap((entry) => entry.model ?? []))?.sections;
+    const rendered = sections?.channel_context ?? "";
+    expect(rendered).toContain("MEDIA:");
+    // 提示词必须准确描述实际限制：仅工作区、单个与总量上限
+    expect(rendered).toContain("inside your workspace");
+    expect(rendered).toContain(`${Math.round(MEDIA_MAX_BYTES / (1024 * 1024))} MB`);
+    expect(rendered).toContain(`${MAX_OUTBOUND_MEDIA} files`);
+    expect(rendered).toContain(`${Math.round(MAX_TOTAL_OUTBOUND_MEDIA_BYTES / (1024 * 1024))} MB in total`);
+    // 每条消息的 <context> 事实块说明对所有会话类型生效
+    expect(sections?.message_time_context).toContain("authoritative");
   });
 });

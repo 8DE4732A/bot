@@ -5,6 +5,9 @@ import { isInsidePath } from "../../config/env-paths.ts";
 import type { MediaKind, OutboundMedia } from "../base.ts";
 import { MEDIA_MAX_BYTES } from "./media-cache.ts";
 
+/** 出站单文件上限（与入站同一常量；提示词与解析器共用） */
+export { MEDIA_MAX_BYTES };
+
 /** 单条回复允许的媒体数量上限 */
 export const MAX_OUTBOUND_MEDIA = 8;
 /** 单条回复媒体总大小上限（防 8×128MB 同时驻留） */
