@@ -368,10 +368,10 @@ export interface AuditPage {
   total: number;
 }
 
-/* ---------------- Durable 任务（1.4.0） ---------------- */
+/* ---------------- Durable 任务（1.5.0） ---------------- */
 
 export interface DurableTaskStateInfo {
-  kind: "running" | "ready" | "waiting" | "sleeping" | "completing" | "blocked";
+  kind: "running" | "pending" | "waiting" | "sleeping" | "completing" | "blocked";
   migrates?: boolean;
   on?: string[];
   until?: number;

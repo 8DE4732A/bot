@@ -19,9 +19,10 @@
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "^0.0.78",
-    "@earendil-works/chord": "1.4.0",
-    "@earendil-works/pi-ai": "1.4.0",
-    "@earendil-works/pi-durable": "1.4.0",
+    "@earendil-works/chord": "1.5.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-durable": "1.5.0",
+    "@earendil-works/pi-telemetry": "1.5.0",
     "@larksuiteoapi/node-sdk": "^1.74.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@types/qrcode": "^1.5.6",

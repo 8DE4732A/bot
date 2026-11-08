@@ -2,12 +2,7 @@ import { useEffect, useState } from "react";
 
 import { api, isGatewayEvent } from "../api";
 import { ConfirmButton, Empty, Field, Icon, Modal, fmtTime, useAsync, useToast } from "../components/ui";
-import type {
-  Agent,
-  DurableTaskInfo,
-  DurableTaskStateInfo,
-  ScheduledTask,
-} from "../types";
+import type { Agent, DurableTaskStateInfo, ScheduledTask } from "../types";
 
 /**
  * 定时任务 2.0 (四期 §6.2 #5): 人话编辑器 (五模式平级, 模式切换保留已填
@@ -365,8 +360,8 @@ function durableStateLabel(state: DurableTaskStateInfo): string {
       return `blocked (${state.reason ?? "unknown"})`;
     case "waiting":
       return `waiting (${state.on?.length ?? 0})`;
-    case "ready":
-      return state.migrates ? "ready (migrate)" : "ready";
+    case "pending":
+      return state.migrates ? "pending (migrate)" : "pending";
     default:
       return state.kind;
   }
@@ -381,7 +376,7 @@ export function ScheduledTasksView() {
   const [editing, setEditing] = useState<TaskForm | null>(null);
   const [historyTask, setHistoryTask] = useState<ScheduledTask | null>(null);
   const [triggering, setTriggering] = useState<string | null>(null);
-  const [retrying, setRetrying] = useState<string | null>(null);
+  const [rebuilding, setRebuilding] = useState<string | null>(null);
   const [resetting, setResetting] = useState<string | null>(null);
 
   const tasks = tasksQ.data ?? [];
@@ -421,17 +416,20 @@ export function ScheduledTasksView() {
     }
   };
 
-  const retryDurable = async (t: DurableTaskInfo) => {
-    if (retrying) return;
-    setRetrying(t.id);
+  // 1.5.0: restart-limited 任务已 terminal，恢复 = 为用户显式重建 durable task
+  //（官方语义是重新 submit；UI 以业务 scheduled task 为入口，不是 durable id）。
+  const rebuildDurable = async (t: ScheduledTask) => {
+    if (rebuilding) return;
+    setRebuilding(t.id);
     try {
-      await api.retryDurableTask(t.id);
-      toast(`已重试 durable 任务 ${t.kind}`);
+      await api.recreateDurableTask(t.id);
+      toast(`已重建「${t.name}」的 durable 任务`);
+      tasksQ.reload();
       durableQ.reload();
     } catch (e) {
-      toast(`重试失败: ${(e as Error).message}`, "risk");
+      toast(`重建失败: ${(e as Error).message}`, "risk");
     } finally {
-      setRetrying(null);
+      setRebuilding(null);
     }
   };
 
@@ -494,7 +492,8 @@ export function ScheduledTasksView() {
         <div>
           <div className="section-title">Durable 任务 · {durableTasks.length}</div>
           <div className="field__hint">
-            pi-durable 内部任务；sleeping 到点自动续跑，blocked 表示 crash-loop 已 park，可手动重试。
+            pi-durable 内部 live 任务；sleeping 到点自动续跑；blocked 表示任务定义缺失/过旧/迁移失败。
+            restart-limit 任务已 terminal，请在下方业务任务卡片中“重建任务”。
           </div>
         </div>
         <button className="btn btn--secondary" onClick={durableQ.reload} disabled={durableQ.loading}>
@@ -536,15 +535,9 @@ export function ScheduledTasksView() {
               </div>
               {t.state.kind === "blocked" ? (
                 <div className="card__foot">
-                  {t.state.reason === "restart_limit" ? (
-                    <button className="btn btn--secondary" disabled={!!retrying} onClick={() => void retryDurable(t)}>
-                      重试任务
-                    </button>
-                  ) : (
-                    <span className="field__hint">
-                      blocked: {t.state.reason ?? "unknown"} · 需编辑/重建或人工处理
-                    </span>
-                  )}
+                  <span className="field__hint">
+                    blocked: {t.state.reason ?? "unknown"} · 需在下方任务卡片中重建或人工处理
+                  </span>
                 </div>
               ) : null}
             </div>
@@ -658,6 +651,15 @@ export function ScheduledTasksView() {
                   <button className="btn btn--secondary btn--sm" onClick={() => void trigger(t)} disabled={triggering === t.id || !t.enabled}>
                     {triggering === t.id ? "触发中…" : "立即运行"}
                   </button>
+                  {t.durableState === "blocked" || t.durableState === "failed" ? (
+                    <button
+                      className="btn btn--secondary btn--sm"
+                      onClick={() => void rebuildDurable(t)}
+                      disabled={rebuilding === t.id}
+                    >
+                      {rebuilding === t.id ? "重建中…" : "重建任务"}
+                    </button>
+                  ) : null}
                   <button
                     className="btn btn--secondary btn--sm"
                     onClick={() => setEditing(formFromTask(t))}

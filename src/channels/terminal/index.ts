@@ -1,6 +1,7 @@
 import * as readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { DatabaseStore } from "../../config/database-store.ts";
+import { formatWebUrl, runtimeOrConfiguredWebEndpoint } from "../../config/web-endpoint.ts";
 import { tryCommand } from "../../core/chat-orchestrator.ts";
 import type { ChannelAdapter } from "../base.ts";
 import { ChannelManager } from "../manager.ts";
@@ -63,14 +64,14 @@ export class TerminalChannel implements ChannelAdapter {
 
   private printBanner(): void {
     const agent = this.store.getAgent(this.activeAgentId);
-    const webHost = this.store.getConfig("web_host", "127.0.0.1");
-    const webPort = this.store.getConfig("web_port", "3000");
+    // --port/--host 是运行期覆盖：banner 必须显示实际监听地址
+    const endpoint = runtimeOrConfiguredWebEndpoint(this.store);
 
     console.log("\n\x1b[36m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\x1b[0m");
     console.log("\x1b[36m┃\x1b[0m  🤖 \x1b[1mBot Agent Console\x1b[0m (轻量级多 Agent 终端)         \x1b[36m┃\x1b[0m");
     console.log(`\x1b[36m┃\x1b[0m  当前 Agent: \x1b[33m${agent?.name || "默认助手"} [${this.activeAgentId}]\x1b[0m`);
     console.log(`\x1b[36m┃\x1b[0m  生效模型:   \x1b[35m${agent?.model.provider}/${agent?.model.modelId}\x1b[0m`);
-    console.log(`\x1b[36m┃\x1b[0m  管理后台:   \x1b[4mhttp://${webHost}:${webPort}\x1b[0m`);
+    console.log(`\x1b[36m┃\x1b[0m  管理后台:   \x1b[4m${formatWebUrl(endpoint)}\x1b[0m`);
     console.log("\x1b[36m┃\x1b[0m  可用命令:   /agent, /reset, /compact, /status, /exit   \x1b[36m┃\x1b[0m");
     console.log("\x1b[36m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\x1b[0m\n");
   }

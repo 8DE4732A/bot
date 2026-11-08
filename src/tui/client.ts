@@ -1,4 +1,5 @@
 import { loadOrCreateGatewayToken } from "../core/gateway-token.ts";
+import { formatHostForUrl, formatWebUrl } from "../config/web-endpoint.ts";
 
 /**
  * TUI 的 gateway 客户端 (四期 M2, 设计 §4.1/§4.3):
@@ -65,7 +66,7 @@ export class GatewayClient {
   public connect(): void {
     if (this.closed) return;
     this.onStatus?.("connecting");
-    const url = `ws://${this.opts.host}:${this.opts.port}/api/gateway/ws?token=${encodeURIComponent(this.opts.token)}`;
+    const url = `ws://${formatHostForUrl(this.opts.host)}:${this.opts.port}/api/gateway/ws?token=${encodeURIComponent(this.opts.token)}`;
     const ws = new WebSocket(url);
     this.ws = ws;
 
@@ -230,9 +231,9 @@ export class GatewayClient {
 export const TUI_SESSION = "terminal-main:local-user";
 
 /** 解析 TUI 的 agentId: terminal-main 渠道绑定 (与旧 REPL 同一绑定真相) */
-export async function resolveTuiAgent(webPort: number, token: string): Promise<string> {
+export async function resolveTuiAgent(webHost: string, webPort: number, token: string): Promise<string> {
   try {
-    const res = await fetch(`http://127.0.0.1:${webPort}/api/channels`, {
+    const res = await fetch(`${formatWebUrl({ host: webHost, port: webPort })}/api/channels`, {
       headers: { "x-bot-token": token },
     });
     const channels = (await res.json()) as any[];
@@ -242,9 +243,9 @@ export async function resolveTuiAgent(webPort: number, token: string): Promise<s
   return "agent-default";
 }
 
-export function makeTuiClient(webPort: number, cwd: string, agentId: string): GatewayClient {
+export function makeTuiClient(webHost: string, webPort: number, cwd: string, agentId: string): GatewayClient {
   return new GatewayClient({
-    host: "127.0.0.1",
+    host: webHost,
     port: webPort,
     token: loadOrCreateGatewayToken(cwd),
     agentId,

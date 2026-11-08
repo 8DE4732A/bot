@@ -285,12 +285,11 @@ export const api = {
     request<{ success: boolean }>(`/api/scheduled-tasks?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   listDurableTasks: () => request<{ tasks: DurableTaskInfo[] }>("/api/durable-tasks"),
-  retryDurableTask: (taskId: string) =>
-    request<{ success: boolean }>("/api/durable-tasks/retry", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ taskId }),
-    }),
+  recreateDurableTask: (taskId: string) =>
+    request<{ success: boolean }>(
+      `/api/scheduled-tasks/${encodeURIComponent(taskId)}/recreate-durable`,
+      { method: "POST" },
+    ),
 
   resetChat: (agentId: string, sessionId: string) =>
     request<{ success: boolean }>("/api/chat/reset", {

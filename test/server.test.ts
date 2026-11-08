@@ -585,6 +585,44 @@ describe("AdminWebServer 渠道生命周期 (POST 热替换 / DELETE 回收)", (
     }
   });
 
+  it("recreate-durable: 未知任务 404，非 blocked/failed 409", async () => {
+    const missing = await fetch(
+      `http://127.0.0.1:${testPort}/api/scheduled-tasks/nope/recreate-durable`,
+      { method: "POST" },
+    );
+    expect(missing.status).toBe(404);
+
+    const store = new DatabaseStore();
+    const now = Date.now();
+    store.saveScheduledTask({
+      id: "recreate-not-blocked",
+      agentId: "agent-default",
+      name: "recreate",
+      prompt: "p",
+      scheduleType: "every",
+      intervalSeconds: 300,
+      enabled: true,
+      runCount: 0,
+      durableState: "active",
+      scheduleVersion: 0,
+      notifyEnabled: false,
+      createdAt: now,
+      updatedAt: now,
+    } as any);
+    try {
+      const res = await fetch(
+        `http://127.0.0.1:${testPort}/api/scheduled-tasks/recreate-not-blocked/recreate-durable`,
+        { method: "POST" },
+      );
+      expect(res.status).toBe(409);
+      // 本套件没有初始化 AgentManager Harness，因此先命中 not_ready；
+      // 这里验证的是路由/状态码接线，具体 reason 由 scheduler 单测覆盖。
+      expect((await res.json()).error).toContain("cannot recreate durable task");
+    } finally {
+      store.markScheduledTaskDeleted("recreate-not-blocked");
+    }
+  });
+
   it("所有 API 测试结束：停止 server", async () => {
     // 不要删除 testHome：DatabaseManager 单例可能绑定到这里的 bot.sqlite，
     // 其他测试套件仍在共享它（CLAUDE.md 测试纪律；删除会导致确定性 disk I/O error）。

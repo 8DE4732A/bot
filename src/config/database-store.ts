@@ -1305,6 +1305,45 @@ export class DatabaseStore {
     return row ? this.mapScheduledTaskRow(row) : undefined;
   }
 
+  /** 按 durable task id 反查业务任务（1.5.0 restart-limit report 定位用） */
+  public getScheduledTaskByDurableTaskId(durableTaskId: string): ScheduledTaskDefinition | undefined {
+    const row = this.db.queryOne<any>(
+      "SELECT * FROM scheduled_tasks WHERE durable_task_id = ? AND deleted_at IS NULL",
+      durableTaskId,
+    );
+    return row ? this.mapScheduledTaskRow(row) : undefined;
+  }
+
+  /**
+   * 条件回写 blocked：只匹配当前 durable id、未删除、仍启用且未 poison 的行。
+   * 防止 restart-limit report 覆盖用户已禁用/已 poison 的状态，或覆盖并发重建的新 id。
+   */
+  public markScheduledTaskBlockedIfDurable(id: string, durableTaskId: string): boolean {
+    const { changes } = this.db.run(
+      `UPDATE scheduled_tasks SET durable_state = 'blocked', updated_at = ?
+       WHERE id = ? AND durable_task_id = ? AND deleted_at IS NULL AND enabled = 1
+         AND conversation_poisoned = 0
+         AND durable_state NOT IN ('deleted', 'poisoned', 'aborting', 'done')`,
+      Date.now(),
+      id,
+      durableTaskId,
+    );
+    return Number(changes ?? 0) > 0;
+  }
+
+  /** live 任务回写 active，但不得覆盖已 blocked/aborting/终结的用户状态。 */
+  public setScheduledTaskActiveIfDurable(id: string, durableTaskId: string): boolean {
+    const { changes } = this.db.run(
+      `UPDATE scheduled_tasks SET durable_state = 'active', updated_at = ?
+       WHERE id = ? AND durable_task_id = ? AND deleted_at IS NULL
+         AND durable_state NOT IN ('blocked', 'aborting', 'deleted', 'poisoned', 'done')`,
+      Date.now(),
+      id,
+      durableTaskId,
+    );
+    return Number(changes ?? 0) > 0;
+  }
+
   public listScheduledTasksRaw(agentId?: string): ScheduledTaskDefinition[] {
     const rows = agentId
       ? this.db.query<any>("SELECT * FROM scheduled_tasks WHERE agent_id = ? ORDER BY created_at ASC", agentId)

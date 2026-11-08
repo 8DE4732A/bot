@@ -12,7 +12,7 @@ import type {
   ShellExecOptions,
   ShellExecResult,
   TextLineReader,
-  WatchChange,
+  FileChange,
   WatchTarget,
 } from "@earendil-works/pi-durable/env";
 import type { BotSandboxConfig } from "../config/database-store.ts";
@@ -447,7 +447,7 @@ export class SandboxedExecutionEnv extends NodeExecutionEnv {
 
   public override async watch(
     targets: readonly WatchTarget[],
-    onChange: (change: WatchChange) => void,
+    onChange: (change: FileChange) => void,
     context: Context,
   ): Promise<Result<FileWatcher, FileError>> {
     const resolved: WatchTarget[] = [];

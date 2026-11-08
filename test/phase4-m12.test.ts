@@ -12,7 +12,7 @@ import {
   normalizeDefinition,
   resolveGatewayProgram,
 } from "../src/gateway/service-defs.ts";
-import { probeGateway, startControlSocket } from "../src/gateway/control-socket.ts";
+import { makeControlHandlers, probeGateway, startControlSocket } from "../src/gateway/control-socket.ts";
 import { SessionHub } from "../src/gateway/session-hub.ts";
 import { InboundPipeline } from "../src/channels/runtime/dispatch.ts";
 import { setSlashFastPath } from "../src/channels/runtime/dispatch.ts";
@@ -97,6 +97,7 @@ describe("phase4: control socket (liveness = identify 应答)", () => {
         activeTurns: 0,
         scheduler: { started: true, inFlight: 0 },
         channels: [],
+        webHost: "127.0.0.1",
         webPort: "3000",
       }),
       drain: async () => {},
@@ -118,6 +119,19 @@ describe("phase4: control socket (liveness = identify 应答)", () => {
   test("不可连接 = 不在运行 (liveness 判据)", async () => {
     const dead = await probeGateway(join(sockDir, "nope.sock"), "identify", 800).catch((e) => e);
     expect(dead).toBeInstanceOf(Error);
+  });
+
+  test("status 公布实际监听端点（--port/--host 覆盖不写库）", async () => {
+    const handlers = makeControlHandlers({
+      cwd: "/x",
+      isDraining: () => false,
+      onDrain: async () => {},
+      listChannels: () => [],
+      webEndpoint: () => ({ host: "0.0.0.0", port: 34567 }),
+    });
+    const status = await handlers.status();
+    expect(status.webHost).toBe("0.0.0.0");
+    expect(status.webPort).toBe("34567");
   });
 });
 

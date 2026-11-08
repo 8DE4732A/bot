@@ -1,4 +1,5 @@
 import { DatabaseStore } from "../config/database-store.ts";
+import { formatWebUrl, runtimeOrConfiguredWebEndpoint } from "../config/web-endpoint.ts";
 import { AgentManager } from "./agent-manager.ts";
 import { doCancel, doReset } from "../gateway/lifecycle.ts";
 import { formatTokens } from "../channels/terminal/stats.ts";
@@ -332,9 +333,8 @@ function registerBuiltinCommands(): void {
     busyPolicy: "dispatch",
     handler: async () => {
       const store = new DatabaseStore();
-      const host = store.getConfig("web_host", "127.0.0.1");
-      const port = store.getConfig("web_port", "3000");
-      return { ok: true, content: `管理后台: http://${host}:${port}` };
+      // 进程内优先实际监听端点（--port/--host 覆盖时不等于 system_config）
+      return { ok: true, content: `管理后台: ${formatWebUrl(runtimeOrConfiguredWebEndpoint(store))}` };
     },
   });
 

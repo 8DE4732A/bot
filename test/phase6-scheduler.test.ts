@@ -68,6 +68,40 @@ describe("phase6: migration v6", () => {
   });
 });
 
+describe("phase6: durable task 反查", () => {
+  test("getScheduledTaskByDurableTaskId 只返回未删除业务行", () => {
+    const task = makeTask();
+    store.saveScheduledTask(task);
+    store.setScheduledTaskDurable(task.id, "durable-lookup-42", "active");
+    expect(store.getScheduledTaskByDurableTaskId("durable-lookup-42")?.id).toBe(task.id);
+
+    store.markScheduledTaskDeleted(task.id);
+    expect(store.getScheduledTaskByDurableTaskId("durable-lookup-42")).toBeUndefined();
+  });
+
+  test("active/blocked 条件回写不覆盖用户状态", () => {
+    const task = makeTask();
+    store.saveScheduledTask(task);
+    store.setScheduledTaskDurable(task.id, "durable-cas-1", "active");
+
+    // active CAS 可以写 active
+    expect(store.setScheduledTaskActiveIfDurable(task.id, "durable-cas-1")).toBe(true);
+
+    // blocked 后 active CAS 不得覆盖
+    expect(store.markScheduledTaskBlockedIfDurable(task.id, "durable-cas-1")).toBe(true);
+    expect(store.setScheduledTaskActiveIfDurable(task.id, "durable-cas-1")).toBe(false);
+    expect(store.getScheduledTaskRaw(task.id)?.durableState).toBe("blocked");
+
+    // poisoned 后 blocked CAS 不得覆盖
+    store.setScheduledTaskDurable(task.id, "durable-cas-1", "poisoned");
+    expect(store.markScheduledTaskBlockedIfDurable(task.id, "durable-cas-1")).toBe(false);
+    expect(store.getScheduledTaskRaw(task.id)?.durableState).toBe("poisoned");
+
+    // 旧 durable id 不得改写
+    expect(store.markScheduledTaskBlockedIfDurable(task.id, "stale-id")).toBe(false);
+  });
+});
+
 describe("phase6: run ledger / lease / outbox", () => {
   test("reserve 幂等：同一 (taskId, runKey) 只生成一条 ledger、runCount 只加一次", () => {
     const now = Date.now();

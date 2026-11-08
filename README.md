@@ -72,7 +72,9 @@ bun run typecheck
 bun run build:web
 ```
 
-> 开发者提示：若本机存在 `../pi` monorepo（pi 框架源码），`tsconfig.json` 的 `paths` 会自动优先使用其最新源码（便于跟进未发布改动）；否则回退到 npm 已发布版本，两种模式均可正常构建运行。
+> 开发者提示：框架依赖锁定 npm 精确版本（`pi-durable` / `pi-ai` / `chord` / `pi-telemetry` 1.5.0）；本机 `../pi` 仓库仅作源码阅读参考，不参与构建（Bun 运行时恒解析 `node_modules` 的 dist）。
+>
+> 升级提示：从 1.4.x 升到 1.5.0 前请备份 `.bot/conversations.sqlite`。1.5.0 写过的会话文档不能被 1.4.x 读取，回滚时需要恢复备份。
 
 ---
 
@@ -92,6 +94,10 @@ Options:
   --no-terminal  后台服务模式，不启动终端交互 REPL
   --daemon       同 --no-terminal
 ```
+
+> `--port/--host` 只对本次启动生效（不写数据库）。运行中的 gateway 会在
+> `.bot/gateway.sock` 的 status 应答里公布实际端点，`bot tui` / `bot admin` /
+> `bot status` 会自动使用它。
 
 ---
 

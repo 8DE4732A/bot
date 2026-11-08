@@ -2,7 +2,7 @@ import { createServer, connect, type Server, type Socket } from "node:net";
 import { chmodSync, unlinkSync } from "node:fs";
 import { AgentManager } from "../core/agent-manager.ts";
 import { SchedulerManager } from "../scheduler/index.ts";
-import { DatabaseStore } from "../config/database-store.ts";
+import type { WebEndpoint } from "../config/web-endpoint.ts";
 import { BOT_VERSION } from "../version.ts";
 import { logger } from "../utils/logger.ts";
 
@@ -26,6 +26,8 @@ export interface GatewayStatusPayload {
   activeTurns: number;
   scheduler: { started: boolean; inFlight: number };
   channels: { id: string; type: string; name: string }[];
+  /** 实际监听地址（--port/--host 覆盖时与 system_config 不同） */
+  webHost: string;
   webPort: string;
 }
 
@@ -212,6 +214,8 @@ export function makeControlHandlers(opts: {
   isDraining: () => boolean;
   onDrain: (mode: "restart" | "stop", notifyDone: () => void, notifyError: (err: string) => void) => Promise<void>;
   listChannels: () => { id: string; type: string; name: string }[];
+  /** 取实际监听端点（listen 成功后端口才最终确定，必须用函数而非快照） */
+  webEndpoint: () => WebEndpoint;
 }): ControlHandlers {
   return {
     identify: () => ({
@@ -223,8 +227,8 @@ export function makeControlHandlers(opts: {
     status: async () => {
       const manager = AgentManager.getInstance();
       const scheduler = SchedulerManager.getInstance();
-      const store = new DatabaseStore();
       const schedulerStatus = await scheduler.status();
+      const endpoint = opts.webEndpoint();
       return {
         version: GATEWAY_VERSION,
         cwd: opts.cwd,
@@ -242,7 +246,8 @@ export function makeControlHandlers(opts: {
           tasksBlocked: schedulerStatus.tasksBlocked,
         },
         channels: opts.listChannels(),
-        webPort: store.getConfig("web_port", "3000"),
+        webHost: endpoint.host,
+        webPort: String(endpoint.port),
       };
     },
     drain: (mode, notifyDone, notifyError) => {

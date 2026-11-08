@@ -357,6 +357,9 @@ export class AdminWebServer {
       });
       this.server.listen(this.port, this.host, () => {
         this.server.removeListener("error", reject);
+        // --port 0 = 内核分配临时端口：以实际绑定端口为准（日志/控制 socket/TUI 共用）
+        const address = this.server.address();
+        if (address && typeof address === "object") this.port = address.port;
         logger.info("WebServer", `Web Admin Dashboard running at http://${this.host}:${this.port}`);
         // 历史脏数据: 启动时发现重叠 workspaceDir 并留痕（新保存已被 validate 拒绝）
         for (const [agentId, reason] of detectWorkspaceConflicts(this.store.listAgents())) {
@@ -1798,39 +1801,28 @@ export class AdminWebServer {
         return;
       }
 
-      // 10c. Durable Tasks API (1.4.0: sleeping/blocked 诊断 + parked 任务重试)
+      // 10c. Durable Tasks API (1.5.0: 只展示 live 任务；状态含 pending)
       if (pathname === "/api/durable-tasks" && method === "GET") {
         this.sendJson(res, { tasks: await AgentManager.getInstance().listDurableTasks() });
         return;
       }
-      if (pathname === "/api/durable-tasks/retry" && method === "POST") {
+      // 10d. 1.5.0: restart-limited 任务已 terminal，恢复 = 用户显式重建 durable task
+      //（官方语义是“重新 submit”，不是已删除的 Harness.retryTask）。
+      const recreateDurable = pathname.match(/^\/api\/scheduled-tasks\/([^/]+)\/recreate-durable$/);
+      if (recreateDurable && method === "POST") {
         if (isDraining()) {
-          this.sendError(res, 503, "gateway 正在重启 (draining), 暂不接受任务重试");
+          this.sendError(res, 503, "gateway 正在重启 (draining), 暂不接受任务重建");
           return;
         }
-        const body = await this.readJsonBody(req);
-        const taskId = typeof body.taskId === "string" ? body.taskId : "";
-        if (!taskId) {
-          this.sendError(res, 400, "taskId is required");
-          return;
-        }
-        const live = await AgentManager.getInstance().listDurableTasks();
-        const target = live.find((t) => t.id === taskId);
-        if (!target) {
-          this.sendError(res, 404, `durable task '${taskId}' not found`);
-          return;
-        }
-        if (target.state.kind !== "blocked" || target.state.reason !== "restart_limit") {
-          this.sendError(res, 409, `durable task '${taskId}' is not restart-limit blocked`);
-          return;
-        }
+        const taskId = decodeURIComponent(recreateDurable[1]);
         try {
-          const retried = await AgentManager.getInstance().retryDurableTask(taskId);
-          if (!retried) {
-            this.sendError(res, 404, `durable task '${taskId}' not found`);
+          const result = await SchedulerRuntime.getInstance().recreateDurableTask(taskId);
+          if (!result.ok) {
+            const status = result.reason === "not_found" ? 404 : 409;
+            this.sendError(res, status, `cannot recreate durable task '${taskId}': ${result.reason}`);
             return;
           }
-          this.store.recordAudit("durable.task_retried", { taskId });
+          this.store.recordAudit("scheduler.durable_recreated", { taskId });
           this.sendJson(res, { success: true });
         } catch (err) {
           this.sendError(res, 500, (err as Error).message);

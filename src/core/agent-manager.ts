@@ -2,18 +2,22 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { estimateContextTokens } from "@earendil-works/pi-ai/utils/estimate";
 import {
   AssistantEntry,
+  CompactionEntry,
   createRegistry,
   Harness,
-  watchEvents,
+  LiveDoc,
 } from "@earendil-works/pi-durable";
 import type {
-  AgentEventStream,
   Conversation,
   ConversationId,
+  ConversationView,
   Extension,
   Harness as HarnessType,
   HarnessSettings,
-  ReportInfo,
+  Observation,
+  Report,
+  WatchCall,
+  RunFailure,
   TaskId,
   TaskInspection,
   UserInput,
@@ -57,8 +61,16 @@ import {
   type CompactionOutcome,
 } from "./context-compaction.ts";
 import { diffUsageState, emptyUsageDiff, snapshotUsage } from "./context-usage.ts";
+import {
+  createTurnViewState,
+  reduceTurnView,
+  seedTurnView,
+  type TurnViewChanges,
+} from "./live-view.ts";
+import { textOfContent } from "./message-content.ts";
 import { BOT_VERSION } from "../version.ts";
 import { SchedulerSystemExtension } from "../scheduler/system-extension.ts";
+import { SCHEDULED_PROMPT_TASK } from "../scheduler/durable-task.ts";
 
 import type { MutableModels } from "@earendil-works/pi-ai/models";
 
@@ -195,7 +207,16 @@ function estimateIncomingInput(content: string | UserInput): number {
   return estimateIncomingTokens(text) + images * 1_600;
 }
 
-const configFingerprint = (a: AgentDefinition) =>
+/** system_config.agent_max_turns 解析：0/非法 = 关闭（官方默认不限制）。 */
+export function parseConfiguredMaxTurns(value: string | undefined): number | undefined {
+  const text = (value ?? "0").trim();
+  // 严格十进制整数：parseInt("12abc")/Number("1e3") 都会放过手误配置
+  if (!/^\d+$/.test(text)) return undefined;
+  const raw = Number(text);
+  return Number.isSafeInteger(raw) && raw >= 1 ? Math.min(raw, 1_000) : undefined;
+}
+
+const configFingerprint = (a: AgentDefinition, maxTurns?: number) =>
   [
     a.model.provider,
     a.model.modelId,
@@ -203,6 +224,7 @@ const configFingerprint = (a: AgentDefinition) =>
     a.instructions,
     a.workspaceDir,
     [...a.skills].sort().join(","),
+    maxTurns ?? 0,
   ].join("|");
 
 /** durable 任务是否应阻塞队列投递/drain；sleeping/blocked 可跨进程存活，不阻塞。 */
@@ -225,7 +247,7 @@ export function countsTowardGlobalDurableBusy(
 }
 
 export interface DurableTaskStateInfo {
-  kind: "running" | "ready" | "waiting" | "sleeping" | "completing" | "blocked";
+  kind: "running" | "pending" | "waiting" | "sleeping" | "completing" | "blocked";
   migrates?: boolean;
   on?: string[];
   until?: number;
@@ -247,8 +269,8 @@ export function describeDurableState(state: TaskInspection["state"]): DurableTas
   switch (state.kind) {
     case "running":
       return { kind: "running" };
-    case "ready":
-      return { kind: "ready", migrates: state.migrates };
+    case "pending":
+      return { kind: "pending", migrates: state.migrates };
     case "waiting":
       return { kind: "waiting", on: state.on.map(String) };
     case "sleeping":
@@ -258,6 +280,74 @@ export function describeDurableState(state: TaskInspection["state"]): DurableTas
     case "blocked":
       return { kind: "blocked", reason: state.reason };
   }
+}
+
+/** 1.5.0 restart-limit report 是否属于某个 bot.scheduled-prompt durable 任务。 */
+export function restartLimitReportTaskId(report: Report): string | undefined {
+  if (!("task" in report) || !report.task) return undefined;
+  if (report.task.kind !== SCHEDULED_PROMPT_TASK) return undefined;
+  if (report.kind !== "task_faulted" && report.kind !== "task_interrupted") return undefined;
+  if (report.reason !== "restart_limit") return undefined;
+  return String(report.task.id);
+}
+
+export interface RestartLimitBusinessStore {
+  getScheduledTaskByDurableTaskId(
+    durableTaskId: string,
+  ): { id: string; agentId?: string } | undefined;
+  markScheduledTaskBlockedIfDurable(id: string, durableTaskId: string): boolean;
+  recordAudit(event: string, detail: Record<string, unknown>): void;
+}
+
+/**
+ * 1.5.0: reconcile 在 resume 之前运行，会把即将 restart-limit 的任务先写成 active；
+ * resume 后的首次 reservation 才把它 fault 成 terminal。onReport 到达时按
+ * durable id 回写业务 blocked，UI 才会出现“重建任务”，且 reconcile 不会复活它。
+ */
+export function markRestartLimitedBusinessTask(
+  store: RestartLimitBusinessStore,
+  report: Report,
+): string | undefined {
+  const durableTaskId = restartLimitReportTaskId(report);
+  if (!durableTaskId) return undefined;
+  const business = store.getScheduledTaskByDurableTaskId(durableTaskId);
+  if (!business) return undefined;
+  // 条件更新：用户已禁用/poison 或并发重建换了 durable id 时不能覆盖
+  if (!store.markScheduledTaskBlockedIfDurable(business.id, durableTaskId)) return undefined;
+  store.recordAudit("scheduler.durable_blocked", {
+    taskId: business.id,
+    durableTaskId,
+    reason: "restart_limit",
+  });
+  if (business.agentId) {
+    EventBus.getInstance().publish({
+      type: "task.updated",
+      taskId: business.id,
+      agentId: business.agentId,
+    });
+  }
+  return business.id;
+}
+
+/**
+ * 1.5.0 不再 park crash-loop 任务：达到 restartLimit 的自定义任务以
+ * terminal(faulted) 结束，detail 为 `{ reason: "restart_limit" }`。
+ * 调度器据此把业务行标记为 blocked，避免 reconcile 自动复活形成死循环。
+ */
+export function isRestartLimitedRecord(
+  record: { readonly state: { readonly status: string; readonly outcome?: unknown } } | undefined,
+): boolean {
+  if (!record || record.state.status !== "terminal") return false;
+  const outcome = record.state.outcome as
+    | { readonly status?: string; readonly error?: { readonly detail?: unknown } }
+    | undefined;
+  if (outcome?.status !== "faulted" && outcome?.status !== "failed") return false;
+  const detail = outcome.error?.detail;
+  return Boolean(
+    detail &&
+      typeof detail === "object" &&
+      (detail as { reason?: unknown }).reason === "restart_limit",
+  );
 }
 
 export class AgentManager {
@@ -469,8 +559,8 @@ export class AgentManager {
           settings: () => this.buildHarnessSettings(),
           // 七期: 内容无关的 span 遥测（request/tool 明细，供上下文观测页）
           telemetry: getContextTelemetry(),
-          // 1.4.0 ReportInfo: Session/任务/扩展/host/listener 失败统一归因
-          onReport: (err, info) => this.handleReport(err, info),
+          // 1.5.0 Report: Session/任务/扩展/host/listener 失败统一归因
+          onReport: (report) => this.handleReport(report),
           registry: this.registry,
           env: (target) => {
             const convId = String(target.conversationId);
@@ -547,14 +637,14 @@ export class AgentManager {
     return this.contextPolicy;
   }
 
-  /** 1.4.0 ReportInfo：Session/任务/扩展/host/listener 失败统一记录审计。 */
-  private handleReport(error: unknown, info: ReportInfo): void {
-    const conversationId =
-      "task" in info && info.task
-        ? String(info.task.conversationId)
-        : "conversationId" in info && info.conversationId
-          ? String(info.conversationId)
-          : undefined;
+  /** 1.5.0 Report：Session/任务/扩展/host/listener 失败统一记录审计。 */
+  private handleReport(report: Report): void {
+    const task = "task" in report ? report.task : undefined;
+    const conversationId = task
+      ? String(task.conversationId)
+      : report.kind === "extension_error" && report.conversationId
+        ? String(report.conversationId)
+        : undefined;
     let agentId: string | undefined;
     if (conversationId) {
       try {
@@ -563,27 +653,44 @@ export class AgentManager {
         /* 归属不明时只记全局审计 */
       }
     }
-    const detail: Record<string, unknown> = { type: info.type };
-    if ("extension" in info && info.extension) detail.extension = info.extension;
-    if ("task" in info && info.task) {
-      detail.taskId = String(info.task.id);
-      detail.taskKind = info.task.kind;
+    const detail: Record<string, unknown> = { kind: report.kind };
+    if ("extension" in report && report.extension) detail.extension = report.extension;
+    if (task) {
+      detail.taskId = String(task.id);
+      detail.taskKind = task.kind;
     }
-    if (info.type === "task_faulted") detail.reason = info.reason;
-    if (info.type === "host_error") detail.callback = info.callback;
+    if (
+      report.kind === "task_faulted" ||
+      report.kind === "task_interrupted" ||
+      report.kind === "task_outdated"
+    ) {
+      detail.reason = report.reason;
+    }
+    if (report.kind === "task_interrupted") detail.restarts = report.restarts;
+    if (report.kind === "host_error") detail.callback = report.callback;
     try {
       this.store.recordAudit("agent.report", detail, agentId);
     } catch (auditErr) {
       logger.warn("AgentManager", `Failed to record durable report: ${auditErr}`);
     }
-    const message = error instanceof Error ? error.message : String(error);
+
+    // 1.5.0: restart-limit 的自定义任务在 resume() 的首次 reservation 才 fault，
+    // 此时 SchedulerRuntime.reconcile 已经跑过并把业务行写成 active。这里按
+    // durable task id 补写 blocked，否则 UI 不显示“重建任务”，任务也不再调度。
+    try {
+      markRestartLimitedBusinessTask(this.store, report);
+    } catch (markErr) {
+      logger.warn("AgentManager", `Failed to mark restart-limited task blocked: ${markErr}`);
+    }
+
+    const message = report.error instanceof Error ? report.error.message : String(report.error);
     const severe =
-      info.type === "session_failed" ||
-      info.type === "task_faulted" ||
-      info.type === "task_parked" ||
-      info.type === "migration_failed";
-    if (severe) logger.error("AgentManager", `durable report ${info.type}: ${message}`);
-    else logger.warn("AgentManager", `durable report ${info.type}: ${message}`);
+      report.kind === "storage_failed" ||
+      report.kind === "task_faulted" ||
+      report.kind === "task_interrupted" ||
+      report.kind === "migration_failed";
+    if (severe) logger.error("AgentManager", `durable report ${report.kind}: ${message}`);
+    else logger.warn("AgentManager", `durable report ${report.kind}: ${message}`);
   }
 
   /**
@@ -593,7 +700,7 @@ export class AgentManager {
   private watchSessionFailure(harness: HarnessType): void {
     void harness.closed.then((end) => {
       // 旧 harness 的 closed 可能在重建后才 settle；不能让它标记新会话失败
-      if (this.harness === harness && end.reason === "failed") {
+      if (this.harness === harness && end.kind === "failed") {
         this.handleSessionFailure(end.error);
       }
     });
@@ -695,6 +802,18 @@ export class AgentManager {
     }
   }
 
+  /**
+   * 官方 AgentState.maxTurns（1.5.0）：限制一次 run 的工具轮数。
+   * system_config.agent_max_turns=0（默认）表示不启用，保持旧行为。
+   */
+  private configuredMaxTurns(): number | undefined {
+    try {
+      return parseConfiguredMaxTurns(this.store.getConfig("agent_max_turns", "0"));
+    } catch {
+      return undefined;
+    }
+  }
+
   public async getOrCreateConversation(
     agentId: string,
     sessionId: string,
@@ -711,6 +830,7 @@ export class AgentManager {
 
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`Agent not found: ${agentId}`);
+    const maxTurns = this.configuredMaxTurns();
 
     // 历史重叠 workspaceDir 无法在 platformDenyRead 中互相隔离：fail-closed
     const workspaceConflict = this.getWorkspaceConflicts().get(agentId);
@@ -749,10 +869,16 @@ export class AgentManager {
           cached = { conv: existing, configFp: "" };
         } else {
           logger.warn("AgentManager", `Conversation ${sessionRecord.conversationId} no longer exists; recreating session ${cacheKey}`);
-          cached = { conv: await this.createNewConversation(agent, agentSkills), configFp: configFingerprint(agent) };
+          cached = {
+            conv: await this.createNewConversation(agent, agentSkills, maxTurns),
+            configFp: configFingerprint(agent, maxTurns),
+          };
         }
       } else {
-        cached = { conv: await this.createNewConversation(agent, agentSkills), configFp: configFingerprint(agent) };
+        cached = {
+          conv: await this.createNewConversation(agent, agentSkills, maxTurns),
+          configFp: configFingerprint(agent, maxTurns),
+        };
       }
 
       this.cacheConversation(cacheKey, cached.conv, cached.configFp);
@@ -770,7 +896,7 @@ export class AgentManager {
 
     // Sync agent settings only when they actually changed (configure 是一次事务提交);
     // extensions 也同步: 会话创建时冻结的技能集无法反映管理页的勾选变更
-    const fp = configFingerprint(agent);
+    const fp = configFingerprint(agent, maxTurns);
     if (cached.configFp !== fp) {
       try {
         await cached.conv.configure(
@@ -783,6 +909,8 @@ export class AgentManager {
             instructions: agent.instructions,
             cwd: agent.workspaceDir,
             extensions: agentSkills,
+            // AgentChange 允许 null 清除；配置关掉时必须显式传 null，不能省略（省略=保持不变）
+            maxTurns: maxTurns ?? null,
           },
           BACKGROUND_CONTEXT,
         );
@@ -798,6 +926,7 @@ export class AgentManager {
   private async createNewConversation(
     agent: AgentDefinition,
     extensions: any[],
+    maxTurns?: number,
   ): Promise<Conversation> {
     const conv = await this.harness!.createConversation(
       {
@@ -811,6 +940,7 @@ export class AgentManager {
           instructions: agent.instructions,
           cwd: agent.workspaceDir,
           extensions,
+          ...(maxTurns ? { maxTurns } : {}),
         },
       },
       BACKGROUND_CONTEXT,
@@ -879,6 +1009,7 @@ export class AgentManager {
 
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`Agent not found: ${agentId}`);
+    const maxTurns = this.configuredMaxTurns();
     const agentSkills = this.extensionsFor(agent);
     const cacheKey = sessionKey(agentId, `scheduler:${taskId}`);
 
@@ -902,12 +1033,12 @@ export class AgentManager {
         this.store.bindSchedulerConversation(taskId, effective, agentId);
       }
     } else {
-      conv = await this.createNewConversation(agent, agentSkills);
+      conv = await this.createNewConversation(agent, agentSkills, maxTurns);
       this.store.bindSchedulerConversation(taskId, String(conv.id), agentId);
     }
 
     const cached = this.conversations.get(cacheKey);
-    const fp = configFingerprint(agent);
+    const fp = configFingerprint(agent, maxTurns);
     if (!cached || cached.conv.id !== conv.id) {
       this.cacheConversation(cacheKey, conv, fp);
     }
@@ -922,6 +1053,7 @@ export class AgentManager {
           instructions: agent.instructions,
           cwd: agent.workspaceDir,
           extensions: agentSkills,
+          maxTurns: maxTurns ?? null,
         },
         BACKGROUND_CONTEXT,
       );
@@ -941,11 +1073,12 @@ export class AgentManager {
     if (!harness) throw new Error("AgentManager is not initialized");
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`Agent not found: ${agentId}`);
-    const conv = await this.createNewConversation(agent, this.extensionsFor(agent));
+    const maxTurns = this.configuredMaxTurns();
+    const conv = await this.createNewConversation(agent, this.extensionsFor(agent), maxTurns);
     this.cacheConversation(
       sessionKey(agentId, `scheduler:${taskId}`),
       conv,
-      configFingerprint(agent),
+      configFingerprint(agent, maxTurns),
     );
     return conv;
   }
@@ -1307,12 +1440,22 @@ export class AgentManager {
     });
   }
 
-  /** 重跑被 crash-loop guard park 的任务（1.4.0 Harness.retryTask）。 */
-  public async retryDurableTask(id: string): Promise<boolean> {
-    const task = await this.inspectDurableTask(id);
-    if (!task) return false;
-    await this.harness!.retryTask(task.record.id, BACKGROUND_CONTEXT);
-    return true;
+  /**
+   * 1.5.0: inspect() 只返回 live 任务；崩溃达到 restartLimit 的任务已显式终结，
+   * 需要 getTask 读取终态来区分「已结束」与「从未创建」。
+   */
+  public async getDurableTaskRecord(id: string) {
+    if (!this.harness) return undefined;
+    return this.harness.getTask(Number(id) as TaskId, BACKGROUND_CONTEXT);
+  }
+
+  /** 读取官方 runFailure；异常时返回 undefined，绝不覆盖原始错误。 */
+  private async readRunFailure(conv: Conversation): Promise<RunFailure | undefined> {
+    try {
+      return (await this.harness?.snapshot(LiveDoc, conv.id, BACKGROUND_CONTEXT))?.runFailure;
+    } catch {
+      return undefined;
+    }
   }
 
   /** 订阅全进程 turn 事件 (SessionHub); 返回退订函数 */
@@ -1487,9 +1630,11 @@ export class AgentManager {
       });
     }
 
-    // Attach the framework's typed event stream (watchEvents): 流式输出 + 七期指标
-    // (首字、压缩事件、durationMs 兜底)。metrics 常驻，即使无人观看也挂 watch。
-    let watch: AgentEventStream | undefined;
+    // Attach the framework's synchronous conversation observer (1.5.0): 流式输出 +
+    // 七期指标（首字、压缩事件、durationMs 兜底）。observer 在 commit 采纳时同步调用，
+    // 不经过 watch 的 pending 队列，turn 结束时不存在“最后一帧还没投递”的窗口。
+    let observation: Observation<ConversationView> | undefined;
+    const viewState = createTurnViewState();
     let lastRenderedText = "";
     // 本轮消耗 = 轮内各 assistant 消息 usage 相加; 当前上下文 = 最后一条
     // assistant 消息的 prompt 侧 (工具调用轮的累计差值会把多条消息 prompt
@@ -1497,108 +1642,52 @@ export class AgentManager {
     const turnAgg = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, reasoning: 0, cost: 0 };
     let lastMsgUsage: { input: number; cacheRead: number; cacheWrite: number } | undefined;
     let firstTokenAt: number | undefined;
-    let compactionActive = 0;
     let fallbackLlmMs = 0;
     let fallbackToolMs = 0;
     const compactionSnapshots = new Map<
       string,
-      { startedAt: number; usageBefore: Awaited<ReturnType<typeof snapshotUsage>>; reason: string }
+      { startedAt: number; usageBefore: Awaited<ReturnType<typeof snapshotUsage>> }
     >();
-    let watchInFlight = 0;
-    const waitWatchDrain = async (timeoutMs = 1_000): Promise<void> => {
-      const deadline = Date.now() + timeoutMs;
-      while (watchInFlight > 0 && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-    };
-
-    try {
-      watch = await watchEvents(this.harness!, conv.id, context);
-      let lastToolEvent = "";
-      watch.start(async (events) => {
-        watchInFlight++;
-        try {
-        for (const e of events) {
-          if (e.type === "message_end") {
-            // 压缩摘要的消息不计入用户可见的 turn usage（UsageDoc 差分仍包含其成本）
-            if (compactionActive > 0) continue;
-            // EntryRecord.model = 该条目贡献给模型上下文的消息数组;
-            // assistant 消息的 usage 是本次请求的计量 (input=未命中, cacheRead=命中);
-            // toolResult 消息可能带独立 usage (工具内部模型调用), 一并计入本轮消耗
-            const msgs = (e.entry as any)?.model as any[] | undefined;
-            for (const m of msgs ?? []) {
-              const usage = m?.usage;
-              if (!usage) continue;
-              turnAgg.input += usage.input ?? 0;
-              turnAgg.output += usage.output ?? 0;
-              turnAgg.cacheRead += usage.cacheRead ?? 0;
-              turnAgg.cacheWrite += usage.cacheWrite ?? 0;
-              turnAgg.totalTokens += usage.totalTokens ?? 0;
-              turnAgg.cost += usage.cost?.total ?? 0;
-              if (typeof usage.reasoning === "number") turnAgg.reasoning += usage.reasoning;
-              if (typeof m.durationMs === "number" && m.role === "assistant") fallbackLlmMs += m.durationMs;
-              if (typeof m.durationMs === "number" && m.role === "toolResult") fallbackToolMs += m.durationMs;
-              // 当前上下文取最后一条 assistant 消息的 prompt 侧 (含全部历史)
-              if (m.role === "assistant") {
-                lastMsgUsage = {
-                  input: usage.input ?? 0,
-                  cacheRead: usage.cacheRead ?? 0,
-                  cacheWrite: usage.cacheWrite ?? 0,
-                };
-              }
-            }
-          } else if (e.type === "message_update") {
-            for (const change of e.changes) {
-              if (
-                change.type === "text_start" ||
-                change.type === "text_delta" ||
-                change.type === "thinking_start" ||
-                change.type === "thinking_delta" ||
-                change.type === "toolcall_start" ||
-                change.type === "toolcall_delta"
-              ) {
-                if (firstTokenAt === undefined && compactionActive === 0) firstTokenAt = Date.now();
-              }
-              if (change.type === "text_delta") {
-                if (compactionActive > 0) continue;
-                lastRenderedText += change.delta;
-                sink?.({ delta: change.delta });
-              }
-            }
-          } else if (e.type === "tool_execution_start" || e.type === "tool_execution_update") {
-            if (lastToolEvent !== `${e.toolName}:running`) {
-              lastToolEvent = `${e.toolName}:running`;
-              sink?.({ toolCall: { name: e.toolName, status: "running" } });
-            }
-          } else if (e.type === "tool_execution_end") {
-            if (lastToolEvent !== `${e.toolName}:done`) {
-              lastToolEvent = `${e.toolName}:done`;
-              sink?.({ toolCall: { name: e.toolName, status: "done" } });
-            }
-          } else if (e.type === "compaction_start") {
-            compactionActive++;
+    // 压缩快照要读 Session（snapshotUsage），不能放进同步 observer；串行异步处理。
+    let compactionWork: Promise<void> = Promise.resolve();
+    const serialize = (
+      current: Promise<void>,
+      label: string,
+      work: () => void | Promise<void>,
+    ): Promise<void> =>
+      current.then(work).catch((err) => {
+        logger.warn("AgentManager", `${label}: ${err}`);
+      });
+    const enqueueCompactions = (changes: TurnViewChanges): void => {
+      if (changes.compactionStarts.length === 0 && changes.compactionEnds.length === 0) return;
+      const starts = changes.compactionStarts;
+      const ends = changes.compactionEnds;
+      compactionWork = serialize(
+        compactionWork,
+        "Conversation view compaction processing failed",
+        async () => {
+          for (const start of starts) {
             const snapUsage = await snapshotUsage(this.harness!, conv.id);
-            compactionSnapshots.set(String(e.taskId), {
-              startedAt: Date.now(),
+            compactionSnapshots.set(start.taskId, {
+              startedAt: start.at,
               usageBefore: snapUsage,
-              reason: e.reason,
             });
-          } else if (e.type === "compaction_end") {
-            compactionActive = Math.max(0, compactionActive - 1);
-            const key = String(e.taskId);
-            const snap = compactionSnapshots.get(key);
-            compactionSnapshots.delete(key);
+          }
+
+          for (const end of ends) {
+            const taskId = end.taskId;
+            const snap = compactionSnapshots.get(taskId);
+            compactionSnapshots.delete(taskId);
             const snapAfter = await snapshotUsage(this.harness!, conv.id);
             const diff = snap?.usageBefore && snapAfter
               ? diffUsageState(snap.usageBefore, snapAfter)
               : emptyUsageDiff();
-            const endedAt = Date.now();
+            const endedAt = end.at;
             const startedAt = snap?.startedAt ?? endedAt;
             try {
-              const taskId = e.taskId !== undefined ? String(e.taskId) : undefined;
-              const already = taskId
-                ? this.store.listCompactionEvents({ turnId, limit: 200 }).find((x) => x.taskId === taskId)
-                : undefined;
+              const already = this.store
+                .listCompactionEvents({ turnId, limit: 200 })
+                .find((x) => x.taskId === taskId);
               if (already?.id) {
                 this.store.updateCompactionEventMetrics(already.id, {
                   requestCount: already.requestCount,
@@ -1606,23 +1695,28 @@ export class AgentManager {
                 });
                 continue;
               }
-              const eventId = this.store.insertCompactionEvent({
+              this.store.insertCompactionEvent({
                 conversationId: String(conv.id),
                 agentId,
                 sessionId,
                 turnId,
                 taskId,
                 profile: sessionKind === "scheduled" ? "scheduled" : "normal",
-                trigger: e.reason === "overflow" ? "overflow" : e.reason === "manual" ? "manual" : "threshold",
+                trigger:
+                  end.trigger === "overflow"
+                    ? "overflow"
+                    : end.trigger === "manual"
+                      ? "manual"
+                      : "threshold",
                 startedAt,
                 endedAt,
                 durationMs: Math.max(0, endedAt - startedAt),
                 costUsd: diff.totals.costUsd,
                 costInTurn: true,
                 requestCount: Object.keys(diff.models).length,
-                status: e.error ? "failed" : "done",
+                status: end.error ? "failed" : "done",
                 failOpen: false,
-                error: e.error?.slice(0, 500),
+                error: end.error?.slice(0, 500),
               });
             } catch (err) {
               logger.warn("AgentManager", `Failed to record in-turn compaction: ${err}`);
@@ -1632,20 +1726,118 @@ export class AgentManager {
               agentId,
               sessionId,
               conversationId: String(conv.id),
-              trigger: e.reason,
-              status: e.error ? "failed" : "done",
+              trigger: end.trigger,
+              status: end.error ? "failed" : "done",
               durationMs: Math.max(0, endedAt - startedAt),
               costUsd: diff.totals.costUsd,
             });
           }
+        },
+      );
+    };
+    // observer 只做同步归约；usage/sink/压缩快照进入串行异步队列，避免阻塞 Session 线。
+    let changeWork: Promise<void> = Promise.resolve();
+    // 所有调用点都在 observation.detach() 之后：不会再入队新 work。
+    // 但 changeWork 执行时会 enqueueCompactions 替换 compactionWork，所以必须
+    // 先等 changeWork，再等它产生的最新 compactionWork（不能同时捕获两者）。
+    const waitObserverDrain = async (timeoutMs = 5_000): Promise<void> => {
+      const deadline = Date.now() + timeoutMs;
+      await raceTimeout(changeWork, Math.max(0, deadline - Date.now()), undefined);
+      await raceTimeout(compactionWork, Math.max(0, deadline - Date.now()), undefined);
+    };
+    const applyChanges = (changes: TurnViewChanges): void => {
+      for (const entry of changes.entries) {
+        // 压缩摘要的消息不计入用户可见的 turn usage（UsageDoc 差分仍包含其成本）
+        if (CompactionEntry.is(entry)) continue;
+        // EntryRecord.model = 该条目贡献给模型上下文的消息数组;
+        // assistant 消息的 usage 是本次请求的计量 (input=未命中, cacheRead=命中);
+        // toolResult 消息可能带独立 usage (工具内部模型调用), 一并计入本轮消耗
+        for (const m of entry.model ?? []) {
+          const usage = (m as { usage?: Record<string, any> }).usage;
+          if (!usage) continue;
+          turnAgg.input += usage.input ?? 0;
+          turnAgg.output += usage.output ?? 0;
+          turnAgg.cacheRead += usage.cacheRead ?? 0;
+          turnAgg.cacheWrite += usage.cacheWrite ?? 0;
+          turnAgg.totalTokens += usage.totalTokens ?? 0;
+          turnAgg.cost += usage.cost?.total ?? 0;
+          if (typeof usage.reasoning === "number") turnAgg.reasoning += usage.reasoning;
+          const durationMs = (m as { durationMs?: unknown }).durationMs;
+          if (typeof durationMs === "number" && m.role === "assistant") fallbackLlmMs += durationMs;
+          if (typeof durationMs === "number" && m.role === "toolResult") fallbackToolMs += durationMs;
+          // 当前上下文取最后一条 assistant 消息的 prompt 侧 (含全部历史)
+          if (m.role === "assistant") {
+            lastMsgUsage = {
+              input: usage.input ?? 0,
+              cacheRead: usage.cacheRead ?? 0,
+              cacheWrite: usage.cacheWrite ?? 0,
+            };
+          }
         }
-        } finally {
-          watchInFlight--;
-        }
+      }
+
+      // 近似 TTFT：observer 在 partial commit 采纳时看到首个 token（不是 HTTP 首字节；
+      // 受 progress.partialIntervalMs 影响，口径与 1.4 的流事件计时略有差异）。
+      if (changes.firstTokenSeen && firstTokenAt === undefined) firstTokenAt = Date.now();
+      if (changes.textDelta) {
+        lastRenderedText += changes.textDelta;
+        sink?.({ delta: changes.textDelta });
+      }
+      for (const tool of changes.toolUpdates) sink?.({ toolCall: tool });
+      enqueueCompactions(changes);
+    };
+    const enqueueChanges = (changes: TurnViewChanges): void => {
+      changeWork = serialize(changeWork, "Conversation view processing failed", () => {
+        applyChanges(changes);
       });
+    };
+
+    // observeConversation() 先注册 observer 再 resolve；注册到 resolve 之间到达的
+    // advance 必须缓存，不能在 seed 之前归约——否则会把历史窗口当成新 entries 并
+    // 污染 turn usage。observation.value 是注册前捕获的初始快照，缓存的 value 都
+    // 比它新；resolve 后先 seed，再按序 replay。
+    let observerSeeded = false;
+    const pendingObserverCalls: WatchCall<ConversationView>[] = [];
+    const processObserverCall = (call: WatchCall<ConversationView>): void => {
+      if (call.kind === "failed") {
+        logger.warn("AgentManager", `Conversation view observer failed: ${call.error}`);
+        return;
+      }
+      try {
+        enqueueChanges(reduceTurnView(viewState, call.value, Date.now()));
+      } catch (err) {
+        // 指标/UI 异常绝不能打断 Session 线；旧实现同样 fail-open
+        logger.warn("AgentManager", `Conversation view processing failed: ${err}`);
+      }
+    };
+
+    try {
+      observation = await this.harness!.observeConversation(
+        conv.id,
+        {
+          advance(call) {
+            if (!observerSeeded) {
+              pendingObserverCalls.push(call);
+              return;
+            }
+            processObserverCall(call);
+          },
+          end(end) {
+            if (end.kind === "failed" || end.kind === "listener_error") {
+              logger.warn("AgentManager", `Conversation view observer ended: ${end.kind}`);
+            }
+          },
+        },
+        context,
+        { min: 50, max: 200 },
+      );
+      seedTurnView(viewState, observation.value);
+      observerSeeded = true;
+      for (const call of pendingObserverCalls.splice(0)) processObserverCall(call);
     } catch (e) {
-      logger.warn("AgentManager", `Failed to attach streaming watch: ${e}`);
-      watch = undefined;
+      logger.warn("AgentManager", `Failed to attach conversation view observer: ${e}`);
+      observation = undefined;
+      pendingObserverCalls.length = 0;
     }
 
     const modelCost = agentForModel
@@ -1711,6 +1903,12 @@ export class AgentManager {
 
       const settled = await submission.wait(context);
 
+      // turn 已结算：先 detach 防止迟到 commit 继续入队，再把 changeWork/
+      // compactionWork 全部 drain 完，最后才做最终文本对账与 usage 固化。
+      observation?.detach();
+      observation = undefined;
+      await waitObserverDrain();
+
       if (settled.status === "done" && settled.type === "input") {
         const answer = await conv.commit(
           (tx) => tx.entry(AssistantEntry, settled.answer),
@@ -1718,17 +1916,11 @@ export class AgentManager {
         );
 
         const assistantMsg = answer?.model?.[0];
-        let fullText = "";
-        if (assistantMsg && Array.isArray(assistantMsg.content)) {
-          for (const part of assistantMsg.content) {
-            if (part.type === "text") {
-              fullText += part.text;
-            }
-          }
-        }
-        // watch 的最终 message_end 可能因 stop() 丢弃：用最终 assistant usage 兜底，
-        // 保证 /status 的 contextTokens 与 sink usage 不为空（成本仍以 UsageDoc 差分为准）
-        if (assistantMsg?.role === "assistant" && assistantMsg.usage && !lastMsgUsage) {
+        const fullText = assistantMsg ? textOfContent(assistantMsg.content) : "";
+        // 最终 assistant entry 的 usage 是当前上下文的最新真相；多 tool round 时
+        // observer 可能还没来得及把最后一条 entry 归约进来，不能只在 lastMsgUsage
+        // 为空时兜底，否则 contextTokens 会停在前一轮 assistant 上。
+        if (assistantMsg?.role === "assistant" && assistantMsg.usage) {
           lastMsgUsage = {
             input: assistantMsg.usage.input ?? 0,
             cacheRead: assistantMsg.usage.cacheRead ?? 0,
@@ -1737,8 +1929,13 @@ export class AgentManager {
         }
 
         // 流式已发送的内容与最终回答不是前缀关系时 (多轮工具调用导致生成重置),
-        // 不能按长度切片, 否则发出错位的中段子串——改为显式补发完整回答
-        if (sink) {
+        // 不能按长度切片, 否则发出错位的中段子串——改为显式补发完整回答。
+        // 1.5.0 的 view 归约器在新 generation 前会补一个换行，因此还要识别
+        // “最终回答已经作为尾部完整展示过”的情况，避免重复发一遍。
+        const alreadyStreamed =
+          lastRenderedText === fullText ||
+          (fullText.length > 0 && lastRenderedText.endsWith(`\n${fullText}`));
+        if (sink && !alreadyStreamed) {
           if (fullText.startsWith(lastRenderedText)) {
             if (fullText.length > lastRenderedText.length) {
               sink({ delta: fullText.slice(lastRenderedText.length) });
@@ -1763,7 +1960,6 @@ export class AgentManager {
         // 终端 /status 与会话累计也使用与 llm_turns 相同的账本（diff 可用时）
         let usageForStats = turnAgg;
         try {
-          await waitWatchDrain();
           await telemetry.flush().catch(() => {});
           const usageAfter = await snapshotUsage(this.harness!, conv.id);
           const usageDiff = usageBefore && usageAfter
@@ -1901,17 +2097,35 @@ export class AgentManager {
 
         return fullText || "(无返回内容)";
       } else {
-        const reason = (settled as any).reason || "unknown";
-        throw new Error(`Agent failed to answer: ${reason}`);
+        // 1.5.0: pi.live.runFailure 是「本轮为什么没有回答」的官方来源，
+        // submission 的 reason 只是兜底（continue/turn_limit/nothing_to_answer 等）。
+        // 只采用包含本次 submission 的 runFailure；排队中被 abort 时不会 startRun，
+        // pi.live 里可能仍留着上一轮的失败原因。
+        const liveFailure = await this.readRunFailure(conv);
+        const failure =
+          liveFailure && liveFailure.inputs.some((id) => String(id) === String(submission.id))
+            ? liveFailure
+            : undefined;
+        const reason = failure?.reason ?? settled.reason ?? "unknown";
+        const detailValue = failure?.detail ?? settled.detail;
+        const detail =
+          detailValue === undefined
+            ? ""
+            : typeof detailValue === "string"
+              ? `: ${detailValue}`
+              : `: ${JSON.stringify(detailValue)}`;
+        throw new Error(`Agent failed to answer: ${reason}${detail}`);
       }
     } catch (err) {
+      observation?.detach();
+      observation = undefined;
       const aborted =
         activeChat?.controller.signal.aborted === true ||
         /cancel/i.test(String(err)) ||
         /\babort(ed)?\b/i.test(String(err));
       try {
         const endedAt = Date.now();
-        await waitWatchDrain();
+        await waitObserverDrain();
         const usageAfter = await snapshotUsage(this.harness!, conv.id).catch(() => undefined);
         const usageDiff = usageBefore && usageAfter
             ? diffUsageState(usageBefore, usageAfter)
@@ -1976,9 +2190,7 @@ export class AgentManager {
       throw err;
     } finally {
       telemetry.endTurn(String(conv.id), turnId);
-      if (watch) {
-        await watch.stop().catch(() => {});
-      }
+      observation?.detach();
     }
   }
 

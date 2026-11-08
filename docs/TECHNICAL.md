@@ -42,17 +42,17 @@ pi-durable
 - **提交式交互**：用户消息走 `conv.submit({type:"input", content})` → `submission.wait()` → 拿到 `settled.answer` 后必须 `conv.commit(tx => tx.entry(AssistantEntry, settled.answer))` 才真正入历史。框架的 `coding-agent` 示例（`../pi/packages/coding-agent/src/experimental/vacation/`）是该用法的权威参照。
 - **Agent 配置与会话解耦**：创建会话时传入 `{model, thinkingLevel, instructions, cwd, extensions}`；后续用 `conv.configure(AgentChange)` 变更——**extensions 支持数组整体替换**（`harness/agent.ts:99-110`），这是本项目"技能热更新"的实现基础。
 - **Env 回调每次使用时重建**：`HarnessOptions.env(target)` 在每个工具轮次被调用（含崩溃恢复的重放任务）。这意味着：env 层的安全策略必须 fail-closed（查不到归属就拒绝），且不能依赖回调只发生一次。
-- **watch vs watchEvents**：`conv.watch()` 返回 view 文档流（需要读 `docs["pi.live"]` 内部结构）；`watchEvents(harness, conversationId, ctx)` 返回**类型化事件流**（`text_delta` 经由 `message_update.changes`、`tool_execution_start/update/end` 等）。后者是公开 API（主入口导出），框架升级有编译期兜底——**始终用它**。
+- **状态视图 vs 事件流（1.5.0）**：`watchEvents()` 已从框架删除；公开的流式/状态 API 是 `harness.observeConversation()`（同步 observer）或 `conv.watch(ctx, window)` → `ConversationView`（`docs["pi.live"]` 的 `generation/tools/compactions/runFailure`，`entries` 为窗口化 transcript）。`LiveState`/`ToolSlot` 是主入口导出的类型化结构，不是内部文档。本项目用 `src/core/live-view.ts` 纯函数归约 view，再映射到 `ChatChunk`；AgentManager 选同步 observer，避免 `watch.stop()` 丢弃 pending 帧。
 
 ### 2.3 实测确认的关键契约（踩坑沉淀）
 
 | 契约 | 说明 | 项目中的落点 |
 |---|---|---|
 | `harness.conversation(id)` 对不存在记录**返回 undefined 不抛错** | 删除会话库后旧映射不会报错而是静默 `undefined` | `agent-manager.ts` 显式判 undefined → 新建会话自愈；抛错视为瞬时错误上抛 |
-| `conv.configure()` 是一次事务提交 | 每条消息都调会多一次 SQLite 写事务 | 配置指纹（provider/model/thinking/instructions/cwd/skills）未变化时跳过 |
+| `conv.configure()` 是一次事务提交 | 每条消息都调会多一次 SQLite 写事务 | 配置指纹（provider/model/thinking/instructions/cwd/skills/maxTurns）未变化时跳过 |
 | bash 工具固定 `inheritEnv: true` 且 spill 用 `createTempFile` | 子进程默认继承宿主全部 env；大输出落 os.tmpdir | 执行环境强制最小环境白名单 `inheritEnv:false`；`createTemp*` 放行不套业务 allowWrite |
 | `Harness.close()` 会 join 全部任务；`storage.close()` 做 WAL checkpoint | 直接关 storage 会硬杀在途任务 | `AgentManager.shutdown()` 先 harness.close 再 storage.close |
-| `ToolSlot` 等内部结构在 npm 与本地源码间**已经漂移过**（name 字段曾删除） | `as any` 读内部文档无编译期信号 | 禁止读内部文档，一律 watchEvents / 类型化 API |
+| `LiveState`/`ToolSlot` 在 1.5.0 已是**主入口导出的类型化结构**；旧 `watchEvents` 时代内部字段漂移过 | `as any` 读未导出字段无编译期信号 | 统一用 `ConversationView` + `LiveState`，归约逻辑集中在 `live-view.ts` |
 | `durable` 表名无前缀（conversations/entries/…） | 与业务表共存会冲突 | 双库分储：`bot.sqlite`（业务）/ `conversations.sqlite`（状态机） |
 
 ### 2.4 pi-durable 的扩展机制与 pi 生态的关系
@@ -88,11 +88,12 @@ pi-durable **没有专门的 skill 概念**——它的原语是 Extension（工
 
 ### 2.6 实验性框架的使用姿势
 
-pi-durable 已进入 1.4.x（1.2.0 有工具结果与存储错误语义的破坏性变更；1.4.0 有会话库 schema v2 迁移与 durable sleeping/blocked 状态）。本项目的策略：
+pi-durable 已进入 1.5.x（1.5.0 删除了 `watchEvents`/`retryTask`，`restartLimit` 任务改为显式 terminal；`pi.live` v3 / `pi.tool` v3 / `pi.generation` v2 是单向迁移）。本项目的策略：
 
-1. **纯 npm 依赖**：npm 精确 `1.4.0`，`bun install` 后完全独立（构建/测试/typecheck 均不需要本地 `../pi`）。**关键事实**：Bun 运行时恒解析 node_modules 的 dist，tsconfig paths 对运行时无效（仅 tsc 遵循）——若保留 paths 会出现"类型超前于运行时"的漂移（typecheck 绿但 dist 里没有该 API），因此 tsconfig 已移除框架 paths 映射，typecheck 与运行时同源；1.0.3 起 `watch`/`openBinaryReader`/`openDirReader` 均为基类正式 API，`execution-env.ts` 直接类型化 override 并前置 PathGuard。工具返回值使用 `output`（1.2.0 起，`content` 已移除）。1.4.0 起 `conversations.sqlite` 首次打开自动迁移到 schema v2，**迁移后不能回退到 1.3.0**，升级前备份；`durableBusyCount()` 排除 `sleeping`/`blocked` 任务（可跨进程存活，不阻塞队列/drain）。升级 = 提升三个包的精确版本并重跑 typecheck/tests。`../pi` 仅作源码阅读参考。
-2. **只用公开导出**：`Harness`/`watchEvents`/`AssistantEntry`/`defineTool` 均从主入口 import；凡是需要 `as any` 读框架内部的地方都是升级雷区，一律换成类型化 API 或封装适配层。
+1. **纯 npm 依赖**：npm 精确 `1.5.0`（`pi-durable`/`pi-ai`/`chord`，并显式声明 `pi-telemetry`），`bun install` 后完全独立（构建/测试/typecheck 均不需要本地 `../pi`）。**关键事实**：Bun 运行时恒解析 node_modules 的 dist，tsconfig paths 对运行时无效（仅 tsc 遵循）——若保留 paths 会出现"类型超前于运行时"的漂移，因此 tsconfig 已移除框架 paths 映射，typecheck 与运行时同源；`execution-env.ts` 直接类型化 override 并前置 PathGuard。工具返回值使用 `output`（1.2.0 起，`content` 已移除）。**升级前必须备份 `conversations.sqlite`**：1.5.0 写过的会话文档不能被 1.4.0 读取，回滚需恢复备份；`durableBusyCount()` 仍排除 `sleeping`/`blocked` 任务（可跨进程存活，不阻塞队列/drain）。
+2. **只用公开导出**：`Harness`/`ConversationView`/`LiveState`/`AssistantEntry`/`defineTool` 均从主入口 import；凡是需要 `as any` 读框架内部的地方都是升级雷区，一律换成类型化 API 或封装适配层。
 3. **对框架行为做实证**：不信任文档记忆，关键契约（undefined 语义、env 重建时机、configure 提交成本、close 链）都在框架源码中核实过（见 `../pi/packages/durable/src/`），部分写入了 `test/` 固化。
+4. **1.5.0 迁移要点**：`watchEvents` → `harness.observeConversation()` 同步 observer（`live-view.ts` 归约）；`onReport` 单参数 `Report`（`kind`/`error`）；`SessionEnd` 用 `kind`；env watch 用 `FileChange` / `FileWatcher.stop`；`TaskInspection.state.kind` 用 `pending`；restart-limited 任务 terminal（自定义 `task_faulted`、内置 `task_interrupted`）后由 onReport 按 durable id 回写业务 `blocked`，用 `recreate-durable` 恢复，不再有 `retryTask`；`system_config.agent_max_turns` 映射到官方 `AgentState.maxTurns`（默认 `0` = 关闭）。
 
 ---
 
@@ -109,7 +110,7 @@ ChannelManager   按库配置实例化 (factory: type → 构造器注册表)、
    ▼
 AgentManager     会话串行锁 → getOrCreateConversation (LRU 缓存 100 +
    │             channel_sessions 反查 fail-closed) → conv.configure (指纹去重)
-   │             → submit/wait/commit + watchEvents 流式回调
+   │             → submit/wait/commit + Conversation.watch 状态归约（live-view.ts）
    ▼
 SandboxedExecutionEnv   pi-durable env 的安全实现 (每个工具轮次由框架回调创建)
    ├─ PathGuard          路径 deny / symlink 逐段解析 / inode 指纹

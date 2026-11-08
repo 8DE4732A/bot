@@ -6,7 +6,7 @@ import { DatabaseManager } from "../src/database/index.ts";
 import { DatabaseStore } from "../src/config/database-store.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { getCurrentSystemMessage } from "@earendil-works/pi-ai/utils/transcript";
-import { AgentManager } from "../src/core/agent-manager.ts";
+import { AgentManager, type ChatChunk } from "../src/core/agent-manager.ts";
 import { DEFAULT_CONTEXT_POLICY } from "../src/core/context-policy.ts";
 import {
   MAX_OUTBOUND_MEDIA,
@@ -41,23 +41,58 @@ function startMock() {
           ? request.messages.reduce((sum: number, m: any) => sum + JSON.stringify(m.content ?? "").length, 0)
           : 0;
         const promptTokens = Math.max(1, Math.ceil(promptChars / 4));
-        const body = sseChunk({
-          id: "mock-1",
-          object: "chat.completion.chunk",
-          created: 1,
-          model: "deepseek-chat",
-          choices: [{ index: 0, delta: { role: "assistant", content: "hello from mock" }, finish_reason: null }],
-        }) +
-          sseChunk({
-            id: "mock-1",
-            object: "chat.completion.chunk",
-            created: 1,
-            model: "deepseek-chat",
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-            usage: { prompt_tokens: promptTokens, completion_tokens: 4, total_tokens: promptTokens + 4 },
-          }) +
-          "data: [DONE]\n\n";
-        return new Response(body, {
+        // 分多个 content chunk 并人为拉开间隔（> progress.partialIntervalMs），
+        // 确保流式断言证明的是 ConversationView 增量路径，而不是最终 answer 对账。
+        const encoder = new TextEncoder();
+        const parts = ["hello ", "from ", "mock"];
+        // 只有流式用例需要跨过 progress.partialIntervalMs；其他 chat 调用不等
+        const slowStream = JSON.stringify(request.messages ?? "").includes("stream please");
+        const stream = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            for (let index = 0; index < parts.length; index++) {
+              const content = parts[index]!;
+              controller.enqueue(
+                encoder.encode(
+                  sseChunk({
+                    id: "mock-1",
+                    object: "chat.completion.chunk",
+                    created: 1,
+                    model: "deepseek-chat",
+                    choices: [
+                      {
+                        index: 0,
+                        delta: index === 0 ? { role: "assistant", content } : { content },
+                        finish_reason: null,
+                      },
+                    ],
+                  }),
+                ),
+              );
+              if (slowStream && index < parts.length - 1) {
+                await new Promise((resolve) => setTimeout(resolve, 120));
+              }
+            }
+            controller.enqueue(
+              encoder.encode(
+                sseChunk({
+                  id: "mock-1",
+                  object: "chat.completion.chunk",
+                  created: 1,
+                  model: "deepseek-chat",
+                  choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                  usage: {
+                    prompt_tokens: promptTokens,
+                    completion_tokens: 4,
+                    total_tokens: promptTokens + 4,
+                  },
+                }),
+              ),
+            );
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        });
+        return new Response(stream, {
           headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
         });
       }
@@ -147,6 +182,23 @@ describe("AgentManager chat observability", () => {
     expect(requests.length).toBeGreaterThanOrEqual(1);
     expect(requests[0]!.taskKind).toBe("generation");
     expect(requests[0]!.provider).toBe("mock");
+  });
+
+  test("1.5.0 ConversationView 的流式文本送达 onChunk", async () => {
+    ensureMockProvider();
+    const chunks: ChatChunk[] = [];
+    const answer = await AgentManager.getInstance().chat(
+      "agent-default",
+      "terminal-main:stream-user",
+      "stream please",
+      (chunk) => chunks.push(chunk),
+    );
+    expect(answer).toContain("hello from mock");
+    const deltas = chunks
+      .filter((chunk) => typeof chunk.delta === "string" && chunk.delta.length > 0)
+      .map((chunk) => chunk.delta!);
+    expect(deltas.length).toBeGreaterThanOrEqual(2);
+    expect(deltas.join("")).toContain("hello from mock");
   });
 
 

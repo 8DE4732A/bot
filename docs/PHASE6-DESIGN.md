@@ -3,6 +3,8 @@
 > 状态：**已实现**（2026-10-25；M0–M4 落地，216 tests 全绿 + 真实 provider 冒烟）
 > 基线：`@earendil-works/pi-durable` 1.4.0（durable sleeps / wake / crash-loop guard / `retryTask` / `TaskInspection.state`）
 > 关联：`docs/PHASE5-DESIGN.md`（工作区技能/记忆）、`src/scheduler/`、`src/core/agent-manager.ts`
+>
+> **1.5.0 后续变更**：`Harness.retryTask` 已删除，restart-limited 任务改为显式 terminal（`task_interrupted` / `runFailure`），`TaskInspection.state.kind` 用 `pending`；当前实现以 `CLAUDE.md` / `docs/TECHNICAL.md` 为准，本文保留六期设计历史。
 
 ## 1. 背景与目标
 

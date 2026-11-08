@@ -1,6 +1,13 @@
 #!/usr/bin/env bun
 import { DatabaseStore } from "./config/database-store.ts";
 import { ensureBotDirectories, getBotPaths } from "./config/env-paths.ts";
+import {
+  configuredWebEndpoint,
+  formatWebUrl,
+  resolveWebEndpoint,
+  setRuntimeWebEndpoint,
+  type WebEndpoint,
+} from "./config/web-endpoint.ts";
 import { ChannelManager } from "./channels/manager.ts";
 import { TerminalChannel } from "./channels/terminal/index.ts";
 import { AgentManager } from "./core/agent-manager.ts";
@@ -34,7 +41,7 @@ import {
   writePidFile,
   clearPidFile,
 } from "./gateway/lifecycle.ts";
-import { gatewayInstance, resolveGatewayProgram } from "./gateway/service-defs.ts";
+import { gatewayInstance, resolveGatewayProgram, type GatewayInstance } from "./gateway/service-defs.ts";
 import { makeControlHandlers, probeGateway, probeLiveGateway, startControlSocket } from "./gateway/control-socket.ts";
 import { existsSync, openSync, unlinkSync, writeFileSync } from "node:fs";
 import { BOT_VERSION } from "./version.ts";
@@ -102,14 +109,14 @@ async function main() {
   });
 
   if (command === "status") {
-    printConfigStatus(cwd, paths, store);
+    await printConfigStatus(cwd, paths, store);
     process.exit(0);
   }
 
   if (command === "admin") {
-    const port = store.getConfig("web_port", "3000");
-    const host = store.getConfig("web_host", "127.0.0.1");
-    console.log(`\n\x1b[36mWeb Admin URL: \x1b[4mhttp://${host}:${port}\x1b[0m\n`);
+    // 运行中的 gateway 才掌握真实端点（--port/--host 只影响该进程）
+    const endpoint = await resolveCliWebEndpoint(gatewayInstance(cwd), store);
+    console.log(`\n\x1b[36mWeb Admin URL: \x1b[4m${formatWebUrl(endpoint)}\x1b[0m\n`);
     process.exit(0);
   }
 
@@ -218,10 +225,15 @@ async function runPlatform(
     process.exit(opts.supervised ? EXIT_CONFIG_ERROR : 1);
   }
 
-  let port = opts.port ?? parseInt(store.getConfig("web_port", "3000"), 10);
-  let host = opts.host ?? store.getConfig("web_host", "127.0.0.1");
+  // 实际监听端点：--port/--host 是进程级覆盖，默认值走 system_config 的同一解析。
+  // 控制 socket 的 status 与进程内 banner//admin 都读这一份，listen 后回填实际端口。
+  const configured = configuredWebEndpoint(store);
+  const webEndpoint: WebEndpoint = {
+    host: opts.host ?? configured.host,
+    port: opts.port ?? configured.port,
+  };
 
-  logger.info("CLI", `Starting Bot platform at ${cwd} (port: ${port})...`);
+  logger.info("CLI", `Starting Bot platform at ${cwd} (port: ${webEndpoint.port})...`);
 
   // 2. Load custom skills (工具型 index.ts + 文档型 SKILL.md)
   await loadCustomSkills(cwd);
@@ -318,6 +330,7 @@ async function runPlatform(
         type: a.type,
         name: a.name,
       })),
+      webEndpoint: () => webEndpoint,
     }),
   ).catch((err) => {
     // lock 已保证互斥, bind 失败只剩文件系统异常等真实错误
@@ -328,17 +341,19 @@ async function runPlatform(
   // 4 & 5. Start Web Server and configured channels (渠道先启动、Web 后开,
   // 共享生命周期状态防双连接泄漏——三期既有时序)
   const channelManager = ChannelManager.getInstance();
-  // gateway/daemon 模式不创建终端 REPL: readline 会试图读取 stdin (SIGTTIN 风险)
+  // gateway/daemon 模式不创建终端 REPL: readline 会试图读取 stdin (SIGTTIN 风险)。
+  // 交互终端**延后到 Web 端口绑定成功后**再注册/启动：端口被占用时先打出
+  // REPL banner 再退出会被误认为“终端对话坏了”（见文件末尾的启动点）。
   const terminalChannel = extra.interactiveTerminal ? new TerminalChannel() : undefined;
-  if (terminalChannel) channelManager.register(terminalChannel);
-  const webServer = new AdminWebServer(port, host, {
+  const webServer = new AdminWebServer(webEndpoint.port, webEndpoint.host, {
     // 注入式 token (四期 §6.1): 浏览器经 HTML 注入/bootstrap 无感携带;
     // 管理台与 gateway 共用同一 token
     authToken: loadOrCreateGatewayToken(cwd),
   });
   await channelManager.startAll();
   try {
-    await webServer.start();
+    webEndpoint.port = await webServer.start();
+    setRuntimeWebEndpoint(webEndpoint);
   } catch (err) {
     // 端口占用等 = 致命配置错 (§3.2): supervised 下 exit 78 + 标记,
     // bootstrap-guard 在下次重启时终止 KeepAlive 链条
@@ -396,11 +411,14 @@ async function runPlatform(
 
   logger.info(
     "CLI",
-    `Platform started: web http://${host}:${port} · gateway.sock ${instance.socketFile}${isSupervised ? " (supervised)" : ""}`,
+    `Platform started: web ${formatWebUrl(webEndpoint)} · gateway.sock ${instance.socketFile}${isSupervised ? " (supervised)" : ""}`,
   );
 
   if (extra.interactiveTerminal && terminalChannel) {
-    // Start interactive terminal channel (bot start 前台模式)
+    // Web 端口已绑定成功，才把交互终端注册进 manager 并启动 REPL。
+    // 不走 startAll 的 CLI-managed 分支（那里按 channels.enabled 判定）；
+    // `bot start` 是显式交互模式，与旧行为一致：始终给终端。
+    channelManager.register(terminalChannel);
     await terminalChannel.start();
   } else {
     logger.info("CLI", "Gateway mode enabled. Running until stopped…");
@@ -530,15 +548,30 @@ async function tuiEntry(args: string[], store: DatabaseStore): Promise<void> {
     console.log("");
     process.exit(1);
   }
+  // gateway 可能以 --port/--host 覆盖启动：以控制 socket 的实际端点为准，
+  // 否则 TUI 会连数据库里的旧端口（gateway 在线但 WS 永远离线）。
+  const endpoint = await resolveCliWebEndpoint(instance, store);
   const { runTui } = await import("./tui/index.tsx");
-  await runTui({ webPort: store.getConfig("web_port", "3000") });
+  await runTui({ webHost: endpoint.host, webPort: endpoint.port });
 }
 
-function printConfigStatus(cwd: string, paths: ReturnType<typeof getBotPaths>, store: DatabaseStore): void {
+/**
+ * CLI 侧解析管理台端点：运行中的 gateway 以控制 socket 的 status 为准；
+ * 未运行 / 旧版本 gateway（无 webHost）回退 system_config。
+ */
+async function resolveCliWebEndpoint(instance: GatewayInstance, store: DatabaseStore): Promise<WebEndpoint> {
+  const status = await probeGateway(instance.socketFile, "status", 1500).catch(() => undefined);
+  return resolveWebEndpoint(status, configuredWebEndpoint(store));
+}
+
+async function printConfigStatus(
+  cwd: string,
+  paths: ReturnType<typeof getBotPaths>,
+  store: DatabaseStore,
+): Promise<void> {
   const agents = store.listAgents();
   const channels = store.listChannels();
-  const port = store.getConfig("web_port", "3000");
-  const host = store.getConfig("web_host", "127.0.0.1");
+  const endpoint = await resolveCliWebEndpoint(gatewayInstance(cwd), store);
 
   console.log("\n\x1b[1m=== Bot Agent Status ===\x1b[0m");
   console.log(`  工作目录 (cwd):      ${cwd}`);
@@ -546,7 +579,7 @@ function printConfigStatus(cwd: string, paths: ReturnType<typeof getBotPaths>, s
   console.log(`  会话数据库:          ${paths.conversationsDbFile}`);
   console.log(`  日志目录:            ${paths.logsDir}`);
   console.log(`  工作空间根目录:      ${paths.workspacesDir}`);
-  console.log(`  Web 管理后台:        http://${host}:${port}`);
+  console.log(`  Web 管理后台:        ${formatWebUrl(endpoint)}`);
   console.log(`  已配置 Agent 数量:   ${agents.length}`);
   for (const a of agents) {
     console.log(`    - [${a.id}] ${a.name} (${a.model.provider}/${a.model.modelId})`);

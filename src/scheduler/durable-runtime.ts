@@ -1,13 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { ConversationId, TaskId } from "@earendil-works/pi-durable";
+import type { ConversationId, TaskId, TaskInspection } from "@earendil-works/pi-durable";
 import {
   DatabaseStore,
   type ScheduledTaskDefinition,
   type ScheduledTaskDurableState,
   type ScheduledTaskRunRecord,
 } from "../config/database-store.ts";
-import { AgentManager } from "../core/agent-manager.ts";
+import { AgentManager, isRestartLimitedRecord } from "../core/agent-manager.ts";
 import { EventBus } from "../core/event-bus.ts";
 import { logger } from "../utils/logger.ts";
 import { buildTriggerMessage, computeNextRunAt, LAST_RESULT_MAX_CHARS } from "./schedule.ts";
@@ -255,6 +255,49 @@ export class SchedulerRuntime {
     });
   }
 
+  /**
+   * 用户显式重建（1.5.0 官方语义：restart-limited 任务已终结，恢复 = 重新 submit）。
+   * 仅允许业务 blocked/failed；live 任务先取消，再由 ensure 创建新的 durable task。
+   */
+  public async recreateDurableTask(
+    taskId: string,
+  ): Promise<{
+    ok: boolean;
+    reason?:
+      | "not_found"
+      | "not_ready"
+      | "disabled"
+      | "poisoned"
+      | "not_blocked"
+      | "busy"
+      | "create_failed";
+  }> {
+    return this.withTaskLock(taskId, async () => {
+      const store = new DatabaseStore();
+      const row = store.getScheduledTaskRaw(taskId);
+      if (!row || row.deletedAt) return { ok: false, reason: "not_found" as const };
+      if (!AgentManager.getInstance().getHarness()) {
+        return { ok: false, reason: "not_ready" as const };
+      }
+      if (!row.enabled) return { ok: false, reason: "disabled" as const };
+      if (row.conversationPoisoned) return { ok: false, reason: "poisoned" as const };
+      if (row.durableState !== "blocked" && row.durableState !== "failed") {
+        return { ok: false, reason: "not_blocked" as const };
+      }
+      if (row.durableTaskId) {
+        const cancel = await this.cancelRunLocked(taskId, row.durableTaskId);
+        if (!cancel.ok) return { ok: false, reason: "busy" as const };
+      }
+      store.setScheduledTaskDurable(taskId, undefined, "pending");
+      await this.ensureDurableTaskLocked(taskId, store);
+      const after = store.getScheduledTaskRaw(taskId);
+      if (!after?.durableTaskId || after.durableState === "failed") {
+        return { ok: false, reason: "create_failed" as const };
+      }
+      return { ok: true };
+    });
+  }
+
   private async ensureDurableTaskLocked(
     taskId: string,
     store: DatabaseStore,
@@ -271,7 +314,18 @@ export class SchedulerRuntime {
     }
 
     if (row.durableTaskId) {
-      const live = await agentManager.inspectDurableTask(row.durableTaskId).catch(() => undefined);
+      let live: TaskInspection | undefined;
+      try {
+        live = await agentManager.inspectDurableTask(row.durableTaskId);
+      } catch (err) {
+        // 读失败 ≠ 任务不存在：fail-closed，保留原 id，等下一次 reconcile，绝不重复 createTask
+        logger.warn(
+          "SchedulerRuntime",
+          `Failed to inspect durable task '${row.durableTaskId}' for '${taskId}': ${err}`,
+        );
+        store.setScheduledTaskDurable(taskId, row.durableTaskId, "failed");
+        return { aborting: false };
+      }
       if (live && row.durableState === "aborting") {
         // 上次取消超时：reconcile/ensure 继续清理，绝不复用旧 task
         const cancel = await this.cancelRunLocked(taskId, row.durableTaskId);
@@ -281,12 +335,9 @@ export class SchedulerRuntime {
         }
         store.setScheduledTaskDurable(taskId, undefined, "pending");
       } else if (live) {
-        if (live.state.kind === "blocked" && live.state.reason === "restart_limit") {
-          store.setScheduledTaskDurable(taskId, row.durableTaskId, "blocked");
-          return { aborting: false };
-        }
         if (live.state.kind !== "blocked") {
-          store.setScheduledTaskDurable(taskId, row.durableTaskId, "active");
+          // CAS：restart-limit report 可能已在 inspect 后把业务行改成 blocked
+          store.setScheduledTaskActiveIfDurable(taskId, row.durableTaskId);
           return { aborting: false };
         }
         // blocked (missing_task/task_too_old/migration_failed)：清理后重建
@@ -294,6 +345,29 @@ export class SchedulerRuntime {
         if (!cancel.ok) {
           store.setScheduledTaskDurable(taskId, row.durableTaskId, "aborting");
           return { aborting: true };
+        }
+      } else {
+        // 1.5.0: crash-loop 任务不再 park，达到 restartLimit 后显式 terminal(faulted)。
+        // 不能盲目重建（会无限复活），保留业务 blocked，等用户显式“重建任务”。
+        let record: Awaited<ReturnType<typeof agentManager.getDurableTaskRecord>>;
+        try {
+          record = await agentManager.getDurableTaskRecord(row.durableTaskId);
+        } catch (err) {
+          logger.warn(
+            "SchedulerRuntime",
+            `Failed to read terminal durable task '${row.durableTaskId}' for '${taskId}': ${err}`,
+          );
+          store.setScheduledTaskDurable(taskId, row.durableTaskId, "failed");
+          return { aborting: false };
+        }
+        if (record && record.state.status !== "terminal") {
+          // inspect 与 getTask 之间的瞬时不一致：仍视为 live，绝不重建
+          store.setScheduledTaskActiveIfDurable(taskId, row.durableTaskId);
+          return { aborting: false };
+        }
+        if (isRestartLimitedRecord(record)) {
+          store.setScheduledTaskDurable(taskId, row.durableTaskId, "blocked");
+          return { aborting: false };
         }
       }
       store.setScheduledTaskDurable(taskId, undefined, "pending");
@@ -466,19 +540,15 @@ export class SchedulerRuntime {
         await this.withTaskLock(row.id, async () => {
           const fresh = store.getScheduledTaskRaw(row.id);
           if (!fresh || fresh.deletedAt || !fresh.enabled) return;
-          if (fresh.durableTaskId) {
-            const live = await AgentManager.getInstance()
-              .inspectDurableTask(fresh.durableTaskId)
-              .catch(() => undefined);
-            if (live?.state.kind === "blocked" && live.state.reason === "restart_limit") {
-              store.setScheduledTaskDurable(row.id, fresh.durableTaskId, "blocked");
-              summary.blocked += 1;
-              return;
-            }
-          }
           const result = await this.ensureDurableTaskLocked(row.id, store);
-          if (result.aborting) summary.failed += 1;
-          else summary.created += 1;
+          if (result.aborting) {
+            summary.failed += 1;
+          } else {
+            const after = store.getScheduledTaskRaw(row.id);
+            if (after?.durableState === "blocked") summary.blocked += 1;
+            else if (after?.durableState === "failed") summary.failed += 1;
+            else summary.created += 1;
+          }
         });
       } catch (err) {
         summary.failed += 1;

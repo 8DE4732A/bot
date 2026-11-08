@@ -6,6 +6,7 @@ import type {
   Harness as HarnessType,
 } from "@earendil-works/pi-durable";
 import type { Message } from "@earendil-works/pi-ai";
+import { textOfContent } from "../core/message-content.ts";
 
 /**
  * 会话历史读取器（四期 M3）。
@@ -38,22 +39,6 @@ export interface SessionSearchHit {
 const TOOL_RESULT_MAX_CHARS = 400;
 const SEARCH_SNIPPET_RADIUS = 60;
 const SEARCH_SCAN_PER_CONVERSATION = 2_000;
-
-function textOfContent(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((part): part is { text: string } => {
-      return Boolean(
-        part &&
-          typeof part === "object" &&
-          "text" in part &&
-          typeof (part as { text?: unknown }).text === "string",
-      );
-    })
-    .map((part) => part.text)
-    .join("");
-}
 
 function describeMessage(message: Message, seq: number): SessionMessage | undefined {
   const text = textOfContent(message.content);
