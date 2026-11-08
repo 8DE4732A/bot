@@ -1,6 +1,10 @@
 # 发布流水线 (0.1.0 起): tag 触发 → 四平台交叉编译 → GitHub Release
 #
 # 触发: git tag v0.1.0 && git push origin v0.1.0
+#
+# 单 job 构建全部平台：bun --compile 的 --target 本身就能在 linux-x64 上交叉
+# 编译四个平台，四平台 matrix 会把 --all 重复跑四遍，并放大 setup-bun 下载
+# 资源的瞬时 504 风险。
 
 name: Release
 
@@ -13,24 +17,16 @@ permissions:
   contents: write # GitHub Release 上传
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
+  release:
+    name: Build & Release
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - bun-darwin-arm64
-          - bun-darwin-x64
-          - bun-linux-x64
-          - bun-linux-arm64
     steps:
       - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2
         with:
-          # 固定版本而不是 latest：latest 解析到的 1.4.4 linux-x64 资源曾在
-          # GitHub Releases CDN 稳定 504；1.4.3 资源正常且可直接复现构建。
+          # 固定版本而不是 latest：latest 解析到的 1.4.4 资源曾在 GitHub
+          # Releases CDN 稳定 504；1.4.3 可直接复现构建。
           bun-version: 1.4.3
 
       - name: Install dependencies
@@ -44,36 +40,19 @@ jobs:
           node -e 'const fs=require("fs"); const p=JSON.parse(fs.readFileSync("package.json","utf8")); p.version=process.argv[1]; fs.writeFileSync("package.json", JSON.stringify(p,null,2)+"\n")' "$TAG_VERSION"
           node -p '"package.json version -> " + require("./package.json").version'
 
-      # 四平台交叉编译全在 ubuntu 完成 (bun --compile 的 --target 交叉编译);
-      # 版本经 --define 注入二进制 (bot --version / gateway identify 可见)
+      # 四平台交叉编译全在 ubuntu 完成; 版本经 --define 注入二进制
+      # (bot --version / gateway identify 可见)。
       - name: Build release artifacts
         env:
           VERSION: ${{ github.ref_name }}
         run: |
           VERSION="${VERSION#v}" bun run scripts/build-release.ts --all
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ matrix.target }}
-          path: dist/release/
-
-  github-release:
-    name: GitHub Release
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          pattern: release-*
-
       - name: Stage binaries
         run: |
           mkdir -p dist
-          # artifact 目录: release-<target>/<platform>/bot → bot-<platform>.tar.gz;
-          # chmod 保留可执行位 (artifact 上传不保证 mode, 缺失则解压后 permission denied)
-          for dir in artifacts/release-*/*/; do
+          # dist/release/<platform>/bot → dist/bot-<platform>.tar.gz
+          for dir in dist/release/*/; do
             platform=$(basename "$dir")
             chmod +x "$dir/bot"
             tar -czf "dist/bot-${platform}.tar.gz" -C "$dir" bot
