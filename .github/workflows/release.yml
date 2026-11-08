@@ -29,7 +29,9 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # 固定版本而不是 latest：latest 解析到的 1.4.4 linux-x64 资源曾在
+          # GitHub Releases CDN 稳定 504；1.4.3 资源正常且可直接复现构建。
+          bun-version: 1.4.3
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
