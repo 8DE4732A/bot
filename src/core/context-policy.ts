@@ -288,23 +288,43 @@ function scopeApplies(scope: StrategyScope, profile: ContextSessionProfile): boo
 }
 
 /**
- * keepRecent 是框架全局值；用所有已启用策略里最低的阈值约束它，
- * 保证任何策略触发时都还能选出 cut。
+ * keepRecent 上限：用该会话画像下会启用的策略里最低的阈值约束它，
+ * 保证该画像下任何策略触发时都还能选出 cut。
+ *
+ * 1.6.0 起压缩设置按会话配置（`configure({ compaction })`），普通会话不把
+ * 定时任务阈值计入，长窗口模型可以保留更多近期上下文。
  */
-export function deriveKeepRecentTokens(policy: ContextPolicy, window: number): number {
+export function deriveKeepRecentTokens(
+  policy: ContextPolicy,
+  window: number,
+  profile: ContextSessionProfile,
+): number {
+  return keepRecentFor(policy, window, (scope) => scopeApplies(scope, profile));
+}
+
+/** harness-wide 兜底：取全部已启用策略的最低阈值（未配置的会话使用）。 */
+export function deriveHarnessKeepRecentTokens(policy: ContextPolicy, window: number): number {
+  return keepRecentFor(policy, window, () => true);
+}
+
+function keepRecentFor(
+  policy: ContextPolicy,
+  window: number,
+  considers: (scope: StrategyScope) => boolean,
+): number {
   const s = policy.strategies;
   const candidates: number[] = [];
   if (s.global.enabled && Number.isFinite(window) && window > 0) {
     candidates.push(Math.floor(window * s.global.percent));
   }
-  if (s.scheduledHeuristic.enabled) {
+  if (s.scheduledHeuristic.enabled && considers("scheduled")) {
     candidates.push(
       Number.isFinite(window) && window > 0
         ? Math.min(s.scheduledHeuristic.fallbackTokens, Math.floor(window * s.scheduledHeuristic.maxPercentOfWindow))
         : s.scheduledHeuristic.fallbackTokens,
     );
   }
-  if (s.fixed.enabled) {
+  if (s.fixed.enabled && considers(s.fixed.scope)) {
     candidates.push(s.fixed.tokens);
   }
   const minThreshold = candidates.length > 0 ? Math.min(...candidates) : undefined;
@@ -314,25 +334,28 @@ export function deriveKeepRecentTokens(policy: ContextPolicy, window: number): n
 }
 
 function finalizeThreshold(
-  policy: ContextPolicy,
   raw: number,
   window: number,
   reserve: number,
   minTokens: number,
+  keepRecent: number,
 ): number {
   if (!Number.isFinite(raw) || raw <= 0) return 0;
   let threshold = Math.max(raw, minTokens);
   if (Number.isFinite(window) && window > 0) {
     threshold = Math.min(threshold, window - reserve);
   }
-  // 必须比 keepRecent 大出可切分空间，否则框架 selectCut 永远返回 undefined
-  threshold = Math.max(threshold, deriveKeepRecentTokens(policy, window) + 1_024);
+  // 必须比该画像实际使用的 keepRecent 大出可切分空间，否则框架 selectCut 永远返回 undefined
+  threshold = Math.max(threshold, keepRecent + 1_024);
   return threshold > 0 ? Math.floor(threshold) : 0;
 }
 
 export interface ResolvedThresholds {
   reserve: number;
+  /** 普通会话的 keepRecent（1.6.0 起按会话配置，不再受定时策略拖累） */
   keepRecent: number;
+  /** 定时任务会话的 keepRecent */
+  scheduledKeepRecent: number;
   /** 全局百分比阈值（窗口未知为 0） */
   globalThreshold: number;
   /** 定时任务启发式：无历史时的回退阈值 */
@@ -351,18 +374,25 @@ export function resolveContextThresholds(policy: ContextPolicy, window: number):
     Number.isFinite(window) && window > 0
       ? Math.min(s.scheduledHeuristic.fallbackTokens, Math.floor(window * s.scheduledHeuristic.maxPercentOfWindow))
       : s.scheduledHeuristic.fallbackTokens;
+  const keepRecent = deriveKeepRecentTokens(policy, window, "normal");
+  const scheduledKeepRecent = deriveKeepRecentTokens(policy, window, "scheduled");
+  // 同一个全局阈值同时服务两种画像，下限必须同时满足两者的 keepRecent
+  const anyKeepRecent = Math.max(keepRecent, scheduledKeepRecent);
+  const fixedKeepRecent =
+    s.fixed.scope === "scheduled" ? scheduledKeepRecent : s.fixed.scope === "normal" ? keepRecent : anyKeepRecent;
   return {
     reserve,
-    keepRecent: deriveKeepRecentTokens(policy, window),
-    globalThreshold: finalizeThreshold(policy, globalRaw, window, reserve, s.global.minTokens),
+    keepRecent,
+    scheduledKeepRecent,
+    globalThreshold: finalizeThreshold(globalRaw, window, reserve, s.global.minTokens, anyKeepRecent),
     scheduledFallbackThreshold: finalizeThreshold(
-      policy,
       heuristicRaw,
       window,
       reserve,
       s.scheduledHeuristic.minTokens,
+      scheduledKeepRecent,
     ),
-    fixedThreshold: finalizeThreshold(policy, s.fixed.tokens, window, reserve, s.fixed.minTokens),
+    fixedThreshold: finalizeThreshold(s.fixed.tokens, window, reserve, s.fixed.minTokens, fixedKeepRecent),
     idleHours: s.idle.idleHours,
   };
 }
@@ -390,7 +420,8 @@ export function resolveHeuristicThreshold(
       ? Math.floor((deltas.reduce((sum, delta) => sum + delta, 0) / deltas.length) * s.multiplier)
       : s.fallbackTokens;
   const reserve = resolveEmergencyReserve(policy, window);
-  return finalizeThreshold(policy, raw, window, reserve, s.minTokens);
+  // 启发式阈值只用于定时任务会话
+  return finalizeThreshold(raw, window, reserve, s.minTokens, deriveKeepRecentTokens(policy, window, "scheduled"));
 }
 
 export interface CompactionDecisionInput {
@@ -453,28 +484,57 @@ export function decideCompaction(
   return null;
 }
 
-/** 构造 HarnessSettings.compaction：harness-wide 基础值 + per-model override。 */
+/**
+ * 单模型的压缩覆盖条目。「`backgroundTokens` 必须显式为 0（否则会落回框架
+ * 默认 32768）」与「会话设置必须写 modelOverride 才能压过 harness override」
+ * 两条隐性契约集中在这里，两个构造器共用。
+ */
+function compactionOverride(reserveTokens: number, keepRecentTokens: number) {
+  return { reserveTokens, keepRecentTokens, backgroundTokens: 0 };
+}
+
+/** 构造 HarnessSettings.compaction：harness-wide 基础值 + per-model override（未配置会话的兜底）。 */
 export function buildCompactionSettings(
   policy: ContextPolicy,
   models: { provider: string; id: string; contextWindow: number }[],
 ): CompactionSettings {
-  const baseKeepRecent = deriveKeepRecentTokens(policy, 0);
-  const overrides: Record<string, { reserveTokens: number; keepRecentTokens: number; backgroundTokens: number }> = {};
+  const overrides: Record<string, ReturnType<typeof compactionOverride>> = {};
   for (const model of models) {
     const window = Number(model.contextWindow);
-    const keepRecent = deriveKeepRecentTokens(policy, window);
-    overrides[`${model.provider}/${model.id}`] = {
-      reserveTokens: resolveEmergencyReserve(policy, window),
-      keepRecentTokens: keepRecent,
-      backgroundTokens: 0,
-    };
+    overrides[`${model.provider}/${model.id}`] = compactionOverride(
+      resolveEmergencyReserve(policy, window),
+      deriveHarnessKeepRecentTokens(policy, window),
+    );
   }
   return {
-    // 关键：即使模型窗口未知也必须显式关闭 background，否则落回框架默认 32768
     enabled: true,
-    reserveTokens: Math.min(16_384, policy.emergencyReserveCapTokens),
-    keepRecentTokens: baseKeepRecent,
-    backgroundTokens: 0,
+    ...compactionOverride(
+      resolveEmergencyReserve(policy, 0),
+      deriveHarnessKeepRecentTokens(policy, 0),
+    ),
     modelOverrides: overrides,
+  };
+}
+
+/**
+ * 构造单个会话的 `CompactionSettings`（1.6.0 `configure({ compaction })`）。
+ *
+ * 数值与 `/api/context/policy` 的预览共用 `resolveContextThresholds`，保证
+ * 「管理台看到的 keepRecent」就是「实际写进会话的值」。harness 已为每个模型
+ * 写了 override，所以这里必须同样写，否则普通/定时两套设置会被盖住。
+ */
+export function buildConversationCompactionSettings(
+  policy: ContextPolicy,
+  profile: ContextSessionProfile,
+  model: { provider: string; id: string; contextWindow: number } | undefined,
+): CompactionSettings {
+  const window = model ? Number(model.contextWindow) : 0;
+  const thresholds = resolveContextThresholds(policy, window);
+  const keepRecent = profile === "scheduled" ? thresholds.scheduledKeepRecent : thresholds.keepRecent;
+  const override = compactionOverride(thresholds.reserve, keepRecent);
+  return {
+    enabled: true,
+    ...override,
+    ...(model ? { modelOverrides: { [`${model.provider}/${model.id}`]: override } } : {}),
   };
 }

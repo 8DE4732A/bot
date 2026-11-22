@@ -17,6 +17,7 @@ import {
 } from "./runtime/media-outbound.ts";
 import { splitMessage } from "./runtime/segmenter.ts";
 import { planVisionInput } from "./runtime/vision-input.ts";
+import { getImageProcessor } from "./runtime/image-processor.ts";
 import { resolveModelMetadata } from "../core/model-metadata.ts";
 
 /** 多段连发间隔 (防平台风控, 对齐设计 §3.2) */
@@ -334,6 +335,8 @@ export class ChannelManager implements ChannelDispatchRuntime {
     const agent = this.store.getAgent(agentId);
     const provider = agent ? this.store.getModelProvider(agent.model.provider) : undefined;
     const metadata = agent && provider ? resolveModelMetadata(provider, agent.model.modelId, this.store) : undefined;
+    // 1.6.0：图片先按模型限制缩放/转换（Photon 不可用时自动退回“超限跳过”）；
+    // 传惰性 getter，纯文本/不支持图片的消息不加载 Photon
     const visionPlan = await planVisionInput(
       message.content,
       message.attachments,
@@ -345,6 +348,7 @@ export class ChannelManager implements ChannelDispatchRuntime {
             known: metadata.source !== "fallback",
           }
         : undefined,
+      { processor: () => getImageProcessor() },
     );
     if (visionPlan.mode === "reject") {
       this.store.recordAudit("channel.image_unsupported", {

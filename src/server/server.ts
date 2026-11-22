@@ -1908,6 +1908,7 @@ export class AdminWebServer {
                 modelId,
                 contextWindow: meta.contextWindow,
                 keepRecentTokens: thresholds.keepRecent,
+                scheduledKeepRecentTokens: thresholds.scheduledKeepRecent,
                 globalThreshold: thresholds.globalThreshold,
                 scheduledFallbackThreshold: thresholds.scheduledFallbackThreshold,
                 fixedThreshold: thresholds.fixedThreshold,

@@ -88,12 +88,14 @@ pi-durable **没有专门的 skill 概念**——它的原语是 Extension（工
 
 ### 2.6 实验性框架的使用姿势
 
-pi-durable 已进入 1.5.x（1.5.0 删除了 `watchEvents`/`retryTask`，`restartLimit` 任务改为显式 terminal；`pi.live` v3 / `pi.tool` v3 / `pi.generation` v2 是单向迁移）。本项目的策略：
+pi-durable 已进入 1.6.x（1.5.0 删除了 `watchEvents`/`retryTask`，`restartLimit` 任务改为显式 terminal；1.6.0 引入可挂起工作——signals、会 park 的工具、`beforeTool` 闸门、`afterTools`/`onYield` 派生任务——并把 `pi.tool` 升到 v4、`pi.generation` 升到 v3，二者与 1.5 的 `pi.live` v3 / `pi.tool` v3 / `pi.generation` v2 一样是单向迁移）。本项目的策略：
 
-1. **纯 npm 依赖**：npm 精确 `1.5.0`（`pi-durable`/`pi-ai`/`chord`，并显式声明 `pi-telemetry`），`bun install` 后完全独立（构建/测试/typecheck 均不需要本地 `../pi`）。**关键事实**：Bun 运行时恒解析 node_modules 的 dist，tsconfig paths 对运行时无效（仅 tsc 遵循）——若保留 paths 会出现"类型超前于运行时"的漂移，因此 tsconfig 已移除框架 paths 映射，typecheck 与运行时同源；`execution-env.ts` 直接类型化 override 并前置 PathGuard。工具返回值使用 `output`（1.2.0 起，`content` 已移除）。**升级前必须备份 `conversations.sqlite`**：1.5.0 写过的会话文档不能被 1.4.0 读取，回滚需恢复备份；`durableBusyCount()` 仍排除 `sleeping`/`blocked` 任务（可跨进程存活，不阻塞队列/drain）。
+1. **纯 npm 依赖**：npm 精确 `1.6.0`（`pi-durable`/`pi-ai`/`chord`，并显式声明 `pi-telemetry`），`bun install` 后完全独立（构建/测试/typecheck 均不需要本地 `../pi`）。**关键事实**：Bun 运行时恒解析 node_modules 的 dist，tsconfig paths 对运行时无效（仅 tsc 遵循）——若保留 paths 会出现"类型超前于运行时"的漂移，因此 tsconfig 已移除框架 paths 映射，typecheck 与运行时同源；`execution-env.ts` 直接类型化 override 并前置 PathGuard。工具返回值使用 `output`（1.2.0 起，`content` 已移除）。**升级前必须备份 `conversations.sqlite`**：1.6.0 写过的会话文档（`pi.tool` v4 / `pi.generation` v3）不能被 1.5.x 读取，回滚需恢复备份；`durableBusyCount()` 仍排除 `sleeping`/`blocked` 任务（可跨进程存活，不阻塞队列/drain）。
 2. **只用公开导出**：`Harness`/`ConversationView`/`LiveState`/`AssistantEntry`/`defineTool` 均从主入口 import；凡是需要 `as any` 读框架内部的地方都是升级雷区，一律换成类型化 API 或封装适配层。
 3. **对框架行为做实证**：不信任文档记忆，关键契约（undefined 语义、env 重建时机、configure 提交成本、close 链）都在框架源码中核实过（见 `../pi/packages/durable/src/`），部分写入了 `test/` 固化。
 4. **1.5.0 迁移要点**：`watchEvents` → `harness.observeConversation()` 同步 observer（`live-view.ts` 归约）；`onReport` 单参数 `Report`（`kind`/`error`）；`SessionEnd` 用 `kind`；env watch 用 `FileChange` / `FileWatcher.stop`；`TaskInspection.state.kind` 用 `pending`；restart-limited 任务 terminal（自定义 `task_faulted`、内置 `task_interrupted`）后由 onReport 按 durable id 回写业务 `blocked`，用 `recreate-durable` 恢复，不再有 `retryTask`；`system_config.agent_max_turns` 映射到官方 `AgentState.maxTurns`（默认 `0` = 关闭）。
+
+5. **1.6.0 迁移要点**：① chord v2 成为包根，`Context` 只从 `@earendil-works/chord/context` 导出（bot 两处导入已改）；② `ConversationView` 结构未变，但 `pi.live` 工具槽新增 `sleeping`/`waiting`（parked 调用）、sleep 的 `until` 变为可选——`live-view.ts` 只上报 `running`/`done`，`sleeping`/`waiting` 按运行中展示，槽位消失时统一补 `done`，`describeDurableState` 透传可选 `until`；③ 工具 `execute()` 可返回 `ToolPark`、结果 `durationMs` 改为整段跨度——bot 无 park 工具，telemetry 兜底口径随框架变化；④ 1.5.1 起支持按会话 `configure({ compaction })`：bot 用 `buildConversationCompactionSettings()` 给普通/定时会话各下发一套 `CompactionSettings`（自带 `modelOverrides` 才能压过 harness override），普通会话不再被定时任务 50k 阈值拖累；策略/模型窗口变化进入配置指纹；⑤ `images/fit` 接入入站图片（`image-processor.ts` 懒加载 Photon + 1×1 探测；源码运行走 worker，单文件二进制用 `photon-wasm.ts` 内嵌 wasm 在进程内处理；解码前按文件头拦截 >40MP 图片）；⑥ 直接受益的框架修复：`Submission.wait()`/`waitForTask()` 取消竞态的 unhandled rejection、scheduler 规划期 `waiting/completing` 卡死、长任务链 O(n²)、`listDir` 枚举竞态 ENOENT、`SqliteStorage.commit` 语句数下降。
 
 ---
 

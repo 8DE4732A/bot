@@ -8,6 +8,7 @@ import {
   LiveDoc,
 } from "@earendil-works/pi-durable";
 import type {
+  CompactionSettings,
   Conversation,
   ConversationId,
   ConversationView,
@@ -49,9 +50,11 @@ import { formatMessageContext, MessageContextHint, withMessageContext } from "./
 import { ModelFactory } from "./model-factory.ts";
 import {
   buildCompactionSettings,
+  buildConversationCompactionSettings,
   DEFAULT_CONTEXT_POLICY,
   loadContextPolicy,
   type ContextPolicy,
+  type ContextSessionProfile,
 } from "./context-policy.ts";
 import { getContextTelemetry } from "./context-telemetry.ts";
 import {
@@ -216,17 +219,6 @@ export function parseConfiguredMaxTurns(value: string | undefined): number | und
   return Number.isSafeInteger(raw) && raw >= 1 ? Math.min(raw, 1_000) : undefined;
 }
 
-const configFingerprint = (a: AgentDefinition, maxTurns?: number) =>
-  [
-    a.model.provider,
-    a.model.modelId,
-    a.model.thinkingLevel,
-    a.instructions,
-    a.workspaceDir,
-    [...a.skills].sort().join(","),
-    maxTurns ?? 0,
-  ].join("|");
-
 /** durable 任务是否应阻塞队列投递/drain；sleeping/blocked 可跨进程存活，不阻塞。 */
 export function isDurableTaskPending(task: TaskInspection): boolean {
   return task.state.kind !== "sleeping" && task.state.kind !== "blocked";
@@ -388,6 +380,8 @@ export class AgentManager {
   /** 七期：上下文策略（内存快照；settings 同步读取，不能查库） */
   private contextPolicy: ContextPolicy = structuredClone(DEFAULT_CONTEXT_POLICY);
   private policyVersion = 0;
+  /** 模型目录代际：reloadModels() 递增，用于让会话重新下发压缩设置（窗口可能变化） */
+  private modelsRevision = 0;
   /** 宿主是否已放行 resume；故障重建的新 Harness 沿用该意图 */
   private autoResume = true;
   /** 当前 harness 是否已 resume（避免重复调用/观测） */
@@ -409,6 +403,7 @@ export class AgentManager {
     // 1.4.0: HarnessOptions.models 支持函数。构建完整的新目录后原子替换，
     // in-flight 请求不会看到 clearProviders() 的中间态。
     this.models = ModelFactory.createConfiguredModels();
+    this.modelsRevision++;
     this.settingsFor = undefined;
     logger.info(
       "AgentManager",
@@ -849,6 +844,8 @@ export class AgentManager {
 
     // 会话扩展集合（技能 + 常驻扩展）单一来源
     const agentSkills = this.extensionsFor(agent);
+    // 画像与 chatTurn 的 sessionKind 判定同源：轮询回滚路径也用 `scheduler:` 前缀
+    const profile: ContextSessionProfile = sessionId.startsWith("scheduler:") ? "scheduled" : "normal";
 
     if (!cached) {
       // Check if session mapping exists
@@ -870,14 +867,14 @@ export class AgentManager {
         } else {
           logger.warn("AgentManager", `Conversation ${sessionRecord.conversationId} no longer exists; recreating session ${cacheKey}`);
           cached = {
-            conv: await this.createNewConversation(agent, agentSkills, maxTurns),
-            configFp: configFingerprint(agent, maxTurns),
+            conv: await this.createNewConversation(agent, agentSkills, maxTurns, profile),
+            configFp: this.configFingerprint(agent, maxTurns),
           };
         }
       } else {
         cached = {
-          conv: await this.createNewConversation(agent, agentSkills, maxTurns),
-          configFp: configFingerprint(agent, maxTurns),
+          conv: await this.createNewConversation(agent, agentSkills, maxTurns, profile),
+          configFp: this.configFingerprint(agent, maxTurns),
         };
       }
 
@@ -896,7 +893,7 @@ export class AgentManager {
 
     // Sync agent settings only when they actually changed (configure 是一次事务提交);
     // extensions 也同步: 会话创建时冻结的技能集无法反映管理页的勾选变更
-    const fp = configFingerprint(agent, maxTurns);
+    const fp = this.configFingerprint(agent, maxTurns);
     if (cached.configFp !== fp) {
       try {
         await cached.conv.configure(
@@ -911,6 +908,8 @@ export class AgentManager {
             extensions: agentSkills,
             // AgentChange 允许 null 清除；配置关掉时必须显式传 null，不能省略（省略=保持不变）
             maxTurns: maxTurns ?? null,
+            // 1.6.0：每个会话写自己的压缩设置（普通画像不套用定时任务阈值）
+            compaction: this.conversationCompaction(agent, profile),
           },
           BACKGROUND_CONTEXT,
         );
@@ -926,7 +925,8 @@ export class AgentManager {
   private async createNewConversation(
     agent: AgentDefinition,
     extensions: any[],
-    maxTurns?: number,
+    maxTurns: number | undefined,
+    profile: ContextSessionProfile,
   ): Promise<Conversation> {
     const conv = await this.harness!.createConversation(
       {
@@ -941,11 +941,44 @@ export class AgentManager {
           cwd: agent.workspaceDir,
           extensions,
           ...(maxTurns ? { maxTurns } : {}),
+          compaction: this.conversationCompaction(agent, profile),
         },
       },
       BACKGROUND_CONTEXT,
     );
     return conv;
+  }
+
+  /** 当前模型目录里的上下文窗口（未知为 0）；配置指纹与压缩设置共用同一来源。 */
+  private modelContextWindow(provider: string, modelId: string): number {
+    return this.models?.getModel(provider, modelId)?.contextWindow ?? 0;
+  }
+
+  /** 1.6.0：按会话画像派生压缩设置（普通/定时两套 keepRecent，模型窗口未知按 0）。 */
+  private conversationCompaction(agent: AgentDefinition, profile: ContextSessionProfile): CompactionSettings {
+    return buildConversationCompactionSettings(this.contextPolicy, profile, {
+      provider: agent.model.provider,
+      id: agent.model.modelId,
+      contextWindow: this.modelContextWindow(agent.model.provider, agent.model.modelId),
+    });
+  }
+
+  /**
+   * 会话配置指纹：agent 配置 + 策略版本 + 模型目录代际。
+   * 后两者变化时压缩设置需要重新下发（窗口/阈值可能已变）。
+   */
+  private configFingerprint(a: AgentDefinition, maxTurns?: number): string {
+    return [
+      a.model.provider,
+      a.model.modelId,
+      a.model.thinkingLevel,
+      a.instructions,
+      a.workspaceDir,
+      [...a.skills].sort().join(","),
+      maxTurns ?? 0,
+      this.policyVersion,
+      this.modelsRevision,
+    ].join("|");
   }
 
   /** 会话扩展集合（技能 + 常驻扩展，见 BASE_EXTENSIONS） */
@@ -1033,12 +1066,12 @@ export class AgentManager {
         this.store.bindSchedulerConversation(taskId, effective, agentId);
       }
     } else {
-      conv = await this.createNewConversation(agent, agentSkills, maxTurns);
+      conv = await this.createNewConversation(agent, agentSkills, maxTurns, "scheduled");
       this.store.bindSchedulerConversation(taskId, String(conv.id), agentId);
     }
 
     const cached = this.conversations.get(cacheKey);
-    const fp = configFingerprint(agent, maxTurns);
+    const fp = this.configFingerprint(agent, maxTurns);
     if (!cached || cached.conv.id !== conv.id) {
       this.cacheConversation(cacheKey, conv, fp);
     }
@@ -1054,6 +1087,8 @@ export class AgentManager {
           cwd: agent.workspaceDir,
           extensions: agentSkills,
           maxTurns: maxTurns ?? null,
+          // 1.6.0：定时会话用定时画像的压缩设置
+          compaction: this.conversationCompaction(agent, "scheduled"),
         },
         BACKGROUND_CONTEXT,
       );
@@ -1074,11 +1109,11 @@ export class AgentManager {
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`Agent not found: ${agentId}`);
     const maxTurns = this.configuredMaxTurns();
-    const conv = await this.createNewConversation(agent, this.extensionsFor(agent), maxTurns);
+    const conv = await this.createNewConversation(agent, this.extensionsFor(agent), maxTurns, "scheduled");
     this.cacheConversation(
       sessionKey(agentId, `scheduler:${taskId}`),
       conv,
-      configFingerprint(agent, maxTurns),
+      this.configFingerprint(agent, maxTurns),
     );
     return conv;
   }
@@ -1546,7 +1581,7 @@ export class AgentManager {
       (sessionId.startsWith("scheduler:") ? sessionId.slice("scheduler:".length) : undefined);
     const agentForModel = this.store.getAgent(agentId);
     const contextWindow = agentForModel
-      ? (this.models?.getModel(agentForModel.model.provider, agentForModel.model.modelId)?.contextWindow ?? 0)
+      ? this.modelContextWindow(agentForModel.model.provider, agentForModel.model.modelId)
       : 0;
 
     // 七期：前置压缩（普通/定时各一套阈值；失败 fail-open，取消则不提交）
@@ -2379,7 +2414,7 @@ export class AgentManager {
     if (!this.harness) throw new Error("Agent Harness is not initialized");
     const agent = this.store.getAgent(agentId);
     const contextWindow = agent
-      ? (this.models?.getModel(agent.model.provider, agent.model.modelId)?.contextWindow ?? 0)
+      ? this.modelContextWindow(agent.model.provider, agent.model.modelId)
       : 0;
     const outcome = await compactConversationNow({
       harness: this.harness,

@@ -1,7 +1,13 @@
 import { readFile } from "node:fs/promises";
-import { DEFAULT_IMAGE_LIMITS } from "@earendil-works/pi-durable/tools";
+import {
+  DEFAULT_IMAGE_LIMITS,
+  type ImageLimits,
+  type ImageProcessor,
+} from "@earendil-works/pi-durable/tools";
+import { fitImage } from "@earendil-works/pi-durable/images/fit";
 import type { UserInput } from "@earendil-works/pi-durable";
 import type { MediaAttachment } from "../base.ts";
+import { imagePixelSize } from "./image-size.ts";
 
 const INLINE_IMAGE_MIME = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 
@@ -20,9 +26,26 @@ export type VisionPlan =
 
 export interface VisionInputOptions {
   readFile?: (path: string) => Promise<Uint8Array>;
-  /** base64 长度上限（与 pi-durable read 的默认限制一致） */
-  maxBytes?: number;
+  /**
+   * 1.6.0：按模型限制缩放/转换图片的处理器（`images/fit` 的 `ImageProcessor`）。
+   * 传函数则推迟到真正有图片要处理时才解析（纯文本消息不加载 Photon）。
+   */
+  processor?: ImageProcessor | (() => Promise<ImageProcessor | undefined>);
+  /** 图片适配限制（maxBytes 为 base64 长度上限）；缺省 DEFAULT_IMAGE_LIMITS */
+  limits?: ImageLimits;
+  /** 源文件字节上限（有/无处理器一致）；缺省 8MiB */
+  maxSourceBytes?: number;
 }
+
+/** 默认源文件上限：比旧 base64 预检（≈3.4MiB）宽容，又避免把超大原图送进解码器。 */
+const DEFAULT_MAX_SOURCE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * 解码前的像素上限（40MP）：压缩字节很小但宽高极大的图片会让 Photon 按
+ * 宽×高×4 分配 wasm 内存（且永不收缩），足以拖垮网关进程。只对有解码的
+ * 处理器路径生效；无处理器时图片不解码，没有这个风险。
+ */
+const MAX_DECODE_PIXELS = 40_000_000;
 
 /** 按文件头判断真实图片格式，避免把伪装成图片的文件直接发给模型。 */
 export function sniffImageMime(bytes: Uint8Array): string | undefined {
@@ -62,7 +85,8 @@ export function sniffImageMime(bytes: Uint8Array): string | undefined {
 /**
  * 入站图片策略：
  * - 明确不支持图片的模型 → 拒绝（不调用 LLM，直接回复用户）
- * - 支持图片的模型 → 直接作为 user content 的 image block 附加（单张超过 base64 上限则跳过）
+ * - 支持图片的模型 → 作为 user content 的 image block 附加；注入 `processor` 时
+ *   先按模型限制缩放/转码（1.6.0 `images/fit`），没有处理器或适配失败则超限跳过
  * - 模态未知（fallback 目录）→ 保留路径引用，提示模型用 read 读取
  */
 export async function planVisionInput(
@@ -93,9 +117,15 @@ export async function planVisionInput(
     };
   }
 
-  const maxBytes = options.maxBytes ?? DEFAULT_IMAGE_LIMITS.maxBytes;
+  const limits = options.limits ?? DEFAULT_IMAGE_LIMITS;
+  const maxSourceBytes = options.maxSourceBytes ?? DEFAULT_MAX_SOURCE_BYTES;
+  // 处理器在“确实有图片且模型支持”之后才解析：纯文本消息不加载 Photon
+  const processor =
+    typeof options.processor === "function" ? await options.processor() : options.processor;
   const read = options.readFile ?? (async (path: string) => new Uint8Array(await readFile(path)));
   const blocks: { type: "image"; data: string; mimeType: string }[] = [];
+  const fitNotes: string[] = [];
+  const omittedNotes: string[] = [];
   let skipped = 0;
 
   for (const image of images) {
@@ -103,8 +133,8 @@ export async function planVisionInput(
       skipped++;
       continue;
     }
-    // base64 后约 4/3；sizeBytes 是原始字节，先做保守预检避免读入超大文件
-    if (image.sizeBytes !== undefined && image.sizeBytes > Math.floor((maxBytes * 3) / 4)) {
+    // sizeBytes 是上游元数据，可能缺失；先做廉价预检，读入后再按真实字节数复核
+    if (image.sizeBytes !== undefined && image.sizeBytes > maxSourceBytes) {
       skipped++;
       continue;
     }
@@ -115,13 +145,34 @@ export async function planVisionInput(
       skipped++;
       continue;
     }
+    if (bytes.byteLength > maxSourceBytes) {
+      skipped++;
+      continue;
+    }
     const mimeType = sniffImageMime(bytes);
     if (!mimeType || !INLINE_IMAGE_MIME.has(mimeType)) {
       skipped++;
       continue;
     }
+    if (processor) {
+      // 解码前按文件头拦「小文件、巨像素」的解压炸弹
+      const size = imagePixelSize(bytes, mimeType);
+      if (size && size.width * size.height > MAX_DECODE_PIXELS) {
+        skipped++;
+        continue;
+      }
+      const fitted = await fitImage(bytes, mimeType, limits, processor);
+      if (fitted.kind === "omitted") {
+        skipped++;
+        omittedNotes.push(fitted.note);
+        continue;
+      }
+      blocks.push(fitted.image);
+      fitNotes.push(...fitted.notes);
+      continue;
+    }
     const data = Buffer.from(bytes).toString("base64");
-    if (data.length > maxBytes) {
+    if (data.length > limits.maxBytes) {
       skipped++;
       continue;
     }
@@ -131,19 +182,27 @@ export async function planVisionInput(
   if (blocks.length === 0) {
     // 声明是图片但无法直接附加（格式/大小/读取失败）：退回路径 + read 提示，
     // 不阻断文本；显式图片模型仍可能通过 read 工具自行读取。
+    const reason =
+      omittedNotes.length > 0 ? `\n\n[系统提示：${omittedNotes.join(" ")}]` : "";
     return {
       mode: "text",
       text:
         `${text}\n\n[系统提示：用户发送的图片无法直接附加（格式或大小限制），` +
-        "请使用 read 工具读取上面的附件路径。]",
+        `请使用 read 工具读取上面的附件路径。]${reason}`,
     };
   }
 
-  const note =
+  const skippedNote =
     skipped > 0
       ? `\n\n[系统提示：另有 ${skipped} 张图片未能直接附加，请使用 read 工具读取上面的附件路径。]`
       : "";
-  const combined = `${text}${note}`;
+  // 适配说明（尺寸/格式转换）随内容一起给模型，便于它把坐标映射回原图；
+  // 无法解码被省略的图片把原因也带上（框架已给出 note）
+  const fitNote =
+    fitNotes.length > 0 ? `\n\n[系统提示：部分图片已按模型限制处理：${fitNotes.join(" ")}]` : "";
+  const omitNote =
+    omittedNotes.length > 0 ? `\n\n[系统提示：${omittedNotes.join(" ")}]` : "";
+  const combined = `${text}${skippedNote}${fitNote}${omitNote}`;
   return {
     mode: "attach",
     text: combined,

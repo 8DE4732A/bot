@@ -7,7 +7,7 @@ import { DatabaseStore } from "../src/config/database-store.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { getCurrentSystemMessage } from "@earendil-works/pi-ai/utils/transcript";
 import { AgentManager, type ChatChunk } from "../src/core/agent-manager.ts";
-import { DEFAULT_CONTEXT_POLICY } from "../src/core/context-policy.ts";
+import { DEFAULT_CONTEXT_POLICY, deriveKeepRecentTokens } from "../src/core/context-policy.ts";
 import {
   MAX_OUTBOUND_MEDIA,
   MAX_TOTAL_OUTBOUND_MEDIA_BYTES,
@@ -328,5 +328,94 @@ describe("AgentManager chat observability", () => {
     expect(rendered).toContain(`${Math.round(MAX_TOTAL_OUTBOUND_MEDIA_BYTES / (1024 * 1024))} MB in total`);
     // 每条消息的 <context> 事实块说明对所有会话类型生效
     expect(sections?.message_time_context).toContain("authoritative");
+  });
+
+  test("1.6.0：普通/定时会话各自下发压缩设置", async () => {
+    ensureMockProvider();
+    const store = new DatabaseStore();
+    store.saveModelMetadata({
+      providerId: "mock",
+      modelId: "deepseek-chat",
+      auto: null,
+      manual: { contextWindow: 1_000_000 },
+      updatedAt: Date.now(),
+    });
+    const agent = store.getAgent("agent-default")!;
+    store.saveAgent({ ...agent, model: { ...agent.model, provider: "mock", modelId: "deepseek-chat" } });
+    AgentManager.getInstance().reloadModels();
+    AgentManager.getInstance().applyContextPolicy(DEFAULT_CONTEXT_POLICY);
+
+    await AgentManager.getInstance().chat("agent-default", "terminal-main:compaction-settings", "hello");
+    const session = store.getSession("channel_session", "agent-default:terminal-main:compaction-settings");
+    const harness = AgentManager.getInstance().getHarness()!;
+    const normalConv = await harness.conversation(Number(session!.conversationId) as never, BACKGROUND_CONTEXT);
+    const normalAgent = await normalConv!.agent(BACKGROUND_CONTEXT);
+    expect(normalAgent.compaction?.keepRecentTokens).toBe(
+      deriveKeepRecentTokens(DEFAULT_CONTEXT_POLICY, 1_000_000, "normal"),
+    );
+
+    const now = Date.now();
+    store.saveScheduledTask({
+      id: "compaction-settings-task",
+      agentId: "agent-default",
+      name: "compaction settings",
+      prompt: "ping",
+      scheduleType: "every",
+      intervalSeconds: 300,
+      enabled: true,
+      runCount: 0,
+      durableState: "pending",
+      scheduleVersion: 0,
+      notifyEnabled: false,
+      createdAt: now,
+      updatedAt: now,
+    } as any);
+    const scheduledConv = await AgentManager.getInstance().openSchedulerConversation(
+      "agent-default",
+      "compaction-settings-task",
+    );
+    const scheduledAgent = await scheduledConv.agent(BACKGROUND_CONTEXT);
+    expect(scheduledAgent.compaction?.keepRecentTokens).toBe(
+      deriveKeepRecentTokens(DEFAULT_CONTEXT_POLICY, 1_000_000, "scheduled"),
+    );
+    // 1M 窗口下：普通 32k（10% 窗口与 cap 取小）> 定时 20k（40% × 50k 回退）
+    expect(scheduledAgent.compaction!.keepRecentTokens!).toBeLessThan(
+      normalAgent.compaction!.keepRecentTokens!,
+    );
+  });
+
+  test("1.6.0：策略变化会让既有会话重新下发压缩设置", async () => {
+    ensureMockProvider();
+    const store = new DatabaseStore();
+    store.saveModelMetadata({
+      providerId: "mock",
+      modelId: "deepseek-chat",
+      auto: null,
+      manual: { contextWindow: 1_000_000 },
+      updatedAt: Date.now(),
+    });
+    const agent = store.getAgent("agent-default")!;
+    store.saveAgent({ ...agent, model: { ...agent.model, provider: "mock", modelId: "deepseek-chat" } });
+    AgentManager.getInstance().reloadModels();
+    AgentManager.getInstance().applyContextPolicy(DEFAULT_CONTEXT_POLICY);
+
+    const sessionId = "terminal-main:policy-refresh";
+    await AgentManager.getInstance().chat("agent-default", sessionId, "hello");
+    const session = store.getSession("channel_session", `agent-default:${sessionId}`);
+    const harness = AgentManager.getInstance().getHarness()!;
+    const readKeepRecent = async () => {
+      const conv = await harness.conversation(Number(session!.conversationId) as never, BACKGROUND_CONTEXT);
+      return (await conv!.agent(BACKGROUND_CONTEXT)).compaction?.keepRecentTokens;
+    };
+    expect(await readKeepRecent()).toBe(
+      deriveKeepRecentTokens(DEFAULT_CONTEXT_POLICY, 1_000_000, "normal"),
+    );
+
+    const tightened = { ...structuredClone(DEFAULT_CONTEXT_POLICY), keepRecentCapTokens: 8_192 };
+    AgentManager.getInstance().applyContextPolicy(tightened);
+    await AgentManager.getInstance().chat("agent-default", sessionId, "again");
+
+    expect(await readKeepRecent()).toBe(deriveKeepRecentTokens(tightened, 1_000_000, "normal"));
+    expect(await readKeepRecent()).toBe(8_192);
   });
 });

@@ -1,6 +1,6 @@
 import { defineTask } from "@earendil-works/pi-durable";
 import type { TaskRuntime } from "@earendil-works/pi-durable";
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { DatabaseStore } from "../config/database-store.ts";
 import type { CancelChatResult } from "./contracts.ts";
 import {

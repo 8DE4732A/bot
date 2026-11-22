@@ -443,6 +443,7 @@ export interface EffectiveContextThreshold {
   modelId: string;
   contextWindow: number;
   keepRecentTokens: number;
+  scheduledKeepRecentTokens: number;
   globalThreshold: number;
   scheduledFallbackThreshold: number;
   fixedThreshold: number;

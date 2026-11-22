@@ -3,7 +3,9 @@ import { addUsageTotals, diffUsageState, emptyUsageTotals } from "../src/core/co
 import {
   DEFAULT_CONTEXT_POLICY,
   buildCompactionSettings,
+  buildConversationCompactionSettings,
   decideCompaction,
+  deriveHarnessKeepRecentTokens,
   deriveKeepRecentTokens,
   parseContextPolicy,
   resolveContextThresholds,
@@ -120,14 +122,51 @@ describe("context policy strategies", () => {
     const thresholds = resolveContextThresholds(policy, 20_000);
     expect(thresholds.scheduledFallbackThreshold).toBeLessThanOrEqual(20_000 - reserve);
     expect(thresholds.scheduledFallbackThreshold).toBeGreaterThan(
-      deriveKeepRecentTokens(policy, 20_000),
+      deriveKeepRecentTokens(policy, 20_000, "scheduled"),
     );
   });
 
   test("keepRecent 受已启用策略的最低阈值 40% 约束", () => {
-    expect(deriveKeepRecentTokens(policy, 1_000_000)).toBe(20_000);
-    expect(deriveKeepRecentTokens(policy, 200_000)).toBe(20_000);
-    expect(deriveKeepRecentTokens(policy, 20_000)).toBe(2_000);
+    expect(deriveHarnessKeepRecentTokens(policy, 1_000_000)).toBe(20_000);
+    expect(deriveHarnessKeepRecentTokens(policy, 200_000)).toBe(20_000);
+    expect(deriveHarnessKeepRecentTokens(policy, 20_000)).toBe(2_000);
+  });
+
+  test("1.6.0 画像化 keepRecent：普通会话不再被定时阈值拖累", () => {
+    // 1M 窗口：定时 0.4×50k=20k；普通 min(0.1×窗口, cap)=32k；harness 兜底保持旧口径
+    expect(deriveKeepRecentTokens(policy, 1_000_000, "scheduled")).toBe(20_000);
+    expect(deriveKeepRecentTokens(policy, 1_000_000, "normal")).toBe(32_768);
+    expect(deriveHarnessKeepRecentTokens(policy, 1_000_000)).toBe(20_000);
+
+    // 固定阈值只作用于声明的 scope
+    const scoped: ContextPolicy = {
+      ...structuredClone(policy),
+      strategies: {
+        ...structuredClone(policy.strategies),
+        fixed: { ...policy.strategies.fixed, enabled: true, tokens: 10_000, scope: "scheduled" },
+      },
+    };
+    expect(deriveKeepRecentTokens(scoped, 1_000_000, "normal")).toBe(32_768);
+    expect(deriveKeepRecentTokens(scoped, 1_000_000, "scheduled")).toBe(4_000);
+  });
+
+  test("会话压缩设置写 modelOverride 以压过 harness override", () => {
+    const model = { provider: "p", id: "m", contextWindow: 1_000_000 };
+    const normal = buildConversationCompactionSettings(policy, "normal", model);
+    const scheduled = buildConversationCompactionSettings(policy, "scheduled", model);
+    expect(normal.enabled).toBe(true);
+    expect(normal.backgroundTokens).toBe(0);
+    expect(normal.keepRecentTokens).toBe(32_768);
+    expect(scheduled.keepRecentTokens).toBe(20_000);
+    expect((normal.modelOverrides as any)["p/m"]).toEqual({
+      reserveTokens: resolveEmergencyReserve(policy, 1_000_000),
+      keepRecentTokens: 32_768,
+      backgroundTokens: 0,
+    });
+    // 模型未知（窗口 0）：仍给出设置，只是不带 modelOverride
+    const unknown = buildConversationCompactionSettings(policy, "normal", undefined);
+    expect(unknown.modelOverrides).toBeUndefined();
+    expect(unknown.keepRecentTokens).toBe(deriveKeepRecentTokens(policy, 0, "normal"));
   });
 
   test("定时启发式：最近 N 个净增量平均值 × 倍数", () => {

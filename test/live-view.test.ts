@@ -185,6 +185,28 @@ describe("ConversationView 归约器（1.5.0）", () => {
     expect(changes.toolUpdates).toEqual([{ name: "bash", status: "done" }]);
   });
 
+  test("1.6.0 parked 状态（sleeping）槽位消失时补 done", () => {
+    const state = createTurnViewState();
+    seedTurnView(state, view({ entries: [] }));
+
+    let changes = reduceTurnView(
+      state,
+      view({ entries: [], live: live({ tools: [{ callId: "p", name: "mcp__x__slow", status: "running" }] }) }),
+    );
+    expect(changes.toolUpdates).toEqual([{ name: "mcp__x__slow", status: "running" }]);
+
+    // 进入 parked（sleeping/waiting）：不向 UI 上报中间状态
+    changes = reduceTurnView(
+      state,
+      view({ entries: [], live: live({ tools: [{ callId: "p", name: "mcp__x__slow", status: "sleeping" }] }) }),
+    );
+    expect(changes.toolUpdates).toEqual([]);
+
+    // 中止/重启后槽位直接消失：补 done，避免永久 running
+    changes = reduceTurnView(state, view({ entries: [], live: live({ tools: [] }) }));
+    expect(changes.toolUpdates).toEqual([{ name: "mcp__x__slow", status: "done" }]);
+  });
+
   test("压缩任务出现/消失即起止；失败原因来自 compactionFailure", () => {
     const state = createTurnViewState();
     seedTurnView(state, view({ entries: [] }));

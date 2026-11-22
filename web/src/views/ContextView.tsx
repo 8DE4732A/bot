@@ -36,6 +36,36 @@ function fmtCost(value: number | undefined, priced = true): string {
   return `$${value.toFixed(4)}`;
 }
 
+/**
+ * 某会话画像下已启用的静态压缩阈值（水位判定与告警共用）。
+ * 与后端 `scopeApplies` 同语义；1.6.0 起普通/定时各自一套 keepRecent。
+ */
+function profileThresholds(
+  strategies: ContextPolicy["strategies"],
+  effective: EffectiveContextThreshold,
+  profile: "normal" | "scheduled",
+): number[] {
+  const candidates: number[] = [];
+  if (strategies.global.enabled && effective.globalThreshold > 0) {
+    candidates.push(effective.globalThreshold);
+  }
+  if (
+    profile === "scheduled" &&
+    strategies.scheduledHeuristic.enabled &&
+    effective.scheduledFallbackThreshold > 0
+  ) {
+    candidates.push(effective.scheduledFallbackThreshold);
+  }
+  if (
+    strategies.fixed.enabled &&
+    (strategies.fixed.scope === "all" || strategies.fixed.scope === profile) &&
+    effective.fixedThreshold > 0
+  ) {
+    candidates.push(effective.fixedThreshold);
+  }
+  return candidates;
+}
+
 function fillClass(ratio: number | undefined): string {
   if (ratio === undefined) return "";
   if (ratio >= 0.95) return " is-risk";
@@ -360,25 +390,11 @@ export function ContextView() {
     );
     const policy = policyQ.data?.policy;
     if (!effective || !policy) return undefined;
-    const { strategies } = policy;
-    const candidates: number[] = [];
-    if (strategies.global.enabled && effective.globalThreshold > 0) {
-      candidates.push(effective.globalThreshold);
-    }
-    if (
-      row.sessionKind === "scheduled" &&
-      strategies.scheduledHeuristic.enabled &&
-      effective.scheduledFallbackThreshold > 0
-    ) {
-      candidates.push(effective.scheduledFallbackThreshold);
-    }
-    if (
-      strategies.fixed.enabled &&
-      (strategies.fixed.scope === "all" || strategies.fixed.scope === row.sessionKind) &&
-      effective.fixedThreshold > 0
-    ) {
-      candidates.push(effective.fixedThreshold);
-    }
+    const candidates = profileThresholds(
+      policy.strategies,
+      effective,
+      row.sessionKind === "scheduled" ? "scheduled" : "normal",
+    );
     if (candidates.length === 0) return undefined;
     return Math.min(...candidates) / row.contextWindow;
   };
@@ -886,16 +902,18 @@ function PolicyTab(props: {
   const enabledCount = [s.global.enabled, s.scheduledHeuristic.enabled, s.fixed.enabled, s.idle.enabled].filter(
     Boolean,
   ).length;
-  const enabledThresholds = (m: EffectiveContextThreshold): number[] =>
-    [
-      s.global.enabled ? m.globalThreshold : 0,
-      s.scheduledHeuristic.enabled ? m.scheduledFallbackThreshold : 0,
-      s.fixed.enabled ? m.fixedThreshold : 0,
-    ].filter((threshold) => threshold > 0);
+  // 1.6.0 起压缩设置按会话画像配置：普通会话不启用定时策略，两者各有 keepRecent。
+  const keepRecentOf = (m: EffectiveContextThreshold, profile: "normal" | "scheduled") =>
+    profile === "normal" ? m.keepRecentTokens : m.scheduledKeepRecentTokens;
   const warnModels = props.effective.filter(
     (m) =>
       m.contextWindow > 0 &&
-      enabledThresholds(m).some((threshold) => threshold >= m.contextWindow || threshold <= m.keepRecentTokens + 1024),
+      (["normal", "scheduled"] as const).some((profile) =>
+        profileThresholds(s, m, profile).some(
+          (threshold) =>
+            threshold >= m.contextWindow || threshold <= keepRecentOf(m, profile) + 1024,
+        ),
+      ),
   );
 
   return (
@@ -1245,7 +1263,7 @@ function PolicyTab(props: {
                 <th>全局阈值</th>
                 <th>定时回退</th>
                 <th>固定阈值</th>
-                <th>keepRecent</th>
+                <th>keepRecent（普通 / 定时）</th>
                 <th>空闲</th>
               </tr>
             </thead>
@@ -1266,7 +1284,9 @@ function PolicyTab(props: {
                   <td className="mono">
                     {s.fixed.enabled && m.fixedThreshold ? fmtTokens(m.fixedThreshold) : "—"}
                   </td>
-                  <td className="mono">{fmtTokens(m.keepRecentTokens)}</td>
+                  <td className="mono">
+                    {fmtTokens(m.keepRecentTokens)} / {fmtTokens(m.scheduledKeepRecentTokens)}
+                  </td>
                   <td className="mono">{s.idle.enabled ? `${m.idleHours}h` : "—"}</td>
                 </tr>
               ))}

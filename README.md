@@ -72,9 +72,9 @@ bun run typecheck
 bun run build:web
 ```
 
-> 开发者提示：框架依赖锁定 npm 精确版本（`pi-durable` / `pi-ai` / `chord` / `pi-telemetry` 1.5.0）；本机 `../pi` 仓库仅作源码阅读参考，不参与构建（Bun 运行时恒解析 `node_modules` 的 dist）。
+> 开发者提示：框架依赖锁定 npm 精确版本（`pi-durable` / `pi-ai` / `chord` / `pi-telemetry` 1.6.0）；本机 `../pi` 仓库仅作源码阅读参考，不参与构建（Bun 运行时恒解析 `node_modules` 的 dist）。
 >
-> 升级提示：从 1.4.x 升到 1.5.0 前请备份 `.bot/conversations.sqlite`。1.5.0 写过的会话文档不能被 1.4.x 读取，回滚时需要恢复备份。
+> 升级提示：从 1.5.x 升到 1.6.0 前请备份 `.bot/conversations.sqlite`。1.6.0 写过的会话文档（`pi.tool` v4 / `pi.generation` v3）不能被 1.5.x 读取，回滚时需要恢复备份。
 
 ---
 

@@ -25,7 +25,7 @@
 ```
 
 - **阈值**：普通 = `window * percent`；定时 = `min(tokens, window * maxPercentOfWindow)`；窗口未知时普通跳过、定时用绝对 tokens；再按 `minTokens` 与 `window - emergencyReserve` 夹住，并保证大于 `keepRecent + 1024`。
-- **keepRecent 是框架全局值**（pi-durable 不支持 per-conversation）：`min(0.4 * scheduled.tokens, 10% window, keepRecentCap)`，floor 1k。`0.4×` 上界确保定时任务 50k 阈值一定能选出可切分区间。
+- **keepRecent 按会话画像**（pi-durable 1.6.0 `configure({ compaction })`）：普通会话 `min(0.4 × 全局阈值, 10% window, keepRecentCap)`，不再把定时策略计入；定时会话把定时启发式（与适用的固定上限）计入后取同样的 40% 上界，确保 50k 阈值一定能选出可切分区间。会话设置必须自带 `modelOverrides`——框架优先级是「会话 modelOverride > harness modelOverride > 会话自身字段 > harness 基础值」，只写会话字段会被 harness override 盖住。
 - **框架 compaction 只做紧急兜底**：`enabled: true`、`reserveTokens = clamp(5% window, 2k, cap)`、`backgroundTokens: 0`。必须显式设置 harness-wide 基础值，否则窗口未知的模型会落回框架默认 `backgroundTokens=32768`。
 - 策略热更新：`AgentManager.applyContextPolicy()` 更新内存快照 + `policyVersion`；settings 函数按 `{models, policyVersion}` 缓存失效，不重开 Harness。
 
@@ -109,5 +109,5 @@ POST    /api/model-metadata/refresh
 - `bun test` 覆盖：策略/估算、models.dev 匹配与 manual 合并、UsageDoc 差分、telemetry 缓冲/归因/幂等、真实 Harness + faux 的前置压缩（成功/低阈值/失败 fail-open/手动）、真实 AgentManager + 本地 SSE provider 的端到端 turn/request 落库、REST。
 - models.dev 依赖外网；离线用缓存/builtin/static fallback。
 - 首包不是 HTTP TTFB；每请求 TTFT 不可得（pi-ai 只暴露 first_chunk），UI 已注明口径。
-- 框架 compaction 的 keepRecent/reserve 是全局值；只有阈值按普通/定时分开。
+- harness 级 compaction 基础值仍是全局兜底；1.6.0 起普通/定时会话各自 `configure({ compaction })`，keepRecent 与阈值都已按画像分开。
 - 多输入排队时 generation 继承首个 submission trace；本项目 session lock 基本串行，turn 总量始终以 UsageDoc 为准。

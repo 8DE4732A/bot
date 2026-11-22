@@ -13,6 +13,7 @@ import {
   decideCompaction,
   deriveKeepRecentTokens,
   type ContextPolicy,
+  type ContextSessionProfile,
 } from "./context-policy.ts";
 import { diffUsageState, emptyUsageDiff, snapshotUsage } from "./context-usage.ts";
 import { logger } from "../utils/logger.ts";
@@ -301,6 +302,13 @@ async function runCompaction(
 
   const durationMs = Date.now() - startedAt;
   const failOpen = status === "failed" || status === "timeout" || status === "aborted";
+  // 手动压缩不带画像：按会话 id 的 scheduler: 前缀还原（与 chatTurn 的 sessionKind 同源）
+  const keepRecentProfile: ContextSessionProfile =
+    deps.profile !== "manual"
+      ? deps.profile
+      : deps.sessionId?.startsWith("scheduler:")
+        ? "scheduled"
+        : "normal";
   const record: CompactionEventRecord = {
     conversationId: deps.conversationId,
     agentId: deps.agentId,
@@ -311,7 +319,7 @@ async function runCompaction(
     profile: deps.profile,
     trigger: deps.trigger,
     thresholdTokens: deps.thresholdTokens,
-    keepRecentTokens: deriveKeepRecentTokens(deps.policy, deps.contextWindow),
+    keepRecentTokens: deriveKeepRecentTokens(deps.policy, deps.contextWindow, keepRecentProfile),
     beforeTokens: before.tokens,
     afterTokens: after.tokens,
     beforeEstimateTokens: before.tokens,

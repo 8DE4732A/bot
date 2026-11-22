@@ -241,11 +241,13 @@ export function reduceTurnView(
   // 可能被折叠进同一个 view；不补的话 TUI/Web 工具轨迹会永久卡在 running。
   for (const [callId, tracked] of [...state.tools]) {
     if (liveTools.has(callId)) continue;
-    if (tracked.status === "running") {
+    if (tracked.status === "pending") {
+      state.tools.delete(callId);
+    } else if (tracked.status !== "done") {
+      // 1.6.0 的 parked 调用会短暂处于 sleeping/waiting（没有结果条目）；
+      // 槽位消失时同样补 done，避免 UI 永远停在 running。
       state.tools.set(callId, { status: "done", name: tracked.name });
       changes.toolUpdates.push({ name: tracked.name, status: "done" });
-    } else if (tracked.status === "pending") {
-      state.tools.delete(callId);
     }
   }
 
